@@ -46,7 +46,7 @@ async function download(url: string, onProgress: (n: number) => void) {
 }
 
 async function readAll(res: Response, onProgress: (n: number) => void) {
-  const chunks: Uint8Array[] = [];
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
   let n = 0;
   const reader = res.body!.getReader();
 
