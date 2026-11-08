@@ -17,17 +17,40 @@ let session: Promise<ort.InferenceSession> | undefined;
 
 const post = (msg: FromWorker, transfer: Transferable[] = []) => postMessage(msg, { transfer });
 
+const FEATURES: GPUFeatureName[] = ["shader-f16", "subgroups", "timestamp-query"];
+
+const LIMITS = [
+  "maxBindGroups",
+  "maxComputeWorkgroupStorageSize",
+  "maxComputeWorkgroupsPerDimension",
+  "maxStorageBufferBindingSize",
+  "maxBufferSize",
+  "maxComputeInvocationsPerWorkgroup",
+  "maxComputeWorkgroupSizeX",
+  "maxComputeWorkgroupSizeY",
+  "maxComputeWorkgroupSizeZ",
+] as const;
+
+async function requestDevice() {
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
+
+  if (!adapter) throw new Error("This browser doesn't have WebGPU.");
+
+  if (!adapter.features.has("shader-f16")) throw new Error("This GPU can't run the model (no shader-f16).");
+
+  return adapter.requestDevice({
+    requiredFeatures: FEATURES.filter((f) => adapter.features.has(f)),
+    requiredLimits: Object.fromEntries(LIMITS.map((name) => [name, adapter.limits[name]])),
+  });
+}
+
 function getSession() {
   session ??= (async () => {
-    const adapter = await navigator.gpu?.requestAdapter();
-
-    if (!adapter) throw new Error("This browser doesn't have WebGPU.");
-
-    if (!adapter.features.has("shader-f16")) throw new Error("This GPU can't run the model (no shader-f16).");
+    const device = await requestDevice();
     const model = await loadModel((loaded) => post({ type: "model", loaded }));
 
     return ort.InferenceSession.create(model, {
-      executionProviders: ["webgpu"],
+      executionProviders: [{ name: "webgpu", preferredLayout: "NCHW", device }],
       graphOptimizationLevel: "all",
     });
   })();
@@ -37,21 +60,13 @@ function getSession() {
 }
 
 async function decode(file: Blob) {
-  let bitmap = await createImageBitmap(file);
-  const area = bitmap.width * bitmap.height;
-
-  if (area > MAX_PIXELS) {
-    const scale = Math.sqrt(MAX_PIXELS / area);
-    const resizeWidth = Math.floor(bitmap.width * scale);
-    const resizeHeight = Math.floor(bitmap.height * scale);
-
-    bitmap.close();
-    bitmap = await createImageBitmap(file, { resizeWidth, resizeHeight, resizeQuality: "high" });
-  }
-
-  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, Math.sqrt(MAX_PIXELS / (bitmap.width * bitmap.height)));
+  const canvas = new OffscreenCanvas(Math.floor(bitmap.width * scale), Math.floor(bitmap.height * scale));
   const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(bitmap, 0, 0);
+
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
 
   return { canvas, ctx };
