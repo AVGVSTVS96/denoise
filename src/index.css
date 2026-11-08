@@ -1,0 +1,25 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: light-dark(#fafafa, #0a0a0a);
+  --color-fg: light-dark(#0a0a0a, #ededed);
+  --color-muted: light-dark(#71717a, #8b8b93);
+  --color-line: light-dark(#e4e4e7, #26262b);
+  --color-card: light-dark(#ffffff, #121214);
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-bg text-fg font-sans antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
