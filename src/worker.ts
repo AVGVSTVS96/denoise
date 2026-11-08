@@ -38,6 +38,8 @@ async function requestDevice() {
 
   if (!adapter.features.has("shader-f16")) throw new Error("This GPU can't run the model (no shader-f16).");
 
+  ort.env.webgpu.adapter = adapter;
+
   return adapter.requestDevice({
     requiredFeatures: FEATURES.filter((f) => adapter.features.has(f)),
     requiredLimits: Object.fromEntries(LIMITS.map((name) => [name, adapter.limits[name]])),
