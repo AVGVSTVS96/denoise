@@ -222,81 +222,90 @@ function Editor({
 }) {
   const [split, setSplit] = useState(50);
   const [actual, setActual] = useState(false);
+  const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
+  const image = useRef<HTMLDivElement>(null);
   const done = job.stage === "done";
 
-  const drag = (e: React.PointerEvent) => {
+  const measure = useCallback(() => {
+    if (!frame.current || !image.current) return;
+    setView({
+      scroll: frame.current.scrollLeft,
+      width: frame.current.clientWidth,
+      offset: image.current.offsetLeft,
+      image: image.current.offsetWidth,
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = frame.current;
+
+    if (!actual || !el) return;
+    el.scrollLeft = (el.scrollWidth - el.clientWidth) / 2;
+    el.scrollTop = (el.scrollHeight - el.clientHeight) / 2;
+    measure();
+    addEventListener("resize", measure);
+
+    return () => removeEventListener("resize", measure);
+  }, [actual, measure]);
+
+  useEffect(() => {
+    document.title = job.stage === "clean" ? `${Math.round((job.done / job.total) * 100)}% · denoise` : "denoise";
+  }, [job.stage, job.done, job.total]);
+
+  const dragOver = (e: React.PointerEvent, box: Element) => {
     if (!done || (e.type === "pointermove" && e.buttons === 0)) return;
-    const r = e.currentTarget.getBoundingClientRect();
+    const r = box.getBoundingClientRect();
     setSplit(Math.min(100, Math.max(0, ((e.clientX - r.left) / r.width) * 100)));
   };
 
-  useEffect(() => {
-    if (!actual || !frame.current) return;
-    const el = frame.current;
-    el.scrollLeft = (el.scrollWidth - el.clientWidth) / 2;
-    el.scrollTop = (el.scrollHeight - el.clientHeight) / 2;
-  }, [actual]);
-
   const ratio = job.width && job.height ? job.width / job.height : 3 / 2;
-
-  const size = actual
-    ? { width: job.width / devicePixelRatio }
-    : { width: `min(100%, calc((100dvh - 11rem) * ${ratio}))` };
+  const clip = actual ? ((view.scroll + (split / 100) * view.width - view.offset) / view.image) * 100 : split;
 
   return (
     <>
-      <div
-        ref={frame}
-        className={`flex min-h-0 flex-1 px-5 ${actual ? "overflow-auto" : "items-center justify-center"}`}
-      >
+      <div className="relative flex min-h-0 flex-1">
         <div
-          onPointerDown={(e) => {
-            if (!actual) e.currentTarget.setPointerCapture(e.pointerId);
-            drag(e);
-          }}
-          onPointerMove={drag}
-          style={{ ...size, aspectRatio: ratio }}
-          className={`relative m-auto shrink-0 overflow-hidden rounded-lg bg-line select-none ${done && !actual ? "cursor-ew-resize touch-none" : ""}`}
+          ref={frame}
+          onScroll={actual ? measure : undefined}
+          className={`relative flex min-w-0 flex-1 ${actual ? "overflow-auto" : "items-center justify-center px-5"}`}
         >
-          <img src={job.original} alt="" draggable={false} className="absolute inset-0 size-full" />
-          <canvas
-            ref={canvas}
-            width={job.width}
-            height={job.height}
-            className="absolute inset-0 size-full"
-            style={done ? { clipPath: `inset(0 0 0 ${split}%)` } : undefined}
-          />
-          {done && (
-            <>
-              <div
-                className="pointer-events-none absolute inset-y-0 w-px bg-white/90 shadow-[0_0_8px_rgb(0_0_0/0.5)]"
-                style={{ left: `${split}%` }}
-              />
-              <div
-                className="pointer-events-none absolute top-1/2 grid size-8 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-white text-black shadow-lg"
-                style={{ left: `${split}%` }}
-              >
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 14 14"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.6"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M5 3.5 1.5 7 5 10.5M9 3.5 12.5 7 9 10.5" />
-                </svg>
-              </div>
-              <Tag className="left-2.5">Before</Tag>
-              <Tag className="right-2.5">After</Tag>
-            </>
-          )}
+          <div
+            ref={image}
+            onPointerDown={(e) => {
+              if (actual) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
+              dragOver(e, e.currentTarget);
+            }}
+            onPointerMove={(e) => !actual && dragOver(e, e.currentTarget)}
+            style={{
+              width: actual ? job.width / devicePixelRatio : `min(100%, calc((100dvh - 11rem) * ${ratio}))`,
+              aspectRatio: ratio,
+            }}
+            className={`relative m-auto shrink-0 overflow-hidden bg-line select-none ${actual ? "" : "rounded-lg"} ${done && !actual ? "cursor-ew-resize touch-none" : ""}`}
+          >
+            <img src={job.original} alt="" draggable={false} className="absolute inset-0 size-full" />
+            <canvas
+              ref={canvas}
+              width={job.width}
+              height={job.height}
+              className="absolute inset-0 size-full"
+              style={done ? { clipPath: `inset(0 0 0 ${Math.min(100, Math.max(0, clip))}%)` } : undefined}
+            />
+            {done && !actual && <Divider split={split} />}
+          </div>
         </div>
+        {done && actual && (
+          <Divider
+            split={split}
+            onHandle={(e) => {
+              if (e.type === "pointerdown") e.currentTarget.setPointerCapture(e.pointerId);
+              dragOver(e, frame.current!);
+            }}
+          />
+        )}
       </div>
-      <footer className="shrink-0 px-5 pt-3 pb-4">
+      <footer className={`shrink-0 px-5 pt-3 pb-4 ${actual ? "border-t border-line" : ""}`}>
         <Progress job={job} error={error} />
         <div className="mt-3 flex items-center gap-2">
           <p className="min-w-0 flex-1 truncate text-[13px] text-muted tabular-nums">
@@ -317,10 +326,42 @@ function Editor({
   );
 }
 
+function Divider({ split, onHandle }: { split: number; onHandle?: (e: React.PointerEvent<HTMLDivElement>) => void }) {
+  return (
+    <div className="pointer-events-none absolute inset-0">
+      <div
+        className="absolute inset-y-0 w-px bg-white/90 shadow-[0_0_8px_rgb(0_0_0/0.5)]"
+        style={{ left: `${split}%` }}
+      />
+      <div
+        onPointerDown={onHandle}
+        onPointerMove={onHandle}
+        className={`absolute top-1/2 grid size-8 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-white text-black shadow-lg pointer-coarse:size-10 ${onHandle ? "pointer-events-auto cursor-ew-resize touch-none" : ""}`}
+        style={{ left: `${split}%` }}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 14 14"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M5 3.5 1.5 7 5 10.5M9 3.5 12.5 7 9 10.5" />
+        </svg>
+      </div>
+      <Tag className={`left-2.5 ${split < 15 ? "opacity-0" : ""}`}>Before</Tag>
+      <Tag className={`right-2.5 ${split > 85 ? "opacity-0" : ""}`}>After</Tag>
+    </div>
+  );
+}
+
 function Tag({ children, className }: { children: React.ReactNode; className: string }) {
   return (
     <span
-      className={`pointer-events-none absolute top-2.5 rounded-md bg-black/55 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur ${className}`}
+      className={`absolute top-2.5 rounded-md bg-black/55 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur transition-opacity ${className}`}
     >
       {children}
     </span>
@@ -331,7 +372,7 @@ function Button({ primary, ...props }: React.ButtonHTMLAttributes<HTMLButtonElem
   return (
     <button
       {...props}
-      className={`h-8 shrink-0 rounded-full px-3.5 text-[13px] font-medium transition disabled:opacity-40 ${
+      className={`h-8 shrink-0 rounded-full px-3.5 text-[13px] pointer-coarse:h-10 pointer-coarse:px-4 pointer-coarse:text-sm font-medium transition disabled:opacity-40 ${
         primary ? "bg-fg text-bg hover:opacity-90" : "border border-line bg-card hover:border-muted/40"
       }`}
     />
@@ -349,7 +390,9 @@ function Progress({ job, error }: { job: Job; error?: string }) {
           : 0;
 
   return (
-    <div className="h-1 overflow-hidden rounded-full bg-line">
+    <div
+      className={`h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${job.stage === "done" ? "opacity-0" : ""}`}
+    >
       <div
         className={`h-full rounded-full transition-[width] duration-500 ${error ? "bg-red-500" : "bg-gradient-to-r from-indigo-500 to-cyan-400"}`}
         style={{ width: `${(job.stage === "model" && job.loaded === 0 ? 0 : value) * 100}%` }}
@@ -366,7 +409,7 @@ function status(job: Job) {
       return "Opening photo…";
     case "model":
       return job.loaded > 0 && job.loaded < modelBytes
-        ? `Downloading model · ${mb(job.loaded)} of ${mb(modelBytes)} MB (once)`
+        ? `Model · ${mb(job.loaded)} / ${mb(modelBytes)} MB`
         : "Starting the GPU…";
     case "clean": {
       const left =
