@@ -3,6 +3,7 @@ import manifest from "../public/model/manifest.json";
 export const modelBytes = manifest.bytes;
 
 const cacheName = `model-${manifest.sha256.slice(0, 12)}`;
+const ATTEMPTS = 3;
 
 export async function loadModel(onProgress: (loaded: number) => void): Promise<Uint8Array> {
   const cache = await caches.open(cacheName).catch(() => undefined);
@@ -11,20 +12,13 @@ export async function loadModel(onProgress: (loaded: number) => void): Promise<U
 
   for (const part of manifest.parts) {
     const url = `/model/${part}`;
-    let res = await cache?.match(url);
+    const cached = await cache?.match(url);
 
-    if (!res) {
-      const net = await fetch(url);
+    const body = cached
+      ? new Uint8Array(await cached.arrayBuffer())
+      : await download(url, (n) => onProgress(offset + n));
 
-      if (!net.ok) throw new Error(`Model download failed (${net.status})`);
-      const body = await readAll(net, (n) => onProgress(offset + n));
-      await cache?.put(url, new Response(body)).catch(() => {});
-      out.set(body, offset);
-      offset += body.byteLength;
-      continue;
-    }
-
-    const body = new Uint8Array(await res.arrayBuffer());
+    if (!cached) await cache?.put(url, new Response(body)).catch(() => {});
     out.set(body, offset);
     offset += body.byteLength;
     onProgress(offset);
@@ -35,7 +29,23 @@ export async function loadModel(onProgress: (loaded: number) => void): Promise<U
   return out;
 }
 
-async function readAll(res: Response, onProgress: (n: number) => void): Promise<Uint8Array<ArrayBuffer>> {
+async function download(url: string, onProgress: (n: number) => void) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url);
+
+      if (!res.ok) throw new Error(`Model download failed (${res.status})`);
+
+      return new Uint8Array(await readAll(res, onProgress));
+    } catch (err) {
+      if (attempt === ATTEMPTS) throw err;
+      onProgress(0);
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+}
+
+async function readAll(res: Response, onProgress: (n: number) => void) {
   const chunks: Uint8Array[] = [];
   let n = 0;
   const reader = res.body!.getReader();
@@ -49,13 +59,5 @@ async function readAll(res: Response, onProgress: (n: number) => void): Promise<
     onProgress(n);
   }
 
-  const body = new Uint8Array(n);
-  let at = 0;
-
-  for (const c of chunks) {
-    body.set(c, at);
-    at += c.byteLength;
-  }
-
-  return body;
+  return new Blob(chunks).arrayBuffer();
 }
