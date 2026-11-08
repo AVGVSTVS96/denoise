@@ -37,26 +37,25 @@ function getSession() {
 }
 
 async function decode(file: Blob) {
-  const probe = await createImageBitmap(file);
-  const area = probe.width * probe.height;
-  const scale = area > MAX_PIXELS ? Math.sqrt(MAX_PIXELS / area) : 1;
-  probe.close();
+  let bitmap = await createImageBitmap(file);
+  const area = bitmap.width * bitmap.height;
+  const scaled = area > MAX_PIXELS;
 
-  const bitmap =
-    scale < 1
-      ? await createImageBitmap(file, {
-          resizeWidth: Math.floor(probe.width * scale),
-          resizeHeight: Math.floor(probe.height * scale),
-          resizeQuality: "high",
-        })
-      : await createImageBitmap(file);
+  if (scaled) {
+    const scale = Math.sqrt(MAX_PIXELS / area);
+    const resizeWidth = Math.floor(bitmap.width * scale);
+    const resizeHeight = Math.floor(bitmap.height * scale);
+
+    bitmap.close();
+    bitmap = await createImageBitmap(file, { resizeWidth, resizeHeight, resizeQuality: "high" });
+  }
 
   const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
   const ctx = canvas.getContext("2d")!;
   ctx.drawImage(bitmap, 0, 0);
   bitmap.close();
 
-  return { canvas, ctx, scaled: scale < 1 };
+  return { canvas, ctx, scaled };
 }
 
 const positions = (size: number) => {

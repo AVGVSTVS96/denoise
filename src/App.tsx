@@ -162,12 +162,29 @@ function Pick({ onFile }: { onFile: (f: File) => void }) {
         onClick={() => input.current?.click()}
         className="group flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-line bg-card px-8 py-14 text-center shadow-[0_1px_2px_rgb(0_0_0/0.04)] transition hover:border-muted/40"
       >
-        <div className="relative size-14 overflow-hidden rounded-xl bg-gradient-to-br from-indigo-500 to-cyan-400">
-          <div className="absolute inset-0 opacity-60 mix-blend-overlay [background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%2256%22 height=%2256%22><filter id=%22n%22><feTurbulence baseFrequency=%221.2%22/></filter><rect width=%2256%22 height=%2256%22 filter=%22url(%23n)%22/></svg>')] [mask-image:linear-gradient(110deg,#000_45%,transparent_55%)]" />
-        </div>
+        <svg viewBox="0 0 56 56" className="size-14 rounded-xl" aria-hidden>
+          <defs>
+            <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stopColor="#6366f1" />
+              <stop offset="1" stopColor="#22d3ee" />
+            </linearGradient>
+            <filter id="grain">
+              <feTurbulence type="fractalNoise" baseFrequency="1.1" numOctaves="2" seed="4" />
+              <feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1.6 -0.55" />
+            </filter>
+            <clipPath id="noisy">
+              <path d="M0 0H56L0 56Z" />
+            </clipPath>
+          </defs>
+          <rect width="56" height="56" fill="url(#mark)" />
+          <rect width="56" height="56" filter="url(#grain)" clipPath="url(#noisy)" opacity="0.7" />
+          <path d="M56 0L0 56" stroke="white" strokeOpacity="0.9" strokeWidth="1.5" />
+        </svg>
         <div className="space-y-1.5">
           <h1 className="text-xl font-semibold tracking-tight">Clean up a noisy photo</h1>
-          <p className="text-sm text-muted">High-ISO shots, cleaned on your device. Nothing is uploaded.</p>
+          <p className="text-sm text-balance text-muted">
+            High-ISO shots, cleaned on your device. Nothing is uploaded.
+          </p>
         </div>
         <span className="rounded-full bg-fg px-4 py-2 text-sm font-medium text-bg transition group-hover:opacity-90">
           Choose photo
