@@ -3,7 +3,7 @@ import { loadModel } from "./model";
 
 export type FromWorker =
   | { type: "model"; loaded: number }
-  | { type: "start"; width: number; height: number; scaled: boolean }
+  | { type: "start"; width: number; height: number }
   | { type: "tile"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
   | { type: "done"; blob: Blob }
@@ -39,9 +39,8 @@ function getSession() {
 async function decode(file: Blob) {
   let bitmap = await createImageBitmap(file);
   const area = bitmap.width * bitmap.height;
-  const scaled = area > MAX_PIXELS;
 
-  if (scaled) {
+  if (area > MAX_PIXELS) {
     const scale = Math.sqrt(MAX_PIXELS / area);
     const resizeWidth = Math.floor(bitmap.width * scale);
     const resizeHeight = Math.floor(bitmap.height * scale);
@@ -55,7 +54,7 @@ async function decode(file: Blob) {
   ctx.drawImage(bitmap, 0, 0);
   bitmap.close();
 
-  return { canvas, ctx, scaled };
+  return { canvas, ctx };
 }
 
 const positions = (size: number) => {
@@ -73,9 +72,9 @@ const ramp = (n: number, first: boolean, last: boolean) =>
 const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
 
 async function run(file: Blob) {
-  const { canvas, ctx, scaled } = await decode(file);
+  const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, scaled });
+  post({ type: "start", width: W, height: H });
   const src = ctx.getImageData(0, 0, W, H).data;
   const sess = await getSession();
   const xs = positions(W);

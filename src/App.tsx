@@ -8,7 +8,6 @@ type Job = {
   original: string;
   width: number;
   height: number;
-  scaled: boolean;
   stage: "decode" | "model" | "clean" | "done";
   loaded: number;
   done: number;
@@ -38,7 +37,6 @@ export function App() {
         original: URL.createObjectURL(file),
         width: 0,
         height: 0,
-        scaled: false,
         stage: "decode",
         loaded: 0,
         done: 0,
@@ -56,7 +54,7 @@ export function App() {
     w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
       switch (data.type) {
         case "start":
-          setJob((j) => j && { ...j, width: data.width, height: data.height, scaled: data.scaled, stage: "model" });
+          setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
 
           return;
         case "model":
@@ -361,7 +359,7 @@ function Progress({ job, error }: { job: Job; error?: string }) {
 }
 
 function status(job: Job) {
-  const mp = `${((job.width * job.height) / 1e6).toFixed(1)} MP`;
+  const mp = `${Math.round((job.width * job.height) / 1e6)} MP`;
 
   switch (job.stage) {
     case "decode":
@@ -376,11 +374,11 @@ function status(job: Job) {
           ? ((performance.now() - job.firstTileAt) / (job.done - 1)) * (job.total - job.done)
           : undefined;
 
-      return `Cleaning ${mp} · ${Math.round((job.done / job.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
+      return `Cleaning · ${Math.round((job.done / job.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
     }
 
     case "done":
-      return `Done in ${eta(job.finishedAt! - job.startedAt)} · ${mp}${job.scaled ? " (resized)" : ""}`;
+      return `Done · ${eta(job.finishedAt! - job.startedAt)} · ${mp}`;
   }
 }
 
