@@ -250,8 +250,19 @@ function Editor({
   }, [actual, measure]);
 
   useEffect(() => {
-    document.title = job.stage === "clean" ? `${Math.round((job.done / job.total) * 100)}% · denoise` : "denoise";
-  }, [job.stage, job.done, job.total]);
+    const prefix = {
+      decode: "",
+      model: job.loaded ? `${Math.round((job.loaded / modelBytes) * 100)}% model · ` : "",
+      clean: `${Math.round((job.done / job.total) * 100)}% · `,
+      done: "Done · ",
+    }[job.stage];
+
+    document.title = `${prefix}denoise`;
+
+    return () => {
+      document.title = "denoise";
+    };
+  }, [job.stage, job.done, job.total, job.loaded]);
 
   const dragOver = (e: React.PointerEvent, box: Element) => {
     if (!done || (e.type === "pointermove" && e.buttons === 0)) return;
@@ -268,7 +279,7 @@ function Editor({
         <div
           ref={frame}
           onScroll={actual ? measure : undefined}
-          className={`relative flex min-w-0 flex-1 ${actual ? "overflow-auto" : "items-center justify-center px-5"}`}
+          className={`relative flex min-w-0 flex-1 ${actual ? "overflow-auto [scrollbar-width:none]" : "items-center justify-center px-5"}`}
         >
           <div
             ref={image}
@@ -305,9 +316,9 @@ function Editor({
           />
         )}
       </div>
-      <footer className={`shrink-0 px-5 pt-3 pb-4 ${actual ? "border-t border-line" : ""}`}>
+      <footer className="relative shrink-0 px-5 py-3">
         <Progress job={job} error={error} />
-        <div className="mt-3 flex items-center gap-2">
+        <div className="flex items-center gap-2">
           <p className="min-w-0 flex-1 truncate text-[13px] text-muted tabular-nums">
             {error ? <span className="text-red-500">{error}</span> : status(job)}
           </p>
@@ -391,7 +402,7 @@ function Progress({ job, error }: { job: Job; error?: string }) {
 
   return (
     <div
-      className={`h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${job.stage === "done" ? "opacity-0" : ""}`}
+      className={`absolute inset-x-5 top-0 h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${job.stage === "done" ? "opacity-0" : ""}`}
     >
       <div
         className={`h-full rounded-full transition-[width] duration-500 ${error ? "bg-red-500" : "bg-gradient-to-r from-indigo-500 to-cyan-400"}`}
