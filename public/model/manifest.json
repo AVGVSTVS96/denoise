@@ -3,8 +3,8 @@
   "bytes": 59371902,
   "sha256": "b98d15ca25ef7b43fffe9661a0603e6841c2734d8811c0d602ca6ce39eafc8ac",
   "parts": [
-    "nafnet-w32-fp16.part0",
-    "nafnet-w32-fp16.part1",
-    "nafnet-w32-fp16.part2"
+    "b98d15ca/nafnet-w32-fp16.part0",
+    "b98d15ca/nafnet-w32-fp16.part1",
+    "b98d15ca/nafnet-w32-fp16.part2"
   ]
 }

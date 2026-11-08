@@ -1,0 +1,8 @@
+{
+  "headers": [
+    {
+      "source": "/model/b98d15ca/(.*)",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+    }
+  ]
+}
