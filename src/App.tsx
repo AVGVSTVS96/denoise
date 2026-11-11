@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
+import { listPhotos, savePhoto, type Photo } from "./library";
 import { modelBytes } from "./model";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
 import type { FromWorker } from "./worker";
@@ -20,6 +21,9 @@ type Job = {
   firstTileAt?: number;
   finishedAt?: number;
   result?: Blob;
+  cleaned?: ImageBitmap;
+  savedAt?: number;
+  saving?: "saving" | "saved" | "failed";
 };
 
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
@@ -33,6 +37,7 @@ export function App() {
   const [error, setError] = useState<string>();
   const [key, setKey] = useState(cloudKey);
   const [model, setModel] = useState<Model>(() => (localStorage.getItem("cloud-model") === "pro" ? "pro" : "flash"));
+  const [photos, setPhotos] = useState<Photo[]>();
   const canvas = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
@@ -42,16 +47,31 @@ export function App() {
       .catch((err: Error) => setError(err.message));
   }, []);
 
+  // Photos cleaned on another device show up when this page comes back into view.
+  useEffect(() => {
+    if (!key) return;
+
+    const refresh = () => {
+      if (document.visibilityState === "visible") listPhotos(key).then(setPhotos, () => {});
+    };
+
+    refresh();
+    document.addEventListener("visibilitychange", refresh);
+
+    return () => document.removeEventListener("visibilitychange", refresh);
+  }, [key]);
+
   const open = useCallback(
     async (file: File) => {
       worker.current?.terminate();
       setError(undefined);
       const shown = (await rawPreview(file)) ?? file;
+      const name = file.name.replace(/\.[^.]+$/, "") || "photo";
       setJob((old) => {
         if (old) URL.revokeObjectURL(old.original);
 
         return {
-          name: file.name.replace(/\.[^.]+$/, "") || "photo",
+          name,
           original: URL.createObjectURL(shown),
           cloud: key && MODELS[model].name,
           width: 0,
@@ -103,6 +123,17 @@ export function App() {
             lock?.release();
             setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
 
+            if (key) {
+              setJob((j) => j && { ...j, saving: "saving" });
+              savePhoto(key, name, shown, data.blob).then(
+                (photo) => {
+                  setPhotos((p) => [photo, ...(p ?? [])]);
+                  setJob((j) => j && { ...j, saving: "saved" });
+                },
+                () => setJob((j) => j && { ...j, saving: "failed" }),
+              );
+            }
+
             return;
           case "error":
             lock?.release();
@@ -116,6 +147,36 @@ export function App() {
     },
     [key, model],
   );
+
+  const view = async (photo: Photo) => {
+    worker.current?.terminate();
+    setError(undefined);
+
+    try {
+      const result = await fetch(photo.result!).then((res) => res.blob());
+      const cleaned = await createImageBitmap(result);
+      setJob((old) => {
+        if (old) URL.revokeObjectURL(old.original);
+
+        return {
+          name: photo.name,
+          original: photo.original ?? photo.result!,
+          width: cleaned.width,
+          height: cleaned.height,
+          stage: "done",
+          loaded: 0,
+          done: 1,
+          total: 1,
+          startedAt: 0,
+          result,
+          cleaned,
+          savedAt: photo.at,
+        };
+      });
+    } catch {
+      setError("That photo couldn't be opened. Try again.");
+    }
+  };
 
   const reset = () => {
     worker.current?.terminate();
@@ -178,9 +239,12 @@ export function App() {
               setModel(m);
             }}
             error={error}
+            photos={photos}
+            onPhoto={view}
             onCloud={() => {
               if (!key) return signIn();
               signOut();
+              setPhotos(undefined);
               setKey(undefined);
             }}
           />
@@ -196,6 +260,8 @@ function Pick({
   model,
   onModel,
   error,
+  photos,
+  onPhoto,
   onCloud,
 }: {
   onFile: (f: File) => void;
@@ -203,59 +269,80 @@ function Pick({
   model: Model;
   onModel: (m: Model) => void;
   error?: string;
+  photos?: Photo[];
+  onPhoto: (p: Photo) => void;
   onCloud: () => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
 
   return (
-    <div className="flex flex-1 items-center justify-center p-5">
-      <button
-        onClick={() => input.current?.click()}
-        className="group flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-line bg-card px-8 py-14 text-center shadow-[0_1px_2px_rgb(0_0_0/0.04)] transition hover:border-muted/40"
-      >
-        <svg viewBox="0 0 56 56" className="size-14 rounded-xl" aria-hidden>
-          <defs>
-            <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stopColor="#6366f1" />
-              <stop offset="1" stopColor="#22d3ee" />
-            </linearGradient>
-            <filter id="grain">
-              <feTurbulence type="fractalNoise" baseFrequency="1.1" numOctaves="2" seed="4" />
-              <feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1.6 -0.55" />
-            </filter>
-            <clipPath id="noisy">
-              <path d="M0 0H56L0 56Z" />
-            </clipPath>
-          </defs>
-          <rect width="56" height="56" fill="url(#mark)" />
-          <rect width="56" height="56" filter="url(#grain)" clipPath="url(#noisy)" opacity="0.7" />
-          <path d="M56 0L0 56" stroke="white" strokeOpacity="0.9" strokeWidth="1.5" />
-        </svg>
-        <div className="space-y-1.5">
-          <h1 className="text-xl font-semibold tracking-tight">Clean up a noisy photo</h1>
-          <p className="text-sm text-balance text-muted">
-            {cloud
-              ? `Cleaned at full size by ${MODELS[model].name} on your OpenRouter account, about $${(MODELS[model].perTile * 24).toFixed(2)} for a 16 MP photo.`
-              : "High-ISO shots, cleaned on your device. Nothing is uploaded."}
-          </p>
-        </div>
-        <span className="rounded-full bg-fg px-4 py-2 text-sm font-medium text-bg transition group-hover:opacity-90">
-          Choose photo
-        </span>
-        <input
-          ref={input}
-          type="file"
-          accept="image/*,.dng"
-          hidden
-          onChange={(e) => {
-            const f = e.target.files?.[0];
+    <div className="flex flex-1 flex-col overflow-y-auto">
+      <div className="flex min-h-[26rem] flex-1 items-center justify-center p-5">
+        <button
+          onClick={() => input.current?.click()}
+          className="group flex w-full max-w-md flex-col items-center gap-5 rounded-2xl border border-line bg-card px-8 py-14 text-center shadow-[0_1px_2px_rgb(0_0_0/0.04)] transition hover:border-muted/40"
+        >
+          <svg viewBox="0 0 56 56" className="size-14 rounded-xl" aria-hidden>
+            <defs>
+              <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stopColor="#6366f1" />
+                <stop offset="1" stopColor="#22d3ee" />
+              </linearGradient>
+              <filter id="grain">
+                <feTurbulence type="fractalNoise" baseFrequency="1.1" numOctaves="2" seed="4" />
+                <feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 1.6 -0.55" />
+              </filter>
+              <clipPath id="noisy">
+                <path d="M0 0H56L0 56Z" />
+              </clipPath>
+            </defs>
+            <rect width="56" height="56" fill="url(#mark)" />
+            <rect width="56" height="56" filter="url(#grain)" clipPath="url(#noisy)" opacity="0.7" />
+            <path d="M56 0L0 56" stroke="white" strokeOpacity="0.9" strokeWidth="1.5" />
+          </svg>
+          <div className="space-y-1.5">
+            <h1 className="text-xl font-semibold tracking-tight">Clean up a noisy photo</h1>
+            <p className="text-sm text-balance text-muted">
+              {cloud
+                ? `Cleaned at full size by ${MODELS[model].name} on your OpenRouter account, about $${(MODELS[model].perTile * 24).toFixed(2)} for a 16 MP photo.`
+                : "High-ISO shots, cleaned on your device. Nothing is uploaded."}
+            </p>
+          </div>
+          <span className="rounded-full bg-fg px-4 py-2 text-sm font-medium text-bg transition group-hover:opacity-90">
+            Choose photo
+          </span>
+          <input
+            ref={input}
+            type="file"
+            accept="image/*,.dng"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
 
-            if (f) onFile(f);
-            e.target.value = "";
-          }}
-        />
-      </button>
-      <div className="fixed inset-x-0 bottom-[max(1.5rem,env(safe-area-inset-bottom))] space-y-2 px-6 text-center text-xs text-muted">
+              if (f) onFile(f);
+              e.target.value = "";
+            }}
+          />
+        </button>
+      </div>
+      {cloud && photos && photos.length > 0 && (
+        <section className="mx-auto w-full max-w-3xl px-5 pb-2">
+          <h2 className="mb-2.5 text-[13px] font-medium text-muted">Your photos</h2>
+          <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4 md:grid-cols-5">
+            {photos.map((photo) => (
+              <button
+                key={photo.id}
+                onClick={() => onPhoto(photo)}
+                title={photo.name}
+                className="aspect-square overflow-hidden rounded-lg bg-line transition hover:opacity-90"
+              >
+                <img src={photo.thumb} alt={photo.name} loading="lazy" className="size-full object-cover" />
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+      <div className="shrink-0 space-y-2 px-6 py-6 text-center text-xs text-muted">
         {error && <p className="text-red-500">{error}</p>}
         {cloud && (
           <div className="flex justify-center gap-1">
@@ -296,6 +383,10 @@ function Editor({
   const frame = useRef<HTMLDivElement>(null);
   const image = useRef<HTMLDivElement>(null);
   const done = job.stage === "done";
+
+  useEffect(() => {
+    if (job.cleaned) canvas.current?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
+  }, [job.cleaned, canvas]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -504,8 +595,12 @@ function status(job: Job) {
       return `Cleaning · ${Math.round((job.done / job.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
     }
 
-    case "done":
-      return `Done · ${eta(job.finishedAt! - job.startedAt)} · ${mp}`;
+    case "done": {
+      if (job.savedAt) return `Saved ${new Date(job.savedAt).toLocaleDateString()} · ${mp}`;
+      const saving = { saving: " · Saving to your photos…", saved: " · In your photos", failed: " · Not saved" };
+
+      return `Done · ${eta(job.finishedAt! - job.startedAt)} · ${mp}${job.saving ? saving[job.saving] : ""}`;
+    }
   }
 }
 
