@@ -15,6 +15,7 @@
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",
     "@vercel/blob": "^2.9.0",
+    "botid": "^1.5.13",
     "onnxruntime-web": "^1.31.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
