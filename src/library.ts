@@ -29,10 +29,10 @@ export async function savePhoto(key: string, name: string, original: Blob, resul
   return photo;
 }
 
-async function upload(url: string, blob: Blob) {
-  const res = await fetch(url, { method: "PUT", body: blob, headers: { "Content-Type": blob.type || "image/jpeg" } });
+export async function upload(url: string, blob: Blob, type = blob.type || "image/jpeg") {
+  const res = await fetch(url, { method: "PUT", body: blob, headers: { "Content-Type": type } });
 
-  if (!res.ok) throw new Error(`Saving to your account failed (${res.status})`);
+  if (!res.ok) throw new Error(`Upload failed (${res.status})`);
 }
 
 async function thumbnail(blob: Blob) {

@@ -1,6 +1,6 @@
 # denoise
 
-Clean up high-ISO photos in the browser. The model runs on your GPU through WebGPU and the photo never leaves your device, unless you sign in to clean it in the cloud.
+Clean up high-ISO photos in the browser. The model runs on your GPU through WebGPU. Each finished clean, the photo as given and the result, is kept privately as training data for the model; turn that off under the Choose photo card and the photo never leaves your device, unless you sign in to clean it in the cloud.
 
 ```sh
 bun install
@@ -17,7 +17,7 @@ Raw files (DNG) are read through the camera's full-size JPEG preview, not the ti
 
 ## Cloud
 
-Sign in with your own OpenRouter account and the photo is cleaned by Gemini 3.1 Flash Image or Gemini 3 Pro Image instead, billed to that account. They see only a small picture, so a whole photo comes back with made-up text; the app sends it in 1024 px tiles and stitches them back, joining tiles in a narrow band so their details don't double up and putting back the photo's own brightness.
+Sign in with your own OpenRouter account and the photo is cleaned by Gemini 3.1 Flash Image or Gemini 3 Pro Image instead, billed to that account, and every cleaned photo is kept on that account: it opens again from Your photos on any device signed in to it. They see only a small picture, so a whole photo comes back with made-up text; the app sends it in 1024 px tiles and stitches them back, joining tiles in a narrow band so their details don't double up and putting back the photo's own brightness.
 
 ## Model
 

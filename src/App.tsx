@@ -3,6 +3,7 @@ import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
 import { modelBytes } from "./model";
+import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
 import type { FromWorker } from "./worker";
 import Worker from "./worker?worker";
@@ -90,9 +91,11 @@ export function App() {
         ?.request("screen")
         .then((l) => (lock = l))
         .catch(() => {});
+      let size = { width: 0, height: 0 };
       w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
         switch (data.type) {
           case "start":
+            size = { width: data.width, height: data.height };
             setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
 
             return;
@@ -122,6 +125,9 @@ export function App() {
           case "done":
             lock?.release();
             setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
+
+            if (sharing())
+              share(file, data.blob, { model: key ? MODELS[model].id : "on-device", ...size }).catch(() => {});
 
             if (key) {
               setJob((j) => j && { ...j, saving: "saving" });
@@ -274,6 +280,7 @@ function Pick({
   onCloud: () => void;
 }) {
   const input = useRef<HTMLInputElement>(null);
+  const [train, setTrain] = useState(sharing);
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -305,7 +312,7 @@ function Pick({
             <p className="text-sm text-balance text-muted">
               {cloud
                 ? `Cleaned at full size by ${MODELS[model].name} on your OpenRouter account, about $${(MODELS[model].perTile * 24).toFixed(2)} for a 16 MP photo.`
-                : "High-ISO shots, cleaned on your device. Nothing is uploaded."}
+                : `High-ISO shots, cleaned on your device.${train ? "" : " Nothing is uploaded."}`}
             </p>
           </div>
           <span className="rounded-full bg-fg px-4 py-2 text-sm font-medium text-bg transition group-hover:opacity-90">
@@ -359,6 +366,17 @@ function Pick({
         )}
         <button onClick={onCloud} className="underline-offset-2 hover:text-fg hover:underline">
           {cloud ? "Cloud on · Sign out of OpenRouter" : "Clean in the cloud: sign in with OpenRouter"}
+        </button>
+        <button
+          onClick={() => {
+            setSharing(!train);
+            setTrain(!train);
+          }}
+          className="block w-full underline-offset-2 hover:text-fg hover:underline"
+        >
+          {train
+            ? "Photos you clean help train denoise · Turn off"
+            : "Photos you clean stay private · Share for training"}
         </button>
         {!cloud && !hasWebGPU && <p>This browser has no WebGPU. Use Safari 26+ or Chrome.</p>}
       </div>
