@@ -15,9 +15,15 @@ bun dev
 
 ## Model
 
-NAFNet, SIDD width 32 ([megvii-research/NAFNet](https://github.com/megvii-research/NAFNet), MIT), as fp16 ONNX in `public/model/` (split into parts under 20 MB).
+NAFNet width 32 ([megvii-research/NAFNet](https://github.com/megvii-research/NAFNet), MIT), as fp16 ONNX in `public/model/` (split into parts under 20 MB). It starts from the published SIDD weights and is fine-tuned in `eval/train.py` on real high-ISO camera shots from NIND (Brummer & De Vleeschouwer) mixed with SIDD phone crops.
 
-The ONNX file was exported with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN. Run `uv run export.py nafnet-sidd-w32` in Hush's `tools/models`; the output's sha256 matches `public/model/manifest.json`.
+| Held-out test shots (PSNR, dB) | SIDD weights | Fine-tuned |
+| --- | --- | --- |
+| Camera, ISO 12,800–102,400 (NIND, 78) | 28.55 | 29.23 |
+| Camera, ISO ≤6,400 (PolyU, 100) | 37.39 | 37.69 |
+| Phone (SIDD, 320 crops) | 40.43 | 40.32 |
+
+`eval/ship.py` exports it with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
 
 ## License
 

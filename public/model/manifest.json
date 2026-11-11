@@ -1,10 +1,10 @@
 {
-  "name": "NAFNet SIDD width 32, fp16 (attention bounded, via Hush tools/models)",
+  "name": "NAFNet width 32, SIDD weights fine-tuned on NIND high-ISO and SIDD, fp16 (attention bounded, via Hush tools/models)",
   "bytes": 59371902,
-  "sha256": "b98d15ca25ef7b43fffe9661a0603e6841c2734d8811c0d602ca6ce39eafc8ac",
+  "sha256": "20bcbdcbbd70cc8ca754f58861dfadc0eb8d32cfd7b45db1ecb2a6578401e720",
   "parts": [
-    "b98d15ca/nafnet-w32-fp16.part0",
-    "b98d15ca/nafnet-w32-fp16.part1",
-    "b98d15ca/nafnet-w32-fp16.part2"
+    "20bcbdcb/nafnet-w32-hiso-fp16.part0",
+    "20bcbdcb/nafnet-w32-hiso-fp16.part1",
+    "20bcbdcb/nafnet-w32-hiso-fp16.part2"
   ]
 }
