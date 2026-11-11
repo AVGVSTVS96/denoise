@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { MODELS, type Model } from "./cloud";
+import { rawPreview } from "./dng";
 import { modelBytes } from "./model";
+import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
 import type { FromWorker } from "./worker";
 import Worker from "./worker?worker";
 
 type Job = {
   name: string;
   original: string;
+  cloud?: string;
   width: number;
   height: number;
   stage: "decode" | "model" | "clean" | "done";
@@ -20,81 +24,98 @@ type Job = {
 
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
+const CHOICES: Model[] = ["flash", "pro"];
+
+const isPhoto = (f: File) => f.type.startsWith("image/") || /\.dng$/i.test(f.name);
+
 export function App() {
   const [job, setJob] = useState<Job>();
   const [error, setError] = useState<string>();
+  const [key, setKey] = useState(cloudKey);
+  const [model, setModel] = useState<Model>(() => (localStorage.getItem("cloud-model") === "pro" ? "pro" : "flash"));
   const canvas = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
-  const open = useCallback((file: File) => {
-    worker.current?.terminate();
-    setError(undefined);
-    setJob((old) => {
-      if (old) URL.revokeObjectURL(old.original);
-
-      return {
-        name: file.name.replace(/\.[^.]+$/, "") || "photo",
-        original: URL.createObjectURL(file),
-        width: 0,
-        height: 0,
-        stage: "decode",
-        loaded: 0,
-        done: 0,
-        total: 0,
-        startedAt: performance.now(),
-      };
-    });
-    const w = new Worker();
-    worker.current = w;
-    let lock: WakeLockSentinel | undefined;
-    navigator.wakeLock
-      ?.request("screen")
-      .then((l) => (lock = l))
-      .catch(() => {});
-    w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
-      switch (data.type) {
-        case "start":
-          setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
-
-          return;
-        case "model":
-          setJob((j) => j && { ...j, loaded: data.loaded });
-
-          return;
-        case "progress":
-          setJob((j) => {
-            if (!j) return j;
-            const now = performance.now();
-
-            return {
-              ...j,
-              stage: "clean",
-              done: data.done,
-              total: data.total,
-              firstTileAt: data.done === 1 ? now : j.firstTileAt,
-            };
-          });
-
-          return;
-        case "tile":
-          canvas.current?.getContext("2d")?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
-
-          return;
-        case "done":
-          lock?.release();
-          setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
-
-          return;
-        case "error":
-          lock?.release();
-          setError(data.message);
-
-          return;
-      }
-    });
-
-    w.postMessage({ file });
+  useEffect(() => {
+    finishSignIn()
+      .then(() => setKey(cloudKey()))
+      .catch((err: Error) => setError(err.message));
   }, []);
+
+  const open = useCallback(
+    async (file: File) => {
+      worker.current?.terminate();
+      setError(undefined);
+      const shown = (await rawPreview(file)) ?? file;
+      setJob((old) => {
+        if (old) URL.revokeObjectURL(old.original);
+
+        return {
+          name: file.name.replace(/\.[^.]+$/, "") || "photo",
+          original: URL.createObjectURL(shown),
+          cloud: key && MODELS[model].name,
+          width: 0,
+          height: 0,
+          stage: "decode",
+          loaded: 0,
+          done: 0,
+          total: 0,
+          startedAt: performance.now(),
+        };
+      });
+      const w = new Worker();
+      worker.current = w;
+      let lock: WakeLockSentinel | undefined;
+      navigator.wakeLock
+        ?.request("screen")
+        .then((l) => (lock = l))
+        .catch(() => {});
+      w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
+        switch (data.type) {
+          case "start":
+            setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
+
+            return;
+          case "model":
+            setJob((j) => j && { ...j, loaded: data.loaded });
+
+            return;
+          case "progress":
+            setJob((j) => {
+              if (!j) return j;
+              const now = performance.now();
+
+              return {
+                ...j,
+                stage: "clean",
+                done: data.done,
+                total: data.total,
+                firstTileAt: data.done === 1 ? now : j.firstTileAt,
+              };
+            });
+
+            return;
+          case "tile":
+            canvas.current?.getContext("2d")?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
+
+            return;
+          case "done":
+            lock?.release();
+            setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
+
+            return;
+          case "error":
+            lock?.release();
+            setError(data.message);
+
+            return;
+        }
+      });
+
+      w.postMessage({ file, key, model });
+    },
+    [key, model],
+  );
 
   const reset = () => {
     worker.current?.terminate();
@@ -106,14 +127,14 @@ export function App() {
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      const file = [...(e.clipboardData?.files ?? [])].find((f) => f.type.startsWith("image/"));
+      const file = [...(e.clipboardData?.files ?? [])].find(isPhoto);
 
       if (file) open(file);
     };
 
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
-      const file = [...(e.dataTransfer?.files ?? [])].find((f) => f.type.startsWith("image/"));
+      const file = [...(e.dataTransfer?.files ?? [])].find(isPhoto);
 
       if (file) open(file);
     };
@@ -145,13 +166,45 @@ export function App() {
         </a>
       </header>
       <main className="flex min-h-0 flex-1 flex-col">
-        {job ? <Editor job={job} error={error} canvas={canvas} onNew={reset} /> : <Pick onFile={open} />}
+        {job ? (
+          <Editor job={job} error={error} canvas={canvas} onNew={reset} />
+        ) : (
+          <Pick
+            onFile={open}
+            cloud={Boolean(key)}
+            model={model}
+            onModel={(m) => {
+              localStorage.setItem("cloud-model", m);
+              setModel(m);
+            }}
+            error={error}
+            onCloud={() => {
+              if (!key) return signIn();
+              signOut();
+              setKey(undefined);
+            }}
+          />
+        )}
       </main>
     </div>
   );
 }
 
-function Pick({ onFile }: { onFile: (f: File) => void }) {
+function Pick({
+  onFile,
+  cloud,
+  model,
+  onModel,
+  error,
+  onCloud,
+}: {
+  onFile: (f: File) => void;
+  cloud: boolean;
+  model: Model;
+  onModel: (m: Model) => void;
+  error?: string;
+  onCloud: () => void;
+}) {
   const input = useRef<HTMLInputElement>(null);
 
   return (
@@ -181,7 +234,9 @@ function Pick({ onFile }: { onFile: (f: File) => void }) {
         <div className="space-y-1.5">
           <h1 className="text-xl font-semibold tracking-tight">Clean up a noisy photo</h1>
           <p className="text-sm text-balance text-muted">
-            High-ISO shots, cleaned on your device. Nothing is uploaded.
+            {cloud
+              ? `Cleaned at full size by ${MODELS[model].name} on your OpenRouter account, about $${(MODELS[model].perTile * 24).toFixed(2)} for a 16 MP photo.`
+              : "High-ISO shots, cleaned on your device. Nothing is uploaded."}
           </p>
         </div>
         <span className="rounded-full bg-fg px-4 py-2 text-sm font-medium text-bg transition group-hover:opacity-90">
@@ -190,7 +245,7 @@ function Pick({ onFile }: { onFile: (f: File) => void }) {
         <input
           ref={input}
           type="file"
-          accept="image/*"
+          accept="image/*,.dng"
           hidden
           onChange={(e) => {
             const f = e.target.files?.[0];
@@ -200,11 +255,26 @@ function Pick({ onFile }: { onFile: (f: File) => void }) {
           }}
         />
       </button>
-      {!hasWebGPU && (
-        <p className="fixed inset-x-0 bottom-[max(1.5rem,env(safe-area-inset-bottom))] px-6 text-center text-xs text-muted">
-          This browser has no WebGPU. Use Safari 26+ or Chrome.
-        </p>
-      )}
+      <div className="fixed inset-x-0 bottom-[max(1.5rem,env(safe-area-inset-bottom))] space-y-2 px-6 text-center text-xs text-muted">
+        {error && <p className="text-red-500">{error}</p>}
+        {cloud && (
+          <div className="flex justify-center gap-1">
+            {CHOICES.map((m) => (
+              <button
+                key={m}
+                onClick={() => onModel(m)}
+                className={`rounded-full px-3 py-1.5 pointer-coarse:py-2 ${m === model ? "bg-fg text-bg" : "border border-line bg-card hover:text-fg"}`}
+              >
+                {MODELS[m].name}
+              </button>
+            ))}
+          </div>
+        )}
+        <button onClick={onCloud} className="underline-offset-2 hover:text-fg hover:underline">
+          {cloud ? "Cloud on · Sign out of OpenRouter" : "Clean in the cloud: sign in with OpenRouter"}
+        </button>
+        {!cloud && !hasWebGPU && <p>This browser has no WebGPU. Use Safari 26+ or Chrome.</p>}
+      </div>
     </div>
   );
 }
@@ -413,12 +483,15 @@ function Progress({ job, error }: { job: Job; error?: string }) {
 }
 
 function status(job: Job) {
-  const mp = `${Math.round((job.width * job.height) / 1e6)} MP`;
+  const megapixels = (job.width * job.height) / 1e6;
+  const mp = `${megapixels < 10 ? megapixels.toFixed(1) : Math.round(megapixels)} MP`;
 
   switch (job.stage) {
     case "decode":
       return "Opening photo…";
     case "model":
+      if (job.cloud) return `Sending to ${job.cloud}…`;
+
       return job.loaded > 0 && job.loaded < modelBytes
         ? `Model · ${mb(job.loaded)} / ${mb(modelBytes)} MB`
         : "Starting the GPU…";
