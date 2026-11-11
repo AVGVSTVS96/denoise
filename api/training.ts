@@ -5,7 +5,7 @@
 // a few dozen cleans a day, and the whole site a few hundred.
 import { issueSignedToken, list, presignUrl, put } from "@vercel/blob";
 import { checkBotId } from "botid/server";
-import { MODELS } from "../src/cloud";
+import { MODELS } from "../src/cloud.js";
 
 const PER_VISITOR = 40;
 const PER_DAY = 200;
