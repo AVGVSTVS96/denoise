@@ -3,8 +3,9 @@
     uv run train.py --steps 6000
 
 Starts from the published SIDD weights, so what the model already does on phone noise is the
-starting point. A third of the noisy patches are JPEG-compressed first, since photos reach the
-app as JPEG. Every `--check` steps it scores the held-out NIND scenes and saves
+starting point, and a third of the patches are SIDD phone crops so it keeps that. A third of the
+noisy patches are JPEG-compressed first, since photos reach the app as JPEG. Every `--check`
+steps it scores the held-out NIND scenes and SIDD photos and saves
 data/models/finetune/step<N>.pth.
 """
 
@@ -21,6 +22,7 @@ import evaluate
 
 TRAIN = evaluate.DATA / "train"
 JPEG_SHARE = 1 / 3
+PHONE_SHARE = 1 / 3
 OUT = evaluate.MODELS / "finetune"
 PATCH = 256
 
@@ -32,13 +34,13 @@ def pairs():
     return [(TRAIN / f"{crop}_clean.png", frames) for crop, frames in by_crop.items()]
 
 
-def batch(loaded, size, rng):
+def batch(camera, phone, size, rng):
     """Random 256 px patches, flipped and turned, one ISO picked per crop."""
     noisy, clean = [], []
     for _ in range(size):
-        target, frames = rng.choice(loaded)
+        target, frames = rng.choice(phone if rng.random() < PHONE_SHARE else camera)
         source = rng.choice(frames)
-        y, x = rng.randrange(evaluate.TILE - PATCH + 1), rng.randrange(evaluate.TILE - PATCH + 1)
+        y, x = (rng.randrange(side - PATCH + 1) for side in target.shape[:2])
         pair = np.stack([source[y : y + PATCH, x : x + PATCH], target[y : y + PATCH, x : x + PATCH]])
         if rng.random() < 0.5:
             pair = pair[:, :, ::-1]
@@ -71,21 +73,26 @@ def psnr(model, held_out):
     return float(np.mean(scores))
 
 
+def scores(model, held_out):
+    return " ".join(f"{name} {psnr(model, shots):.2f}" for name, shots in held_out.items())
+
+
 def main(args):
     rng = random.Random(0)
     torch.manual_seed(0)
     read = lambda path: cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
-    loaded = [(read(target), [read(f) for f in frames]) for target, frames in pairs()]
-    held_out = [(n, c) for _, _, n, c in evaluate.nind()]
+    camera = [(read(target), [read(f) for f in frames]) for target, frames in pairs()]
+    phone = [(clean, [noisy]) for _, noisy, clean in evaluate.sidd_pairs(held_out=False)]
+    held_out = {name: [(n, c) for _, _, n, c in evaluate.SETS[name]()] for name in ("nind", "sidd")}
     model = evaluate.nafnet(32).to(evaluate.DEVICE).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.9), weight_decay=0)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps, eta_min=args.lr / 100)
     OUT.mkdir(parents=True, exist_ok=True)
-    print(f"{len(loaded)} crops; step 0 nind {psnr(model, held_out):.2f}", flush=True)
+    print(f"{len(camera)} camera crops, {len(phone)} phone crops; step 0 {scores(model, held_out)}", flush=True)
 
     running = 0.0
     for step in range(1, args.steps + 1):
-        noisy, clean = batch(loaded, args.batch, rng)
+        noisy, clean = batch(camera, phone, args.batch, rng)
         loss = torch.nn.functional.l1_loss(model(noisy), clean)
         optimizer.zero_grad()
         loss.backward()
@@ -94,7 +101,7 @@ def main(args):
         schedule.step()
         running += loss.item()
         if step % args.check == 0:
-            print(f"step {step} loss {running / args.check:.4f} nind {psnr(model, held_out):.2f}", flush=True)
+            print(f"step {step} loss {running / args.check:.4f} {scores(model, held_out)}", flush=True)
             running = 0.0
             torch.save(model.state_dict(), OUT / f"step{step}.pth")
 

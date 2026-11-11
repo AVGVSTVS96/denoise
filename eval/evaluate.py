@@ -53,11 +53,18 @@ def polyu():
         yield noisy.stem, iso, read(noisy), read(noisy.with_name(noisy.name.replace("_real", "_mean")))
 
 
-def sidd():
-    """Every eighth SIDD validation crop: phone noise, what the published weights were trained on."""
+def sidd_pairs(held_out):
+    """SIDD validation crops, 32 per phone photo. Every fourth photo is held out of train.py."""
     import sidd as source
 
-    for key, noisy, clean in source.pairs(every=8):
+    for key, noisy, clean in source.pairs():
+        if (int(key.rsplit("_", 1)[1]) // 32 % 4 == 0) == held_out:
+            yield key, noisy, clean
+
+
+def sidd():
+    """Phone noise, what the published weights were trained on."""
+    for key, noisy, clean in sidd_pairs(held_out=True):
         yield key, 0, noisy, clean
 
 
