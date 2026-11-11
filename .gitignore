@@ -24,3 +24,10 @@ dist-ssr
 *.sw?
 .vercel
 .env*
+
+# Model evaluation and training
+eval/data
+eval/.venv
+eval/bench/node_modules
+eval/bench/bun.lock
+__pycache__

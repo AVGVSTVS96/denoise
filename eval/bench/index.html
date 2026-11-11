@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>model bench</title>
+<canvas id="c" width="512" height="512"></canvas>
+<script type="module">
+  import * as ort from "/ort/ort.webgpu.bundle.min.mjs";
+
+  const params = new URLSearchParams(location.search);
+  const TILE = 512;
+
+  async function main() {
+    ort.env.wasm.wasmPaths = "/ort/";
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const model = new Uint8Array(await (await fetch(params.get("model"))).arrayBuffer());
+    const started = performance.now();
+    const session = await ort.InferenceSession.create(model, {
+      executionProviders: [{ name: "webgpu", preferredLayout: "NCHW" }],
+      graphOptimizationLevel: "all",
+    });
+    const load = performance.now() - started;
+
+    const bitmap = await createImageBitmap(await (await fetch(params.get("image"))).blob());
+    const ctx = document.getElementById("c").getContext("2d");
+    ctx.drawImage(bitmap, (bitmap.width - TILE) / 2, (bitmap.height - TILE) / 2, TILE, TILE, 0, 0, TILE, TILE);
+    const src = ctx.getImageData(0, 0, TILE, TILE).data;
+    const plane = TILE * TILE;
+    const input = new Float32Array(3 * plane);
+    for (let i = 0; i < plane; i++) for (let c = 0; c < 3; c++) input[c * plane + i] = src[i * 4 + c] / 255;
+
+    const times = [];
+    let out;
+    for (let run = 0; run < Number(params.get("runs") ?? 4); run++) {
+      const t = performance.now();
+      const result = await session.run({
+        [session.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, TILE, TILE]),
+      });
+      out = await result[session.outputNames[0]].getData();
+      times.push(Math.round(performance.now() - t));
+    }
+
+    const pixels = new Uint8ClampedArray(plane * 4);
+    let bad = 0;
+    for (let i = 0; i < plane; i++) {
+      for (let c = 0; c < 3; c++) {
+        const v = out[c * plane + i];
+        if (!Number.isFinite(v)) bad++;
+        pixels[i * 4 + c] = v * 255 + 0.5;
+      }
+      pixels[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(new ImageData(pixels, TILE, TILE), 0, 0);
+    window.result = {
+      gpu: adapter.info?.description || adapter.info?.vendor,
+      load: Math.round(load),
+      times,
+      bad,
+      png: document.getElementById("c").toDataURL("image/png"),
+    };
+  }
+
+  main().catch((error) => (window.result = { error: String(error.stack ?? error) }));
+</script>
