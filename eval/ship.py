@@ -13,13 +13,15 @@ import pathlib
 import sys
 
 import cv2
-import export
 import numpy as np
-import sidd
 import torch
-from nafnet import blocks, bound_attention
 
-import evaluate
+import evaluate  # isort: split
+
+# Hush's tools, which evaluate puts on the path.
+import export
+import sidd
+from nafnet import blocks, bound_attention
 
 OUT = evaluate.MODELS / "nafnet-w32-hiso"
 

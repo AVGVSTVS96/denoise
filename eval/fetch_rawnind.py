@@ -102,6 +102,8 @@ def main(limit, workers=1, worker=0):
         clean, white_balance = develop(scene["clean"])
         # One exposure for the whole scene, so the base frame's highlights sit just under white.
         exposure = 0.9 / max(float(np.percentile(clean, 99.5)), 1e-3)
+        luminance = clean.mean(axis=2)
+        bright = (luminance > np.percentile(luminance, 60)) & (luminance < np.percentile(luminance, 99))
         picks = corners(clean, rng)
         for n, (y, x) in enumerate(picks):
             cv2.imwrite(str(OUT / f"{name}_{n}_clean.png"), srgb(clean[y : y + CROP, x : x + CROP] * exposure))
@@ -117,8 +119,10 @@ def main(limit, workers=1, worker=0):
             dx, dy = shift_between(clean, noisy)
             if max(abs(dx), abs(dy)) > MAX_SHIFT:
                 continue
-            # The camera's shutter and ISO steps don't cancel exactly: match the frame's overall brightness.
-            gain = float(clean.mean() / noisy.mean())
+            # The camera's shutter and ISO steps don't cancel exactly, so the frame's brightness is matched
+            # to the base frame's: over its brighter parts only, because in shadows noise clipped at black
+            # lifts the average.
+            gain = float(clean[bright].mean() / noisy[bright].mean())
             for n, (y, x) in enumerate(picks):
                 cv2.imwrite(
                     str(OUT / f"{name}_{n}_iso{iso}.png"),
