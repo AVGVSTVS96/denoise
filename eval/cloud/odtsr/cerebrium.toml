@@ -1,0 +1,46 @@
+[cerebrium.deployment]
+name = "odtsr"
+python_version = "3.11"
+docker_base_image_url = "debian:bookworm-slim"
+disable_auth = false
+include = ['main.py', 'cerebrium.toml']
+exclude = ['.*']
+
+[cerebrium.hardware]
+cpu = 8.0
+memory = 60.0
+compute = "ADA_L40"
+region = "us-east-1"
+
+[cerebrium.scaling]
+min_replicas = 0
+max_replicas = 1
+cooldown = 10
+replica_concurrency = 1
+
+[cerebrium.dependencies.apt]
+git = "latest"
+libgl1 = "latest"
+"libglib2.0-0" = "latest"
+
+[cerebrium.dependencies.pip]
+torch = "==2.6.0"
+torchvision = "==0.21.0"
+"transformers" = "==4.56.0"
+"peft" = "==0.17.0"
+einops = "latest"
+safetensors = "latest"
+sentencepiece = "latest"
+protobuf = "latest"
+modelscope = "latest"
+ftfy = "latest"
+accelerate = "latest"
+qwen_vl_utils = "latest"
+imageio = "latest"
+pillow_heif = "latest"
+pandas = "latest"
+opencv-python-headless = "latest"
+huggingface_hub = "latest"
+hf_transfer = "latest"
+pyyaml = "latest"
+tqdm = "latest"
