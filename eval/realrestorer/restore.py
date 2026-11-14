@@ -14,10 +14,15 @@ STEPS, CFG, MODEL_GUIDANCE, TRUNC, POWER = 28, 3.0, 3.5, 0.93, 0.4
 names = sys.argv[1:] or NAMES
 
 
-def chunked_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, chunk=1024):
-    if attn_mask is not None or is_causal or q.shape[-2] <= chunk:
+def chunked_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, chunk=512):
+    """Attention a slice of queries at a time, so the full attention matrix (tens of GB here) never exists at once."""
+    if is_causal or q.shape[-2] <= chunk:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
-    return torch.cat([F.scaled_dot_product_attention(q[..., i:i + chunk, :], k, v) for i in range(0, q.shape[-2], chunk)], dim=-2)
+    rows = lambda i: attn_mask if attn_mask is None or attn_mask.shape[-2] == 1 else attn_mask[..., i : i + chunk, :]
+    return torch.cat(
+        [F.scaled_dot_product_attention(q[..., i : i + chunk, :], k, v, attn_mask=rows(i)) for i in range(0, q.shape[-2], chunk)],
+        dim=-2,
+    )
 
 
 class _F:
@@ -31,26 +36,41 @@ cfg = {k: v for k, v in json.loads((tdir / "config.json").read_text()).items() i
 with torch.device("meta"):
     tr = RealRestorerTransformer2DModel(**cfg)
 wmap = json.loads((tdir / "diffusion_pytorch_model.safetensors.index.json").read_text())["weight_map"]
-files = {f: safe_open(str(tdir / f), "pt", device="cpu") for f in set(wmap.values())}
 
 
 def load(prefix, skip=()):
-    return {
-        k[len(prefix):]: files[f].get_tensor(k).to(dev, torch.bfloat16)
-        for k, f in wmap.items()
-        if k.startswith(prefix) and not k[len(prefix):].startswith(skip)
-    }
+    """Reads one prefix's weights, opening each file only for the read: a file kept open pins every page read from it in memory."""
+    keys = {}
+    for k, f in wmap.items():
+        if k.startswith(prefix) and not k[len(prefix):].startswith(skip):
+            keys.setdefault(f, []).append(k)
+    out = {}
+    for f, ks in keys.items():
+        with safe_open(str(tdir / f), "pt", device="cpu") as fh:
+            out.update({k[len(prefix):]: fh.get_tensor(k).to(dev, torch.bfloat16) for k in ks})
+            torch.mps.synchronize()
+    return out
 
 
 m = tr.inner_model
-streamed = list(m.double_blocks) + list(m.single_blocks)
 static = load("inner_model.", skip=("double_blocks.", "single_blocks."))
 m.load_state_dict(static, strict=False, assign=True)
+
+
+def fetch_block(block, args):
+    block.load_state_dict(load(block.prefix), strict=True, assign=True)
+
+
+def drop_block(block, args, output):
+    block.to("meta")
+    torch.mps.empty_cache()
+
+
 for kind, blocks in (("double_blocks", m.double_blocks), ("single_blocks", m.single_blocks)):
     for i, b in enumerate(blocks):
-        pre = f"inner_model.{kind}.{i}."
-        b.register_forward_pre_hook(lambda mod, a, pre=pre: mod.load_state_dict(load(pre), strict=True, assign=True))
-        b.register_forward_hook(lambda mod, a, o: mod.to("meta"))
+        b.prefix = f"inner_model.{kind}.{i}."
+        b.register_forward_pre_hook(fetch_block)
+        b.register_forward_hook(drop_block)
 assert all(p.device.type == "mps" for n, p in m.named_parameters() if not n.startswith(("double_blocks", "single_blocks")))
 
 vae = RealRestorerAutoencoderKL.from_pretrained(W / "vae", torch_dtype=torch.float32).to(dev)
