@@ -14,9 +14,15 @@ from PIL import Image
 S = 1024
 
 
-def linear(path):
-    with rawpy.imread(path) as raw:
-        return raw.postprocess(gamma=(1, 1), no_auto_bright=True, use_camera_wb=True, output_bps=16).astype(np.float32) / 65535
+def linear(path, mosaic=None):
+    """Linear sRGB in [0, 1]; mosaic, if given, replaces the file's sensor data first."""
+    with rawpy.imread(str(path)) as raw:
+        if mosaic is not None:
+            raw.raw_image_visible[:] = mosaic
+        return (
+            raw.postprocess(gamma=(1, 1), no_auto_bright=True, use_camera_wb=True, output_bps=16).astype(np.float32)
+            / 65535
+        )
 
 
 def window(img, x, y):
@@ -26,14 +32,19 @@ def window(img, x, y):
     return img[top : top + S, left : left + S]
 
 
+def gains(noisy, clean):
+    """The display gain from the clean frame, and the factor that brings the noisy frame to its brightness."""
+    return 0.18 / max(np.median(clean), 1e-4) * 0.6, np.median(clean) / max(np.median(noisy), 1e-6)
+
+
 def srgb(lin, gain):
     return Image.fromarray((np.clip(lin * gain, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8))
 
 
-out, name, noisy_path, clean_path, x, y = sys.argv[1:]
-noisy, clean = linear(noisy_path), linear(clean_path)
-gain = 0.18 / max(np.median(clean), 1e-4) * 0.6
-match = np.median(clean) / max(np.median(noisy), 1e-6)
-Path(out).mkdir(parents=True, exist_ok=True)
-srgb(window(noisy, float(x), float(y)), gain * match).save(Path(out) / f"{name}.png")
-srgb(window(clean, float(x), float(y)), gain).save(Path(out) / f"{name}-clean.png")
+if __name__ == "__main__":
+    out, name, noisy_path, clean_path, x, y = sys.argv[1:]
+    noisy, clean = linear(noisy_path), linear(clean_path)
+    gain, match = gains(noisy, clean)
+    Path(out).mkdir(parents=True, exist_ok=True)
+    srgb(window(noisy, float(x), float(y)), gain * match).save(Path(out) / f"{name}.png")
+    srgb(window(clean, float(x), float(y)), gain).save(Path(out) / f"{name}-clean.png")
