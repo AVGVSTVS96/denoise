@@ -1,7 +1,7 @@
 """Raw denoisers on his DNG and the GR IIIx night pairs, developed exactly like the reference renders.
 
     uv run raw_denoise.py rawnind MODEL.onnx    darktable 5.6's RawNIND Bayer model (darktable-ai rawdenoise-nind)
-    uv run raw_denoise.py faithful WEIGHTS.pth  our faithful model (train_raw.py)
+    uv run raw_denoise.py NAME WEIGHTS.pth       our faithful model (train_raw.py), outputs named NAME
     uv run raw_denoise.py rawforge DIR          RawForge outputs, DIR/<raw name>.dng, made by
                                                 rawforge TreeNetDenoiseHeavy IN.DNG OUT.dng --cfa --onnx
 
@@ -176,6 +176,6 @@ def develop(method, mosaics):
 
 if __name__ == "__main__":
     method, source = sys.argv[1:]
-    run = {"rawnind": rawnind, "rawforge": rawforge, "faithful": faithful}[method]
+    run = {"rawnind": rawnind, "rawforge": rawforge}.get(method, faithful)
     (DATA / "out" / "pairs").mkdir(parents=True, exist_ok=True)
     develop(method, {path: run(path, source) for path in raws()})
