@@ -6,7 +6,7 @@ until tailscale status | rg 'bassims-macbook-pro-3' | rg -vq offline && ssh -o C
 echo "mac back $(date); $(ssh mac uptime)"
 E=~/Developer/denoise/eval
 R='~/scratch/denoise-rr'
-on() { ssh -o ServerAliveInterval=30 mac "cd $R && export PATH=\$HOME/.local/bin:\$PATH HF_HUB_ENABLE_HF_TRANSFER=1 PYTORCH_ENABLE_MPS_FALLBACK=1 && $1"; }
+on() { ssh -o ServerAliveInterval=30 mac "cd $R && export PATH=\$HOME/.local/bin:\$PATH PYTORCH_ENABLE_MPS_FALLBACK=1 && $1"; }
 fetch() { # fetch <mac-dir> <suffix>
   for n in $(ssh mac "ls $R/$1"); do
     stem=${n%.png}
