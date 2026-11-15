@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # RealRestorer on the Mac: transformer on his three crops (already encoded), then encode and restore the pair crops,
-# swapping the text encoder and transformer on disk since both don't fit; then Qwen-Image-Edit-2511 on the pair crops. Each result is copied back as it lands.
+# then Qwen-Image-Edit-2511 on the pair crops. Each result is copied back as it lands.
 set -euo pipefail
 until tailscale status | rg 'bassims-macbook-pro-3' | rg -vq offline && ssh -o ConnectTimeout=15 mac true; do sleep 30; done
 echo "mac back $(date); $(ssh mac uptime)"
@@ -20,12 +20,13 @@ his="R0006362-signs R0006362-truck R0006362-facade"
 pairs="gr3x-025600-labels gr3x-102400-labels gr3x-025600-dial gr3x-102400-dial"
 for n in $his; do on "[ -f out/$n.png ] || ./guard.sh venv/bin/python restore.py $n"; fetch out realrestorer; done
 echo "realrestorer his done $(date)"
-get() { on "venv/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download(\"RealRestorer/RealRestorer\", local_dir=\"w\", allow_patterns=[\"$1/*\"])'"; }
 if ! on "ls emb/gr3x-102400-dial.pt" >/dev/null 2>&1; then
-  on "rm -rf w/transformer"; get text_encoder
-  on "./guard.sh venv/bin/python encode.py $pairs && rm -rf w/text_encoder"
-  get transformer
+  # The text encoder and transformer don't fit on the Mac's disk together, so the encoder comes and goes first.
+  on "rm -rf w/transformer && venv/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download(\"RealRestorer/RealRestorer\", local_dir=\"w\", allow_patterns=[\"text_encoder/*\"])'"
+  on "./guard.sh venv/bin/python encode.py $pairs"
+  on "rm -rf w/text_encoder"
 fi
+on "[ -d w/transformer ] || venv/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download(\"RealRestorer/RealRestorer\", local_dir=\"w\", allow_patterns=[\"transformer/*\"])'"
 for n in $pairs; do on "[ -f out/$n.png ] || ./guard.sh venv/bin/python restore.py $n"; fetch out realrestorer; done
 echo "realrestorer pairs done $(date)"
 on 'rm -rf w; for f in in/gr3x-*.png; do n=$(basename $f); [ -f qout/$n ] && continue; \
