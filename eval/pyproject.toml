@@ -26,13 +26,24 @@ dependencies = [
 package = false
 
 [[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+]
 
 [tool.ruff]
 line-length = 120

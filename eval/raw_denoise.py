@@ -1,6 +1,7 @@
 """Raw denoisers on his DNG and the GR IIIx night pairs, developed exactly like the reference renders.
 
     uv run raw_denoise.py rawnind MODEL.onnx    darktable 5.6's RawNIND Bayer model (darktable-ai rawdenoise-nind)
+    uv run raw_denoise.py faithful WEIGHTS.pth  our faithful model (train_raw.py)
     uv run raw_denoise.py rawforge DIR          RawForge outputs, DIR/<raw name>.dng, made by
                                                 rawforge TreeNetDenoiseHeavy IN.DNG OUT.dng --cfa --onnx
 
@@ -8,7 +9,7 @@ Each model ends in a denoised CFA mosaic in the camera's own raw units, the way 
 both hand it back. That mosaic replaces the DNG's sensor data and rawpy develops it with the reference
 settings: his crops from the camera-WB render his R0006362.png came from (its auto brightness held
 fixed), the pairs through night_pairs.py at the noisy frame's own gain. Writes
-data/out/frontier/R0006362-<crop>_<method>.png and data/out/pairs/gr3x-<iso>-labels_<method>.png.
+data/out/frontier/R0006362-<crop>_<method>.png and data/out/pairs/gr3x-<iso>-<window>_<method>.png.
 """
 
 import pathlib
@@ -27,7 +28,8 @@ HIS = DATA / "his" / "R0006362.DNG"
 HIS_CROPS = {"signs": (1688, 2488), "truck": (1728, 488), "facade": (800, 4100)}
 PAIRS = DATA / "night-raw" / "imaging-resource"
 PAIR_ISOS = ("025600", "102400")
-PAIR_CENTRE = (0.62, 0.68)
+#: Centres of the pair windows night_pairs.py cut, as fractions of the frame.
+PAIR_WINDOWS = {"labels": (0.62, 0.68), "dial": (0.82, 0.52)}
 #: darktable's tiling for this model: 512 px packed tiles, cores 32 px in from each edge, ramps across seams.
 TILE = 512
 OVERLAP = 32
@@ -117,6 +119,27 @@ def rawforge(path, folder):
     return np.clip(out * (white - level) + level + 0.5, 0, white).astype(np.uint16)
 
 
+def faithful(path, weights):
+    """Our model takes the mosaic black-subtracted and over the white level, as train_raw.py trains it."""
+    import torch
+
+    import train_raw
+
+    model = faithful.model = getattr(faithful, "model", None) or train_raw.network().cuda().eval()
+    model.load_state_dict(torch.load(weights, map_location="cpu"))
+    with rawpy.imread(str(path)) as raw:
+        cfa = raw.raw_image_visible.astype(np.float32)
+        pattern = raw.raw_pattern
+        level = np.tile(
+            np.asarray(raw.black_level_per_channel, np.float32)[pattern], (cfa.shape[0] // 2, cfa.shape[1] // 2)
+        )
+        white = float(raw.white_level)
+        assert [raw.color_desc.decode()[c] for c in pattern.ravel()] == list("RGGB"), pattern
+    span = white - level
+    out = train_raw.denoise(model, (cfa - level) / span)
+    return np.clip(out * span + level + 0.5, 0, white).astype(np.uint16)
+
+
 def his_brightness(path):
     """The bright= that holds libraw's auto brightness for this raw, so a denoised mosaic can't shift it."""
     with rawpy.imread(str(path)) as raw:
@@ -144,12 +167,15 @@ def develop(method, mosaics):
     clean = night_pairs.linear(pair_raw("000100"))
     for iso in PAIR_ISOS:
         gain, match = night_pairs.gains(night_pairs.linear(pair_raw(iso)), clean)
-        denoised = night_pairs.window(night_pairs.linear(pair_raw(iso), mosaics[pair_raw(iso)]), *PAIR_CENTRE)
-        night_pairs.srgb(denoised, gain * match).save(DATA / "out" / "pairs" / f"gr3x-{iso}-labels_{method}.png")
+        denoised = night_pairs.linear(pair_raw(iso), mosaics[pair_raw(iso)])
+        for name, centre in PAIR_WINDOWS.items():
+            night_pairs.srgb(night_pairs.window(denoised, *centre), gain * match).save(
+                DATA / "out" / "pairs" / f"gr3x-{iso}-{name}_{method}.png"
+            )
 
 
 if __name__ == "__main__":
     method, source = sys.argv[1:]
-    run = {"rawnind": rawnind, "rawforge": rawforge}[method]
+    run = {"rawnind": rawnind, "rawforge": rawforge, "faithful": faithful}[method]
     (DATA / "out" / "pairs").mkdir(parents=True, exist_ok=True)
     develop(method, {path: run(path, source) for path in raws()})
