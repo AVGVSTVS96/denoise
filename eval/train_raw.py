@@ -61,22 +61,22 @@ def tone(x):
 
 @torch.no_grad()
 def denoise(model, mosaic, tile=1024, overlap=64):
-    """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles."""
+    """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
+
+    Every tile keeps only its middle; the last row and column of tiles sit flush with the far edge.
+    """
     gain = float(np.clip(LEVEL / max(float(mosaic.mean()), 1e-6), 1, MAX_GAIN))
-    h, w = mosaic.shape
-    step = tile - 2 * overlap
-    pad_h, pad_w = -(h - 2 * overlap) % step + 2 * overlap, -(w - 2 * overlap) % step + 2 * overlap
-    padded = np.pad(mosaic * gain, ((overlap, pad_h - overlap), (overlap, pad_w - overlap)), "reflect")
+    padded = np.pad(mosaic * gain, overlap, "reflect")
     out = np.zeros_like(padded)
-    for y in range(0, padded.shape[0] - 2 * overlap, step):
-        for x in range(0, padded.shape[1] - 2 * overlap, step):
+    starts = lambda side: sorted({*range(0, side - tile, tile - 2 * overlap), side - tile})
+    for y in starts(padded.shape[0]):
+        for x in starts(padded.shape[1]):
             piece = torch.from_numpy(np.ascontiguousarray(padded[y : y + tile, x : x + tile])).cuda()[None]
             with torch.autocast("cuda", torch.bfloat16):
                 result = unpack(model(pack(piece)).float())[0].cpu().numpy()
-            out[y + overlap : y + tile - overlap, x + overlap : x + tile - overlap] = result[
-                overlap:-overlap, overlap:-overlap
-            ]
-    return out[overlap : overlap + h, overlap : overlap + w] / gain
+            core = np.s_[overlap:-overlap, overlap:-overlap]
+            out[y : y + tile, x : x + tile][core] = result[core]
+    return out[overlap:-overlap, overlap:-overlap] / gain
 
 
 class Crops(torch.utils.data.IterableDataset):
