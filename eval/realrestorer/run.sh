@@ -26,13 +26,14 @@ if ! on "ls emb/gr3x-102400-dial.pt" >/dev/null 2>&1; then
   on "./guard.sh venv/bin/python encode.py $pairs"
   on "rm -rf w/text_encoder"
 fi
-on "[ -d w/transformer ] || venv/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download(\"RealRestorer/RealRestorer\", local_dir=\"w\", allow_patterns=[\"transformer/*\"])'"
+on "ls out/gr3x-102400-dial.png >/dev/null 2>&1 || [ -d w/transformer ] || venv/bin/python -c 'from huggingface_hub import snapshot_download; snapshot_download(\"RealRestorer/RealRestorer\", local_dir=\"w\", allow_patterns=[\"transformer/*\"])'"
 for n in $pairs; do on "[ -f out/$n.png ] || ./guard.sh venv/bin/python restore.py $n"; fetch out realrestorer; done
 echo "realrestorer pairs done $(date)"
-on 'rm -rf w; for f in in/gr3x-*.png; do n=$(basename $f); [ -f qout/$n ] && continue; \
-  mflux-generate-qwen-edit --model AbstractFramework/qwen-image-edit-2511-4bit --base-model qwen-image-edit-2511 \
-    --image-paths $f --width 1024 --height 1024 --steps 30 --guidance 4.0 --seed 42 --no-exif \
-    --prompt "Remove the image noise. Keep every detail, letter and color exactly as it is; change nothing else." \
-    --output qout/$n; done'
-fetch qout qwen-image-edit-2511
+on "rm -rf w"
+for n in gr3x-025600-labels gr3x-102400-labels gr3x-025600-dial gr3x-102400-dial; do
+  on "[ -f qout/$n.png ] || ./guard.sh mflux-generate-qwen-edit --model AbstractFramework/qwen-image-edit-2511-4bit --base-model qwen-image-edit-2511 \
+    --image-paths in/$n.png --width 1024 --height 1024 --steps 30 --guidance 4.0 --seed 42 --no-exif \
+    --prompt 'Remove the image noise. Keep every detail, letter and color exactly as it is; change nothing else.' --output qout/$n.png"
+  fetch qout qwen-image-edit-2511
+done
 echo "qwen pairs done $(date)"
