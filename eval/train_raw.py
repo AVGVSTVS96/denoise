@@ -1,15 +1,23 @@
 """Train the faithful model: NAFNet (width 32) on raw Bayer mosaics, noisy in, clean mosaic out.
 
     uv run train_raw.py                                   from scratch, or resumes data/models/raw/last.pth
-    uv run train_raw.py --out gr3x --init data/models/raw/faithful.pth --scenes 'gr3x-*' \
-        --profile data/noise/gr3x.json --steps 20000 --lr 5e-5      his camera's fine-tune, once it has pairs
+    uv run train_raw.py --out gr3 --init data/models/raw/faithful/faithful.pth \
+        --profile data/noise/gr3.json --steps 20000 --lr 1e-4       one camera's fine-tune
 
 The network sees the mosaic packed into four half-size planes (R, G, G, B), so a phone runs it at a
 quarter of the pixels. Its body starts from the SIDD sRGB weights; the first and last layers are new.
-Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with made-up sensor noise
-(shot noise, read noise and row banding). Without --profile that noise is drawn from a wide range of
-cameras; with one, from a camera's measured levels (calibrate_raw.py). Each crop is scaled to a set
-brightness first, the same way denoise() scales a photo, so dark night frames look like any other.
+Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with noise laid over them.
+Without --profile that noise is either made up (shot noise, read noise and row banding, from a wide
+range of cameras) or a window of the Ricoh GR III's real noise (noise_bank.py). A profile narrows the
+run to one camera: every clean frame gets that camera's noise, its real noise fields if the profile
+has them beside it and else noise made up from its measured levels (calibrate_raw.py), and only the
+camera's own scenes (named <profile>-..., as ir-gr3-inbi is for gr3.json) keep their real noisy
+frames. Each crop is scaled to a set brightness first, the same way denoise() scales a photo, so dark
+night frames look like any other.
+
+The weights that get scored and saved are a running average of the trained ones, taken every fourth
+step, which is steadier than any single step. Every check logs the held-out RawNIND score and bench_raw.py's GR III score,
+its mean and each ISO from 3,200 to 102,400; run.json beside the log keeps the run's settings.
 """
 
 import argparse
@@ -23,16 +31,29 @@ import time
 import numpy as np
 import torch
 
+import bench_raw
 import evaluate
 
 PAIRS = evaluate.DATA / "rawpairs"
+NOISE = evaluate.DATA / "noise"
 MODELS = evaluate.MODELS / "raw"
 #: Mean a crop or photo is scaled to before the network sees it.
 LEVEL = 0.1
 MAX_GAIN = 64.0
 SYNTHETIC_SHARE = 0.4
-#: Imaging Resource's Ricoh GR II and GR III lab scenes, the nearest thing to his camera's own noise.
-RICOH_WEIGHT = 4
+#: How much of the laid-over noise is the GR III's real noise.
+BANK_SHARE = 0.4
+#: The fewest electrons a pixel at LEVEL gets under laid-over noise. His night photo averages 17 and
+#: half of it sits under 6; the GR IIIx's ISO 102,400 frame averages 9.
+FLOOR = 2
+#: How often a scene is drawn, by the start of its name. Imaging Resource's Ricoh lab scenes are the
+#: nearest thing to his camera's noise, and the GR III has its very sensor.
+WEIGHTS = {"ir-gr3": 40, "ir-": 4}
+#: His camera's colour, for the part of the loss that looks at the picture: white balance ranges that
+#: cover daylight, tungsten and street light, and the GR III's matrix from camera colour to sRGB.
+RED, BLUE = (1.5, 2.8), (1.4, 3.2)
+TO_SRGB = ((1.703, -0.719, 0.016), (-0.188, 1.563, -0.375), (0.004, -0.406, 1.402))
+EMA = 0.996
 
 
 def network():
@@ -55,8 +76,42 @@ def unpack(planes):
 
 
 def tone(x):
-    """Roughly how a developed picture spaces brightness, so shadows count as much as highlights."""
-    return (x.clamp(min=0) + 1e-3) ** (1 / 2.2)
+    """Roughly how a developed picture spaces brightness, so shadows count as much as highlights.
+
+    Mirrored below zero: noise leaves a dark pixel negative as often as not, and a curve that is flat
+    there would give the network nothing to learn from.
+    """
+    return x.sign() * ((x.abs() + 1e-3) ** (1 / 2.2) - 1e-3 ** (1 / 2.2))
+
+
+def loss_of(result, clean):
+    """How far the cleaned mosaic is from the clean one, as the picture they develop into.
+
+    Half on the mosaic under a white balance, where detail lives, and half on its 2x2 cells as sRGB:
+    the colour matrix is what blows left-over colour noise up into blotches.
+    """
+    n = clean.shape[0]
+    draw = lambda low, high: torch.empty(n, device=clean.device).uniform_(low, high)
+    red, green, blue = draw(*RED), torch.ones(n, device=clean.device), draw(*BLUE)
+    balance = torch.stack([red, green, green, blue], 1).view(n, 4, 1, 1)
+    a, b = pack(result) * balance, pack(clean) * balance
+    cells = lambda p: torch.einsum(
+        "ij,njhw->nihw", p.new_tensor(TO_SRGB), torch.stack([p[:, 0], (p[:, 1] + p[:, 2]) / 2, p[:, 3]], 1)
+    )
+    l1 = torch.nn.functional.l1_loss
+    return (l1(tone(a), tone(b)) + l1(tone(cells(a)), tone(cells(b)))) / 2
+
+
+def cleaner(model):
+    """bench_raw.score's view of a model: mosaics (N, H, W) in, cleaned mosaics out, scaled as denoise() does."""
+
+    def clean_up(mosaics, mean):
+        gain = min(max(LEVEL / mean, 1), MAX_GAIN)
+        with torch.autocast("cuda", torch.bfloat16):
+            parts = [unpack(model(pack(part * gain)).float()) for part in mosaics.split(8)]
+        return torch.cat(parts) / gain
+
+    return clean_up
 
 
 @torch.no_grad()
@@ -82,22 +137,19 @@ def denoise(model, mosaic, tile=1024, overlap=64):
 class Crops(torch.utils.data.IterableDataset):
     """Endless (noisy-or-None, clean) mosaics, flipped and turned with the colours kept on RGGB."""
 
-    def __init__(self, scenes, size, seed):
-        self.scenes, self.size, self.seed = scenes, size, seed
+    def __init__(self, scenes, size, seed, real):
+        self.scenes, self.size, self.seed, self.real = scenes, size, seed, real
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = random.Random(self.seed + (info.id if info else 0))
-        arrays = {}
-        weights = [RICOH_WEIGHT if s.startswith("ir-") else 1 for s in self.scenes]
+        weights = [next((w for start, w in WEIGHTS.items() if s.startswith(start)), 1) for s in self.scenes]
         while True:
             scene = rng.choices(self.scenes, weights)[0]
-            stack = arrays.get(scene)
-            if stack is None:
-                stack = arrays[scene] = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
+            stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
             frames, crops, side, _ = stack.shape
             crop = rng.randrange(crops)
-            synthetic = frames == 1 or rng.random() < SYNTHETIC_SHARE
+            synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
             frame = 0 if synthetic else rng.randrange(1, frames)
             flip_y, flip_x, turn = rng.random() < 0.5, rng.random() < 0.5, rng.random() < 0.5
             # A flipped mosaic starts on red again one pixel in, so the window's corner takes that parity.
@@ -114,6 +166,41 @@ class Crops(torch.utils.data.IterableDataset):
             yield torch.from_numpy(np.ascontiguousarray(pair)), synthetic
 
 
+def spread(n, device, low, high):
+    """n draws between low and high, even on a log scale."""
+    return torch.exp(torch.empty(n, device=device).uniform_(math.log(low), math.log(high)))
+
+
+def bank_noise(clean, bank):
+    """The GR III's real noise on clean mosaics (N, H, W) already at LEVEL brightness.
+
+    Each crop gets a window of one ISO's unit-strength field, scaled by that ISO's shot and read noise
+    at the brightness under it. The photo is taken as shot 1-16x darker than LEVEL and brought up, as
+    a dim night frame is, but never past FLOOR.
+    """
+    fields, shot, read = bank
+    n, size = clean.shape[0], clean.shape[-1]
+    iso = torch.randint(len(fields), (n,), device=clean.device)
+    corner = lambda side: (torch.randint((side - size) // 2, (n,)) * 2).tolist()
+    unit = torch.stack(
+        [
+            fields[i, y : y + size, x : x + size]
+            for i, y, x in zip(iso.tolist(), corner(fields.shape[1]), corner(fields.shape[2]))
+        ]
+    ).float()
+    darkest = LEVEL / (FLOOR * shot[iso].mean(1))
+    dim = torch.minimum(spread(n, clean.device, 1, 16), darkest).clamp(min=1).view(n, 1, 1, 1)
+    variance = pack(clean).clamp(min=0) * shot[iso].view(n, 4, 1, 1) * dim + (read[iso].view(n, 4, 1, 1) * dim) ** 2
+    return clean + unit * unpack(variance.sqrt())
+
+
+def noise_bank(profile):
+    """A camera's noise fields on the GPU, with each ISO's shot and read noise per colour plane."""
+    levels = json.loads(profile.read_text())["iso"].values()
+    fields = torch.from_numpy(np.load(profile.with_suffix(".npy"))).cuda()
+    return fields, *(torch.tensor([level[kind] for level in levels], device="cuda") for kind in ("shot", "read"))
+
+
 def made_up_noise(clean, profile):
     """Shot, read and row noise on clean mosaics (N, H, W) already at LEVEL brightness.
 
@@ -121,7 +208,7 @@ def made_up_noise(clean, profile):
     shot 1-16x darker than LEVEL and brought up, as a dim night frame is.
     """
     n, device = clean.shape[0], clean.device
-    uniform = lambda low, high: torch.exp(torch.empty(n, device=device).uniform_(math.log(low), math.log(high)))
+    uniform = lambda low, high: spread(n, device, low, high)
     if profile:
         levels = [random.choice(list(profile["iso"].values())) for _ in range(n)]
         dim = uniform(1, 16)
@@ -129,9 +216,10 @@ def made_up_noise(clean, profile):
         read = torch.tensor([lv["read"] for lv in levels], device=device) * dim
         row = torch.tensor([lv.get("row", 0.0) for lv in levels], device=device) * dim
     else:
-        # From 3,000 down to 10 electrons at LEVEL, with half to four electrons of read noise.
-        shot = uniform(LEVEL / 3000, LEVEL / 10)
-        read = shot * uniform(0.5, 4)
+        # From 3,000 electrons at LEVEL down to FLOOR, with half to eight electrons of read noise; the
+        # GR IIIx has about 3.
+        shot = uniform(LEVEL / 3000, LEVEL / FLOOR)
+        read = shot * uniform(0.5, 8)
         row = read * torch.empty(n, device=device).uniform_(0, 0.3)
     view = lambda t: t.view(n, 1, 1)
     photons = torch.poisson(clean.clamp(min=0) / view(shot)) * view(shot)
@@ -139,10 +227,12 @@ def made_up_noise(clean, profile):
 
 
 def gains(clean):
-    """Scale each crop to LEVEL, give or take a factor of two, as denoise() scales a photo to its mean."""
+    """Scale each crop to LEVEL, from six times darker to twice brighter.
+
+    denoise() scales a whole photo to LEVEL, and a night photo's tiles are mostly darker than its mean.
+    """
     mean = clean.mean(dim=(1, 2)).clamp(min=1e-6)
-    spread = torch.exp(torch.empty_like(mean).uniform_(-math.log(2), math.log(2)))
-    return (LEVEL / mean * spread).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
+    return (LEVEL / mean * spread(len(mean), mean.device, 1 / 6, 2)).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
 
 
 def scenes(split, pattern):
@@ -175,16 +265,22 @@ def validate(model, val):
 
 def main(args):
     torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
     out = MODELS / args.out
     out.mkdir(parents=True, exist_ok=True)
-    profile = json.loads(pathlib.Path(args.profile).read_text()) if args.profile else None
-    model = network().cuda()
+    (out / "run.json").write_text(json.dumps(vars(args)))
+    camera = pathlib.Path(args.profile or NOISE / "gr3.json")
+    bank = noise_bank(camera) if camera.with_suffix(".npy").exists() else None
+    profile = json.loads(camera.read_text()) if args.profile and not bank else None
+    share = 1 if args.profile else BANK_SHARE
+    model = network().cuda().to(memory_format=torch.channels_last)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location="cpu"))
     else:
         sidd = torch.load(evaluate.MODELS / "NAFNet-SIDD-width32.pth", map_location="cpu")["params"]
         model.load_state_dict({k: v for k, v in sidd.items() if not k.startswith(("intro", "ending"))}, strict=False)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.9), weight_decay=0)
+    average = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(EMA))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.9), weight_decay=0, fused=True)
     warmup = 1000
     schedule = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -196,42 +292,54 @@ def main(args):
     if (out / "last.pth").exists():
         state = torch.load(out / "last.pth", map_location="cpu")
         model.load_state_dict(state["model"])
+        average.load_state_dict(state["average"])
         optimizer.load_state_dict(state["optimizer"])
         schedule.load_state_dict(state["schedule"])
         step = state["step"]
+    compiled = torch.compile(model)
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
-    running = 0.0
+    running = torch.zeros((), device="cuda")
     while step < args.steps:
         # The scene list is read again every round, so crops raw_pairs.py finishes meanwhile join in.
         train = scenes("train", args.scenes)
         loader = torch.utils.data.DataLoader(
-            Crops(train, args.size, args.seed + step), batch_size=args.batch, num_workers=args.workers, pin_memory=True
+            Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*"),
+            batch_size=args.batch,
+            num_workers=args.workers,
+            pin_memory=True,
         )
         for pair, synthetic in loader:
             pair = pair.cuda(non_blocking=True)
             clean, noisy = pair[:, 0], pair[:, 1]
-            synthetic = synthetic.cuda()
+            synthetic = synthetic.cuda().view(-1, 1, 1)
             g = gains(clean)
             clean, noisy = clean * g, noisy * g
             if synthetic.any():
-                noisy = torch.where(synthetic.view(-1, 1, 1), made_up_noise(clean, profile), noisy)
+                laid = made_up_noise(clean, profile)
+                if bank:
+                    laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank), laid)
+                noisy = torch.where(synthetic, laid, noisy)
             with torch.autocast("cuda", torch.bfloat16):
-                result = unpack(model(pack(noisy)).float())
-            loss = torch.nn.functional.l1_loss(tone(result), tone(clean))
+                result = unpack(compiled(pack(noisy).contiguous(memory_format=torch.channels_last)).float())
+            loss = loss_of(result, clean)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
             schedule.step()
             step += 1
-            running += loss.item()
+            if step % 4 == 0:
+                average.update_parameters(model)
+            running += loss.detach()
             if step % args.check == 0 or step == args.steps:
-                score = validate(model, val) if val else float("nan")
+                bench = bench_raw.score(cleaner(average.module), "gr3")
                 line = {
                     "step": step,
-                    "loss": round(running / args.check, 5),
-                    "val_psnr": round(score, 3),
+                    "loss": round(running.item() / args.check, 5),
+                    "val_psnr": round(validate(average.module, val), 3) if val else float("nan"),
+                    "gr3_psnr": round(float(np.mean([psnr for psnr, _ in bench.values()])), 3),
+                    "gr3_by_iso": [round(psnr, 3) for psnr, _ in bench.values()],
                     "lr": schedule.get_last_lr()[0],
                     "scenes": len(train),
                     "time": round(time.time()),
@@ -239,9 +347,10 @@ def main(args):
                 print(json.dumps(line), flush=True)
                 log.write(json.dumps(line) + "\n")
                 log.flush()
-                running = 0.0
+                running.zero_()
                 state = {
                     "model": model.state_dict(),
+                    "average": average.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "schedule": schedule.state_dict(),
                     "step": step,
@@ -249,10 +358,10 @@ def main(args):
                 torch.save(state, out / "last.tmp")
                 (out / "last.tmp").rename(out / "last.pth")
                 if step % args.keep == 0:
-                    torch.save(model.state_dict(), out / f"step{step}.pth")
+                    torch.save(average.module.state_dict(), out / f"step{step}.pth")
             if step >= args.steps or step % args.rescan == 0:
                 break
-    torch.save(model.state_dict(), out / "faithful.pth")
+    torch.save(average.module.state_dict(), out / "faithful.pth")
 
 
 if __name__ == "__main__":

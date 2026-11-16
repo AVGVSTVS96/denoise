@@ -99,11 +99,27 @@ def corners(clean, rng, count):
     return ranked[: n * 2 // 3] + [rest[i] for i in rng.choice(len(rest), n - n * 2 // 3, replace=False)]
 
 
-def gain(clean, noisy):
-    """Brightness match over the clean frame's brighter, unclipped parts: in shadows, black clipping lifts noise."""
-    g = green(clean)
-    bright = (g > np.percentile(g, 60)) & (g < min(np.percentile(g, 99), 0.9))
-    return float(g[bright].mean() / max(green(noisy)[bright].mean(), 1e-6))
+def match(clean, noisy):
+    """The noisy frame on the clean one's scale, each colour plane by a line through 64 px block means.
+
+    One gain isn't enough: a noisy frame sits on an offset of its own that the file's black level
+    misses, a quarter of the shadows' brightness on the GR III at ISO 102,400 and far more in SID and
+    ELD's darkest frames.
+    """
+    out = np.empty_like(noisy)
+    slopes = []
+    for i in range(2):
+        for j in range(2):
+            means = [
+                p[: p.shape[0] // 64 * 64, : p.shape[1] // 64 * 64].reshape(p.shape[0] // 64, 64, -1, 64).mean((1, 3))
+                for p in (noisy[i::2, j::2], clean[i::2, j::2])
+            ]
+            unclipped = means[1] < 0.5
+            # Fitted from the clean means, which carry no noise to flatten the line.
+            slope, offset = np.polyfit(means[1][unclipped], means[0][unclipped], 1)
+            out[i::2, j::2] = (noisy[i::2, j::2] - offset) / slope
+            slopes.append(1 / float(slope))
+    return out, slopes
 
 
 def build(name, clean_path, noisy_paths, meta):
@@ -126,9 +142,15 @@ def build(name, clean_path, noisy_paths, meta):
         if max(abs(dx), abs(dy)) > MAX_SHIFT:
             print(name, iso, "shifted", dx, dy, flush=True)
             continue
-        g = gain(clean, noisy)
-        frames.append(np.stack([noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] * g for y, x in picks]))
-        kept.append({"iso": iso, "shift": [dx, dy], "gain": round(g, 3)})
+        noisy, gains = match(clean, noisy)
+        dark = green(clean) < np.percentile(green(clean), 20)
+        lift = float(green(noisy)[dark].mean() / green(clean)[dark].mean())
+        # SID and ELD's darkest frames glow unevenly; a model taught on them learns the glow as signal.
+        if not 0.8 < lift < 1.25:
+            print(name, iso, "shadows off", round(lift, 2), flush=True)
+            continue
+        frames.append(np.stack([noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for y, x in picks]))
+        kept.append({"iso": iso, "shift": [dx, dy], "gain": round(float(np.mean(gains)), 3)})
     if noisy_paths and not kept:
         return
     np.save(OUT / f"{name}.tmp.npy", np.stack(frames).astype(np.float16))
