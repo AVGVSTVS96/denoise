@@ -27,6 +27,7 @@ import json
 import math
 import pathlib
 import random
+import threading
 import time
 
 import numpy as np
@@ -52,9 +53,9 @@ FLOOR = 2
 WEIGHTS = {"ir-gr3": 40, "ir-": 4}
 #: The share of draws that go to scenes with real noisy frames, however many clean-only scenes join.
 PAIR_SHARE = 1 / 6
-#: Crops a data worker keeps in memory, and how often a draw swaps one for a fresh read. The scenes
-#: outgrew the disk cache, and on a busy server a read per sample left the GPU waiting on the disk.
-POOL, FRESH = 48, 1 / 4
+#: Crops kept in memory, and how many of them a second are swapped for fresh ones from disk. The
+#: scenes outgrew the disk cache, and a read per sample kept a shared server's disk busy.
+POOL, READS = 1024, 4
 #: His camera's colour, for the part of the loss that looks at the picture: white balance ranges that
 #: cover daylight, tungsten and street light, and the GR III's matrix from camera colour to sRGB.
 RED, BLUE = (1.5, 2.8), (1.4, 3.2)
@@ -140,38 +141,51 @@ def denoise(model, mosaic, tile=1024, overlap=64):
     return out[overlap:-overlap, overlap:-overlap] / gain
 
 
-class Crops(torch.utils.data.IterableDataset):
-    """Endless (noisy-or-None, clean) mosaics, flipped and turned with the colours kept on RGGB."""
+class Crops:
+    """Endless batches of (clean, noisy) mosaics, flipped and turned with the colours kept on RGGB.
+
+    One thread reads: it fills the pool, then swaps READS crops a second. A crop is drawn many times
+    before it leaves, each time under another window, flip and noise.
+    """
 
     def __init__(self, scenes, size, seed, real):
-        self.scenes, self.size, self.seed, self.real = scenes, size, seed, real
+        self.size, self.real, self.rng, self.pool = size, real, random.Random(seed), []
+        self.use(scenes)
+        threading.Thread(target=self.read, daemon=True).start()
 
-    def __iter__(self):
-        info = torch.utils.data.get_worker_info()
-        rng = random.Random(self.seed + (info.id if info else 0))
-        weights = [next((w for start, w in WEIGHTS.items() if s.startswith(start)), 1) for s in self.scenes]
-        paired = list(self.scenes.values())
+    def use(self, scenes):
+        weights = [next((w for start, w in WEIGHTS.items() if s.startswith(start)), 1) for s in scenes]
+        paired = list(scenes.values())
         total = {kind: sum(w for w, p in zip(weights, paired) if p == kind) for kind in (True, False)}
         weights = [w * (PAIR_SHARE if p else 1 - PAIR_SHARE) / total[p] for w, p in zip(weights, paired)]
-        pool = []
+        self.draw = list(scenes), weights
+
+    def read(self):
+        rng = random.Random(self.rng.random())
         while True:
-            if len(pool) < POOL or rng.random() < FRESH:
-                scene = rng.choices(list(self.scenes), weights)[0]
-                stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
-                frames, crop = stack.shape[0], rng.randrange(stack.shape[1])
-                synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
-                frame = 0 if synthetic else rng.randrange(1, frames)
-                read = np.stack([stack[0, crop], stack[frame, crop]]).astype(np.float32), synthetic
-                if len(pool) < POOL:
-                    pool.append(read)
-                else:
-                    pool[rng.randrange(POOL)] = read
-            pair, synthetic = rng.choice(pool)
+            scene = rng.choices(*self.draw)[0]
+            stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
+            frames, crop = stack.shape[0], rng.randrange(stack.shape[1])
+            synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
+            frame = 0 if synthetic else rng.randrange(1, frames)
+            fresh = np.stack([stack[i, crop] for i in sorted({0, frame})]), synthetic
+            if len(self.pool) < POOL:
+                self.pool.append(fresh)
+            else:
+                self.pool[rng.randrange(POOL)] = fresh
+            time.sleep(1 / READS if len(self.pool) == POOL else 0.05)
+
+    def batch(self, n):
+        while len(self.pool) < POOL // 4:
+            time.sleep(1)
+        pairs, kinds = [], []
+        for _ in range(n):
+            pair, synthetic = self.rng.choice(self.pool)
             side = pair.shape[-1]
-            flip_y, flip_x, turn = rng.random() < 0.5, rng.random() < 0.5, rng.random() < 0.5
+            flip_y, flip_x, turn = (self.rng.random() < 0.5 for _ in range(3))
             # A flipped mosaic starts on red again one pixel in, so the window's corner takes that parity.
-            y = rng.randrange((side - self.size) // 2) * 2 + flip_y
-            x = rng.randrange((side - self.size) // 2) * 2 + flip_x
+            y = self.rng.randrange((side - self.size) // 2) * 2 + flip_y
+            x = self.rng.randrange((side - self.size) // 2) * 2 + flip_x
             if flip_y:
                 pair = pair[:, ::-1]
             if flip_x:
@@ -179,7 +193,9 @@ class Crops(torch.utils.data.IterableDataset):
             pair = pair[:, y : y + self.size, x : x + self.size]
             if turn:
                 pair = pair.transpose(0, 2, 1)
-            yield torch.from_numpy(np.ascontiguousarray(pair)), synthetic
+            pairs.append(np.ascontiguousarray(pair[[0, -1]]))
+            kinds.append(synthetic)
+        return torch.from_numpy(np.stack(pairs)).cuda().float(), torch.tensor(kinds, device="cuda")
 
 
 def spread(n, device, low, high):
@@ -317,67 +333,62 @@ def main(args):
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
+    train = scenes("train", args.scenes)
+    crops = Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*")
     while step < args.steps:
-        # The scene list is read again every round, so crops raw_pairs.py finishes meanwhile join in.
-        train = scenes("train", args.scenes)
-        loader = torch.utils.data.DataLoader(
-            Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*"),
-            batch_size=args.batch,
-            num_workers=args.workers,
-            pin_memory=True,
-        )
-        for pair, synthetic in loader:
-            pair = pair.cuda(non_blocking=True)
-            clean, noisy = pair[:, 0], pair[:, 1]
-            synthetic = synthetic.cuda().view(-1, 1, 1)
-            g = gains(clean)
-            clean, noisy = clean * g, noisy * g
-            if synthetic.any():
-                laid = made_up_noise(clean, profile)
-                if bank:
-                    laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank), laid)
-                noisy = torch.where(synthetic, laid, noisy)
-            with torch.autocast("cuda", torch.bfloat16):
-                result = unpack(compiled(pack(noisy).contiguous(memory_format=torch.channels_last)).float())
-            loss = loss_of(result, clean)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
-            schedule.step()
-            step += 1
-            if step % 4 == 0:
-                average.update_parameters(model)
-            running += loss.detach()
-            if step % args.check == 0 or step == args.steps:
-                bench = bench_raw.score(cleaner(average.module), "gr3")
-                line = {
-                    "step": step,
-                    "loss": round(running.item() / args.check, 5),
-                    "val_psnr": round(validate(average.module, val), 3) if val else float("nan"),
-                    "gr3_psnr": round(float(np.mean([psnr for psnr, _ in bench.values()])), 3),
-                    "gr3_by_iso": [round(psnr, 3) for psnr, _ in bench.values()],
-                    "lr": schedule.get_last_lr()[0],
-                    "scenes": len(train),
-                    "time": round(time.time()),
-                }
-                print(json.dumps(line), flush=True)
-                log.write(json.dumps(line) + "\n")
-                log.flush()
-                running.zero_()
-                state = {
-                    "model": model.state_dict(),
-                    "average": average.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "schedule": schedule.state_dict(),
-                    "step": step,
-                }
-                torch.save(state, out / "last.tmp")
-                (out / "last.tmp").rename(out / "last.pth")
-                if step % args.keep == 0:
-                    torch.save(average.module.state_dict(), out / f"step{step}.pth")
-            if step >= args.steps or step % args.rescan == 0:
-                break
+        pair, synthetic = crops.batch(args.batch)
+        clean, noisy = pair[:, 0], pair[:, 1]
+        synthetic = synthetic.view(-1, 1, 1)
+        g = gains(clean)
+        clean, noisy = clean * g, noisy * g
+        if synthetic.any():
+            laid = made_up_noise(clean, profile)
+            if bank:
+                laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank), laid)
+            noisy = torch.where(synthetic, laid, noisy)
+        with torch.autocast("cuda", torch.bfloat16):
+            result = unpack(compiled(pack(noisy).contiguous(memory_format=torch.channels_last)).float())
+        loss = loss_of(result, clean)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        optimizer.step()
+        schedule.step()
+        step += 1
+        if step % 4 == 0:
+            average.update_parameters(model)
+        running += loss.detach()
+        if step % args.check == 0 or step == args.steps:
+            bench = bench_raw.score(cleaner(average.module), "gr3")
+            line = {
+                "step": step,
+                "loss": round(running.item() / args.check, 5),
+                "val_psnr": round(validate(average.module, val), 3) if val else float("nan"),
+                "gr3_psnr": round(float(np.mean([psnr for psnr, _ in bench.values()])), 3),
+                "gr3_by_iso": [round(psnr, 3) for psnr, _ in bench.values()],
+                "lr": schedule.get_last_lr()[0],
+                "scenes": len(train),
+                "time": round(time.time()),
+            }
+            print(json.dumps(line), flush=True)
+            log.write(json.dumps(line) + "\n")
+            log.flush()
+            running.zero_()
+            state = {
+                "model": model.state_dict(),
+                "average": average.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "schedule": schedule.state_dict(),
+                "step": step,
+            }
+            torch.save(state, out / "last.tmp")
+            (out / "last.tmp").rename(out / "last.pth")
+            if step % args.keep == 0:
+                torch.save(average.module.state_dict(), out / f"step{step}.pth")
+        if step % args.rescan == 0:
+            # Crops raw_pairs.py finished meanwhile join in.
+            train = scenes("train", args.scenes)
+            crops.use(train)
     torch.save(average.module.state_dict(), out / "faithful.pth")
 
 
@@ -391,7 +402,6 @@ if __name__ == "__main__":
     parser.add_argument("--check", type=int, default=2000)
     parser.add_argument("--keep", type=int, default=20000, help="steps between saved snapshots")
     parser.add_argument("--rescan", type=int, default=4000)
-    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init")
     parser.add_argument("--scenes", default="*")
