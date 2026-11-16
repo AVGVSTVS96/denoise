@@ -52,6 +52,9 @@ FLOOR = 2
 WEIGHTS = {"ir-gr3": 40, "ir-": 4}
 #: The share of draws that go to scenes with real noisy frames, however many clean-only scenes join.
 PAIR_SHARE = 1 / 6
+#: Crops a data worker keeps in memory, and how often a draw swaps one for a fresh read. The scenes
+#: outgrew the disk cache, and on a busy server a read per sample left the GPU waiting on the disk.
+POOL, FRESH = 48, 1 / 4
 #: His camera's colour, for the part of the loss that looks at the picture: white balance ranges that
 #: cover daylight, tungsten and street light, and the GR III's matrix from camera colour to sRGB.
 RED, BLUE = (1.5, 2.8), (1.4, 3.2)
@@ -150,18 +153,25 @@ class Crops(torch.utils.data.IterableDataset):
         paired = list(self.scenes.values())
         total = {kind: sum(w for w, p in zip(weights, paired) if p == kind) for kind in (True, False)}
         weights = [w * (PAIR_SHARE if p else 1 - PAIR_SHARE) / total[p] for w, p in zip(weights, paired)]
+        pool = []
         while True:
-            scene = rng.choices(list(self.scenes), weights)[0]
-            stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
-            frames, crops, side, _ = stack.shape
-            crop = rng.randrange(crops)
-            synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
-            frame = 0 if synthetic else rng.randrange(1, frames)
+            if len(pool) < POOL or rng.random() < FRESH:
+                scene = rng.choices(list(self.scenes), weights)[0]
+                stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
+                frames, crop = stack.shape[0], rng.randrange(stack.shape[1])
+                synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
+                frame = 0 if synthetic else rng.randrange(1, frames)
+                read = np.stack([stack[0, crop], stack[frame, crop]]).astype(np.float32), synthetic
+                if len(pool) < POOL:
+                    pool.append(read)
+                else:
+                    pool[rng.randrange(POOL)] = read
+            pair, synthetic = rng.choice(pool)
+            side = pair.shape[-1]
             flip_y, flip_x, turn = rng.random() < 0.5, rng.random() < 0.5, rng.random() < 0.5
             # A flipped mosaic starts on red again one pixel in, so the window's corner takes that parity.
             y = rng.randrange((side - self.size) // 2) * 2 + flip_y
             x = rng.randrange((side - self.size) // 2) * 2 + flip_x
-            pair = np.stack([stack[0, crop], stack[frame, crop]]).astype(np.float32)
             if flip_y:
                 pair = pair[:, ::-1]
             if flip_x:
