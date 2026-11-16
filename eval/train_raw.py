@@ -7,6 +7,7 @@
 The network sees the mosaic packed into four half-size planes (R, G, G, B), so a phone runs it at a
 quarter of the pixels. Its body starts from the SIDD sRGB weights; the first and last layers are new.
 Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with noise laid over them.
+A sixth of the draws go to the scenes that have real noisy frames, however many clean ones there are.
 Without --profile that noise is either made up (shot noise, read noise and row banding, from a wide
 range of cameras) or a window of the Ricoh GR III's real noise (noise_bank.py). A profile narrows the
 run to one camera: every clean frame gets that camera's noise, its real noise fields if the profile
@@ -49,6 +50,8 @@ FLOOR = 2
 #: How often a scene is drawn, by the start of its name. Imaging Resource's Ricoh lab scenes are the
 #: nearest thing to his camera's noise, and the GR III has its very sensor.
 WEIGHTS = {"ir-gr3": 40, "ir-": 4}
+#: The share of draws that go to scenes with real noisy frames, however many clean-only scenes join.
+PAIR_SHARE = 1 / 6
 #: His camera's colour, for the part of the loss that looks at the picture: white balance ranges that
 #: cover daylight, tungsten and street light, and the GR III's matrix from camera colour to sRGB.
 RED, BLUE = (1.5, 2.8), (1.4, 3.2)
@@ -144,8 +147,11 @@ class Crops(torch.utils.data.IterableDataset):
         info = torch.utils.data.get_worker_info()
         rng = random.Random(self.seed + (info.id if info else 0))
         weights = [next((w for start, w in WEIGHTS.items() if s.startswith(start)), 1) for s in self.scenes]
+        paired = list(self.scenes.values())
+        total = {kind: sum(w for w, p in zip(weights, paired) if p == kind) for kind in (True, False)}
+        weights = [w * (PAIR_SHARE if p else 1 - PAIR_SHARE) / total[p] for w, p in zip(weights, paired)]
         while True:
-            scene = rng.choices(self.scenes, weights)[0]
+            scene = rng.choices(list(self.scenes), weights)[0]
             stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
             frames, crops, side, _ = stack.shape
             crop = rng.randrange(crops)
@@ -236,11 +242,12 @@ def gains(clean):
 
 
 def scenes(split, pattern):
-    found = []
+    """Each scene's name, and whether it has real noisy frames."""
+    found = {}
     for meta in sorted(PAIRS.glob("*.json")):
         info = json.loads(meta.read_text())
         if info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.with_suffix(".npy").exists():
-            found.append(meta.stem)
+            found[meta.stem] = bool(info["frames"])
     return found
 
 

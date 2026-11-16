@@ -2,6 +2,8 @@
 
     uv run raw_pairs.py 4 0          the first of four workers; every worker skips scenes already done
     uv run raw_pairs.py 6 0 raise    the same for RAISE's clean frames
+    uv run raw_pairs.py 4 0 pixls    and for raw.pixls.us's
+    uv run raw_pairs.py 2 0 own      and for his own photos
 
 Sources: every RawNIND Bayer scene with a frame at ISO 3,200 or more (fetched from the UCLouvain
 Dataverse, CC BY-SA 4.0, and deleted once cropped), and the pairs already in data/night-raw: ELD,
@@ -9,7 +11,14 @@ SID Sony, RawNIND, and Imaging Resource's Ricoh GR II and GR III lab scenes. Hel
 GR IIIx frame, every Imaging Resource still life (the GR IIIx test scene, shot the same way on each
 camera), X-Trans sensors, and the RawNIND scenes evaluate.py's NIND set comes from.
 
-RAISE's clean Nikon raws (research use only) add scenes for made-up noise.
+Clean frames alone add scenes for laid-over noise, from three places. His own photos at ISO 200 or
+less, listed one host:path a line in data/own/paths.txt and read over ssh: the GR IIIx's own lens and
+sensor, and his to train anything on. raw.pixls.us's public-domain (CC0) raws at ISO 400 or less, a
+frame from each of hundreds of cameras. And RAISE's Nikon raws, which are for research only: a model
+that is sold has to leave them out (train_raw.py --scenes).
+
+A frame that turns out too noisy or not Bayer leaves <scene>.skip with its ISO and camera, so no
+worker fetches it twice.
 
 Each scene becomes data/rawpairs/<scene>.npy, float16 (frames, crops, 512, 512): frame 0 is the
 clean mosaic, the rest are noisy frames brought to its brightness. Mosaics are black-subtracted,
@@ -20,7 +29,11 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
+import socket
+import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 import cv2
@@ -30,6 +43,8 @@ import rawpy
 DATA = pathlib.Path(__file__).parent / "data"
 OUT = DATA / "rawpairs"
 NIGHT = DATA / "night-raw"
+OWN = DATA / "own" / "paths.txt"
+PIXLS = "https://raw.pixls.us/json/getrepository.php?set=all"
 HOST = "https://dataverse.uclouvain.be/api"
 DOI = "doi:10.14428/DVN/DEQCIM"
 CROP = 512
@@ -122,13 +137,29 @@ def match(clean, noisy):
     return out, slopes
 
 
+def tags(path):
+    """A raw's ISO (0 when it names none) and camera, read from its EXIF by exiv2."""
+    keys = {"Exif.Photo.ISOSpeedRatings": "iso", "Exif.Image.Model": "camera"}
+    listed = subprocess.run(
+        ["exiv2", "-Pkv", *(f"-g{key}" for key in keys), str(path)], check=False, capture_output=True, text=True
+    )
+    found = {keys[key]: value.strip() for key, _, value in (line.partition(" ") for line in listed.stdout.splitlines())}
+    iso = re.match(r"\d+", found.get("iso", ""))
+    return {"iso": int(iso.group()) if iso else 0, "camera": found.get("camera", "")}
+
+
 def build(name, clean_path, noisy_paths, meta):
-    out = OUT / f"{name}.npy"
-    if out.exists():
+    out, skip = OUT / f"{name}.npy", OUT / f"{name}.skip"
+    if out.exists() or skip.exists():
         return
-    clean = mosaic(clean_path())
+    path = clean_path()
+    limit = meta.pop("clean_iso", None)
+    if limit:
+        meta |= tags(path)
+    clean = mosaic(path) if not limit or 0 < meta["iso"] <= limit else None
     if clean is None:
-        print(name, "not Bayer", flush=True)
+        skip.write_text(json.dumps(meta))
+        print(name, "skipped", meta.get("iso", "not Bayer"), flush=True)
         return
     rng = np.random.default_rng(int(hashlib.sha1(name.encode()).hexdigest()[:8], 16))
     picks = corners(clean, rng, meta.pop("crops", CROPS))
@@ -172,6 +203,27 @@ def fetched(url, suffix=".arw"):
 
 
 fetched.paths = []
+
+
+def copied(source):
+    """The same for a raw on another machine, named host:path."""
+    host, path = source.split(":", 1)
+
+    def get():
+        local = OUT / f"fetch-{hashlib.sha1(source.encode()).hexdigest()[:12]}{pathlib.Path(path).suffix}"
+        fetched.paths.append(local)
+        with local.open("wb") as file:
+            subprocess.run(["ssh", host, "cat", shlex.quote(path)], stdout=file, check=True, timeout=900)
+        # iCloud Drive downloads a file onto the Mac when it is read; evicting leaves the disk as it was.
+        if "/Mobile Documents/" in path:
+            evicted = subprocess.run(
+                ["ssh", host, "brctl", "evict", shlex.quote(path)], check=False, capture_output=True
+            )
+            if evicted.returncode:
+                sys.exit(f"{source} stays downloaded: {evicted.stderr.decode()}")
+        return local
+
+    return get
 
 
 def rawnind_scenes():
@@ -247,6 +299,35 @@ def raise_scenes():
             )
 
 
+def pixls_scenes():
+    """raw.pixls.us's public-domain raws of 10 MP or more, a frame from each camera and mode."""
+    for _, _, _, megapixels, _, licence, _, link, _ in json.load(urllib.request.urlopen(PIXLS))["data"]:
+        url = re.search(r"href='([^']+)'", link).group(1)
+        if "publicdomain/zero" in licence and float(megapixels or 0) >= 10:
+            yield (
+                f"pixls-{url.split('/')[4]}",
+                fetched(urllib.parse.quote(url, safe=":/"), pathlib.Path(url).suffix),
+                [],
+                {"source": "raw.pixls.us", "license": "CC0", "crops": 6, "clean_iso": 400},
+            )
+
+
+def own_scenes():
+    """His own photos, wherever data/own/paths.txt says they are."""
+    for source in OWN.read_text().splitlines():
+        digest = hashlib.sha1(source.encode()).hexdigest()[:6]
+        meta = {"source": "Own", "license": "own", "crops": 12, "clean_iso": 200, "path": source}
+        yield f"own-{pathlib.Path(source).stem}-{digest}", copied(source), [], meta
+
+
+SOURCES = {
+    "pairs": lambda: [*local_scenes(), *rawnind_scenes()],
+    "raise": raise_scenes,
+    "pixls": pixls_scenes,
+    "own": own_scenes,
+}
+
+
 def split(name):
     """About one RawNIND scene in ten is kept out of training to watch for overfitting."""
     return "val" if name.startswith("rawnind-") and hashlib.sha1(name.encode()).digest()[0] % 10 == 0 else "train"
@@ -254,11 +335,13 @@ def split(name):
 
 def main(workers, worker, source="pairs"):
     OUT.mkdir(parents=True, exist_ok=True)
-    scenes = list(raise_scenes()) if source == "raise" else [*local_scenes(), *rawnind_scenes()]
+    socket.setdefaulttimeout(300)
+    scenes = list(SOURCES[source]())
     for name, clean, noisy, meta in scenes[worker::workers]:
         try:
             build(name, clean, noisy, {**meta, "scene": name, "split": split(name)})
-        except (OSError, ValueError, rawpy.LibRawError) as error:  # one bad download or file shouldn't stop the rest
+        # One bad download or file shouldn't stop the rest.
+        except (OSError, ValueError, rawpy.LibRawError, subprocess.SubprocessError) as error:
             print(name, "failed", repr(error), flush=True)
         for path in fetched.paths:
             path.unlink(missing_ok=True)
