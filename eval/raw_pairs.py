@@ -186,7 +186,9 @@ def build(name, clean_path, noisy_paths, meta):
         return
     np.save(OUT / f"{name}.tmp.npy", np.stack(frames).astype(np.float16))
     (OUT / f"{name}.tmp.npy").rename(out)
-    (OUT / f"{name}.json").write_text(json.dumps({**meta, "frames": kept}))
+    # Renamed into place whole: train_raw.py reads these while a build is still writing them.
+    (OUT / f"{name}.tmp").write_text(json.dumps({**meta, "frames": kept}))
+    (OUT / f"{name}.tmp").rename(OUT / f"{name}.json")
     print(name, kept, flush=True)
 
 
