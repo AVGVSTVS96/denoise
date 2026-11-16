@@ -164,11 +164,16 @@ class Crops:
         rng = random.Random(self.rng.random())
         while True:
             scene = rng.choices(*self.draw)[0]
-            stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
-            frames, crop = stack.shape[0], rng.randrange(stack.shape[1])
+            path = PAIRS / f"{scene}.npy"
+            stack = np.load(path, mmap_mode="r")
+            frames, crops, side, _ = stack.shape
+            crop = rng.randrange(crops)
             synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
             frame = 0 if synthetic else rng.randrange(1, frames)
-            fresh = np.stack([stack[i, crop] for i in sorted({0, frame})]), synthetic
+            # Read by offset: through the memory map the kernel fetches about three times what a crop holds.
+            starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in sorted({0, frame})]
+            planes = [np.fromfile(path, stack.dtype, side * side, offset=start) for start in starts]
+            fresh = np.stack(planes).reshape(-1, side, side), synthetic
             if len(self.pool) < POOL:
                 self.pool.append(fresh)
             else:
