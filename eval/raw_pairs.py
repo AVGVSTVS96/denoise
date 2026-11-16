@@ -215,10 +215,10 @@ def copied(source):
         with local.open("wb") as file:
             subprocess.run(["ssh", host, "cat", shlex.quote(path)], stdout=file, check=True, timeout=900)
         # iCloud Drive downloads a file onto the Mac when it is read; evicting leaves the disk as it was.
+        # A file just downloaded can stay locked for some seconds.
         if "/Mobile Documents/" in path:
-            evicted = subprocess.run(
-                ["ssh", host, "brctl", "evict", shlex.quote(path)], check=False, capture_output=True
-            )
+            evict = f"for n in 1 2 3 4 5 6; do brctl evict {shlex.quote(path)} && exit; sleep 10; done; exit 1"
+            evicted = subprocess.run(["ssh", host, evict], check=False, capture_output=True)
             if evicted.returncode:
                 sys.exit(f"{source} stays downloaded: {evicted.stderr.decode()}")
         return local
