@@ -38,7 +38,6 @@ DPREVIEW = (
     "https://www.dpreview.com/wp-json/wayfinder-image-compare/v1/widgets/541206/frontend"
 )
 RATIO, FLOOR = 16, 800
-TRIES = 8
 
 
 def get(url, post=None):
@@ -209,21 +208,18 @@ def fetch(row, source):
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_suffix(".part")
-    for attempt in range(TRIES):
-        try:
-            part.write_bytes(get(urllib.parse.quote(row["url"], safe=":/?=&")))
-            # A challenge page or an error page is small; a raw file never is.
-            if part.stat().st_size > 1 << 20:
-                part.rename(path)
-                return path.stat().st_size
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
-            last = error
-        else:
-            last = "too small"
-        time.sleep(3 * (attempt + 1))
-    part.unlink(missing_ok=True)
-    print("gave up", row["url"], last, flush=True)
-    return 0
+    try:
+        part.write_bytes(get(urllib.parse.quote(row["url"], safe=":/?=&")))
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+        print("gave up", row["url"], error, flush=True)
+        return 0
+    # An error page is small; a raw file never is.
+    if part.stat().st_size < 1 << 20:
+        part.unlink()
+        print("gave up", row["url"], "too small", flush=True)
+        return 0
+    part.rename(path)
+    return path.stat().st_size
 
 
 def main(what, source):
