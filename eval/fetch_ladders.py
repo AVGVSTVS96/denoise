@@ -45,8 +45,17 @@ def get(url, post=None):
     asked = urllib.request.Request(
         url, post and json.dumps(post).encode(), {**AGENT, "Content-Type": "application/json"}
     )
-    body = urllib.request.urlopen(asked, timeout=120).read()
-    return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+    for attempt in range(3):
+        try:
+            body = urllib.request.urlopen(asked, timeout=120).read()
+            return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
+        except urllib.error.HTTPError as error:
+            if error.code < 500 or attempt == 2:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            if attempt == 2:
+                raise
+        time.sleep(10)
 
 
 def slug(name):
@@ -145,7 +154,10 @@ def pb():
 def epz():
     seen = set()
     for page in range(1, 157):
-        listed = get(f"https://www.ephotozine.com/reviews/digital-cameras-29/p-{page}").decode("latin1")
+        try:
+            listed = get(f"https://www.ephotozine.com/reviews/digital-cameras-29/p-{page}").decode("latin1")
+        except urllib.error.URLError:
+            continue
         for review in sorted(
             set(re.findall(r'href="(https://www\.ephotozine\.com/article/[a-z0-9-]+-\d+)"', listed)) - seen
         ):
