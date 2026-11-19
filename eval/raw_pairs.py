@@ -190,7 +190,15 @@ def build(name, clean_path, noisy_paths, meta):
         if not 0.8 < lift < 1.25:
             print(name, iso, "shadows off", round(lift, 2), flush=True)
             continue
-        frames.append(np.stack([noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for y, x in picks]))
+        cut = np.stack([noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for y, x in picks])
+        # Light that changed between the frames, or a subject that moved, leaves 64 px blocks whose
+        # brightness disagrees. A lab ladder is within 3% at nine frames in ten; some reviews' are not.
+        means = lambda crops: crops.reshape(len(crops), CROP // 64, 64, CROP // 64, 64).mean((2, 4))
+        drift = float(np.median(np.abs(means(cut) - means(frames[0])) / (means(frames[0]) + 0.01)))
+        if drift > 0.05:
+            print(name, iso, "drifted", round(drift, 3), flush=True)
+            continue
+        frames.append(cut)
         kept.append({"iso": iso, "shift": [dx, dy], "gain": round(float(np.mean(gains)), 3)})
     if noisy_paths and not kept:
         return
