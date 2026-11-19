@@ -338,14 +338,19 @@ def ladder_scenes():
         steps = sorted((int(file.stem), file) for file in folder.iterdir() if file.stem.isdigit())
         if (site, scene) == ("ir", "sli") or any(name in camera for name in HELD_OUT) or len(steps) < 2:
             continue
-        (_, clean), *noisy = steps
-        meta = {"source": SITES[site], "license": "review samples", "camera": camera, "crops": 8}
-        yield (
-            f"ladder-{site}-{camera}-{scene}",
-            lambda c=clean: c,
-            [(iso, lambda f=file: f) for iso, file in noisy],
-            meta,
-        )
+        (base, clean), *rest = steps
+        # A fetch that missed files can leave a ladder without its low end.
+        noisy = [(iso, lambda f=file: f) for iso, file in rest if iso >= 16 * base]
+        if base > 400 or not noisy:
+            continue
+        # Photography Blog shot a scene of its own for every review, so its ladders are worth more crops.
+        meta = {
+            "source": SITES[site],
+            "license": "review samples",
+            "camera": camera,
+            "crops": 16 if site == "pb" else 8,
+        }
+        yield f"ladder-{site}-{camera}-{scene}", lambda c=clean: c, noisy, meta
 
 
 SOURCES = {
