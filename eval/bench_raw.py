@@ -167,8 +167,7 @@ def main(models):
         table.setdefault(camera, {})["noisy"] = score(lambda noisy, mean: noisy, camera, with_lpips=True)
         for spec in models:
             name, weights = spec.split("=")
-            model = train_raw.network().cuda().eval()
-            model.load_state_dict(torch.load(weights, map_location="cpu"))
+            model = train_raw.trained(weights)
             table[camera][name] = score(train_raw.cleaner(model), camera, with_lpips=True)
         print(f"\n{camera}  PSNR / LPIPS\n{'':24}" + "".join(f"{iso:>14}" for iso in ISOS) + f"{'mean':>14}")
         for name, by_iso in table[camera].items():

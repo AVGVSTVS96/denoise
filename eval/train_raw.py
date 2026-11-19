@@ -6,6 +6,7 @@
 
 The network sees the mosaic packed into four half-size planes (R, G, G, B), so a phone runs it at a
 quarter of the pixels. Its body starts from the SIDD sRGB weights; the first and last layers are new.
+--width 64 trains the wider NAFNet, four times the work for a picture, for when quality matters more.
 Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with noise laid over them.
 A third of the draws go to the scenes that have real noisy frames, however many clean ones there are.
 Without --profile that noise is either made up (shot noise, read noise and row banding, from a wide
@@ -66,10 +67,18 @@ TO_SRGB = ((1.703, -0.719, 0.016), (-0.188, 1.563, -0.375), (0.004, -0.406, 1.40
 EMA = 0.996
 
 
-def network():
+def network(width=32):
     from nafnet import CONFIGS, NAFNet
 
-    return NAFNet(CONFIGS["nafnet-sidd-w32"], img_channel=4)
+    return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=4)
+
+
+def trained(weights):
+    """A saved model, at whatever width it was trained."""
+    state = torch.load(weights, map_location="cpu")
+    model = network(state["intro.weight"].shape[0])
+    model.load_state_dict(state)
+    return model.cuda().eval()
 
 
 def pack(mosaic):
@@ -314,11 +323,11 @@ def main(args):
     bank = noise_bank(camera) if camera.with_suffix(".npy").exists() else None
     profile = json.loads(camera.read_text()) if args.profile and not bank else None
     share = 1 if args.profile else BANK_SHARE
-    model = network().cuda().to(memory_format=torch.channels_last)
+    model = network(args.width).cuda().to(memory_format=torch.channels_last)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location="cpu"))
     else:
-        sidd = torch.load(evaluate.MODELS / "NAFNet-SIDD-width32.pth", map_location="cpu")["params"]
+        sidd = torch.load(evaluate.MODELS / f"NAFNet-SIDD-width{args.width}.pth", map_location="cpu")["params"]
         model.load_state_dict({k: v for k, v in sidd.items() if not k.startswith(("intro", "ending"))}, strict=False)
     average = torch.optim.swa_utils.AveragedModel(model, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(EMA))
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.9), weight_decay=0, fused=True)
@@ -414,6 +423,9 @@ if __name__ == "__main__":
     parser.add_argument("--rescan", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init")
+    parser.add_argument(
+        "--width", type=int, default=32, help="the network's width, 32 or 64: four times the work at 64"
+    )
     parser.add_argument("--scenes", default="*")
     parser.add_argument("--profile")
     main(parser.parse_args())
