@@ -4,6 +4,7 @@
     uv run raw_pairs.py 6 0 raise    the same for RAISE's clean frames
     uv run raw_pairs.py 4 0 pixls    and for raw.pixls.us's
     uv run raw_pairs.py 2 0 own      and for his own photos
+    uv run raw_pairs.py 2 0 ladders  and for review sites' ISO ladders (fetch_ladders.py)
 
 Sources: every RawNIND Bayer scene with a frame at ISO 3,200 or more (fetched from the UCLouvain
 Dataverse, CC BY-SA 4.0, and deleted once cropped), and the pairs already in data/night-raw: ELD,
@@ -16,6 +17,11 @@ less, listed one host:path a line in data/own/paths.txt and read over ssh: the G
 sensor, and his to train anything on. raw.pixls.us's public-domain (CC0) raws at ISO 400 or less, a
 frame from each of hundreds of cameras. And RAISE's Nikon raws, which are for research only: a model
 that is sold has to leave them out (train_raw.py --scenes).
+
+Review sites' ISO ladders (fetch_ladders.py) are real pairs from hundreds of cameras: a camera's
+lowest ISO against each of its high ones, on a tripod. Most of a site's cameras shot one scene, so a
+ladder brings few crops, and Imaging Resource's still life stays out whole, as the test. They are
+review samples, for research runs only.
 
 A frame that turns out too noisy or not Bayer leaves <scene>.skip with its ISO and camera, so no
 worker fetches it twice.
@@ -44,6 +50,10 @@ DATA = pathlib.Path(__file__).parent / "data"
 OUT = DATA / "rawpairs"
 NIGHT = DATA / "night-raw"
 OWN = DATA / "own" / "paths.txt"
+LADDERS = DATA / "ladders"
+SITES = {"ir": "Imaging Resource", "pb": "Photography Blog", "epz": "ePHOTOzine", "dpreview": "DPReview"}
+#: Cameras no scene of which trains, by a part of their name on any site: bench_raw.py's unseen cameras.
+HELD_OUT = ("gr-iiix", "eos-r6", "z6-ii", "a7-iv", "a6400", "e-m1-mark-iii", "pentax-k-1", "rx100-vii", "nx500")
 PIXLS = "https://raw.pixls.us/json/getrepository.php?set=all"
 HOST = "https://dataverse.uclouvain.be/api"
 DOI = "doi:10.14428/DVN/DEQCIM"
@@ -322,11 +332,28 @@ def own_scenes():
         yield f"own-{pathlib.Path(source).stem}-{digest}", copied(source), [], meta
 
 
+def ladder_scenes():
+    for folder in sorted(LADDERS.glob("*/*/*/")):
+        site, camera, scene = folder.relative_to(LADDERS).parts
+        steps = sorted((int(file.stem), file) for file in folder.iterdir() if file.stem.isdigit())
+        if (site, scene) == ("ir", "sli") or any(name in camera for name in HELD_OUT) or len(steps) < 2:
+            continue
+        (_, clean), *noisy = steps
+        meta = {"source": SITES[site], "license": "review samples", "camera": camera, "crops": 8}
+        yield (
+            f"ladder-{site}-{camera}-{scene}",
+            lambda c=clean: c,
+            [(iso, lambda f=file: f) for iso, file in noisy],
+            meta,
+        )
+
+
 SOURCES = {
     "pairs": lambda: [*local_scenes(), *rawnind_scenes()],
     "raise": raise_scenes,
     "pixls": pixls_scenes,
     "own": own_scenes,
+    "ladders": ladder_scenes,
 }
 
 
