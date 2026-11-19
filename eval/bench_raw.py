@@ -31,6 +31,10 @@ CAMERAS = {"gr3": "ricoh-gr-iii--GR3hSLI{:06d}NR0.DNG", "gr3x": "ricoh-gr-iiix--
 ISOS = (3200, 6400, 12800, 25600, 51200, 102400)
 WINDOWS = 32
 STILL_LIFES = raw_pairs.LADDERS / "ir"
+XYZ_FROM_SRGB = np.array(
+    [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]],
+    np.float32,
+)
 SEEN = [
     "canon-eos-5d-mark-iv",
     "canon-eos-80d",
@@ -80,6 +84,10 @@ def build(camera, path, base=100, isos=ISOS, count=WINDOWS):
     with rawpy.imread(str(path(base))) as raw:
         wb = np.asarray(raw.camera_whitebalance[:3], np.float32)
         matrix = np.asarray(raw.color_matrix[:, :3], np.float32)
+        if not matrix.any():
+            # Only some raw formats carry that matrix; for the rest LibRaw knows the camera's colour against XYZ.
+            to_camera = np.asarray(raw.rgb_xyz_matrix[:3], np.float32) @ XYZ_FROM_SRGB
+            matrix = np.linalg.inv(to_camera / to_camera.sum(axis=1, keepdims=True))
     BENCH.mkdir(parents=True, exist_ok=True)
     frames = np.stack(frames).astype(np.float16)
     np.savez(BENCH / f"{camera}.npz", frames=frames, means=means, wb=wb / wb[1], matrix=matrix, isos=isos)
