@@ -7,7 +7,7 @@
 The network sees the mosaic packed into four half-size planes (R, G, G, B), so a phone runs it at a
 quarter of the pixels. Its body starts from the SIDD sRGB weights; the first and last layers are new.
 Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with noise laid over them.
-A sixth of the draws go to the scenes that have real noisy frames, however many clean ones there are.
+A third of the draws go to the scenes that have real noisy frames, however many clean ones there are.
 Without --profile that noise is either made up (shot noise, read noise and row banding, from a wide
 range of cameras) or a window of the Ricoh GR III's real noise (noise_bank.py). A profile narrows the
 run to one camera: every clean frame gets that camera's noise, its real noise fields if the profile
@@ -17,8 +17,10 @@ frames. Each crop is scaled to a set brightness first, the same way denoise() sc
 night frames look like any other.
 
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
-step, which is steadier than any single step. Every check logs the held-out RawNIND score and bench_raw.py's GR III score,
-its mean and each ISO from 3,200 to 102,400; run.json beside the log keeps the run's settings.
+step, which is steadier than any single step. Every check logs the held-out RawNIND score and
+bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
+102,400, and the mean over the cameras whose other scenes train. run.json beside the log keeps the
+run's settings.
 """
 
 import argparse
@@ -43,16 +45,17 @@ MODELS = evaluate.MODELS / "raw"
 LEVEL = 0.1
 MAX_GAIN = 64.0
 SYNTHETIC_SHARE = 0.4
-#: How much of the laid-over noise is the GR III's real noise.
-BANK_SHARE = 0.4
+#: How much of the laid-over noise is the GR III's real noise: one camera's, in a model for any camera.
+BANK_SHARE = 0.2
 #: The fewest electrons a pixel at LEVEL gets under laid-over noise. His night photo averages 17 and
 #: half of it sits under 6; the GR IIIx's ISO 102,400 frame averages 9.
 FLOOR = 2
-#: How often a scene is drawn, by the start of its name. Imaging Resource's Ricoh lab scenes are the
-#: nearest thing to his camera's noise, and the GR III has its very sensor.
-WEIGHTS = {"ir-gr3": 40, "ir-": 4}
+#: How often a scene is drawn, by the start of its name. The review sites' ladders are hundreds of
+#: cameras on a handful of scenes, so together they get about as many draws as the other real pairs,
+#: which are far fewer cameras on far more scenes.
+WEIGHTS = {"ladder-": 0.5}
 #: The share of draws that go to scenes with real noisy frames, however many clean-only scenes join.
-PAIR_SHARE = 1 / 6
+PAIR_SHARE = 1 / 3
 #: Crops kept in memory, and how many of them a second are swapped for fresh ones from disk. The
 #: scenes outgrew the disk cache, and a read per sample kept a shared server's disk busy.
 POOL, READS = 1024, 4
@@ -365,12 +368,14 @@ def main(args):
         running += loss.detach()
         if step % args.check == 0 or step == args.steps:
             bench = bench_raw.score(cleaner(average.module), "gr3")
+            seen = bench_raw.score(cleaner(average.module), "seen")
             line = {
                 "step": step,
                 "loss": round(running.item() / args.check, 5),
                 "val_psnr": round(validate(average.module, val), 3) if val else float("nan"),
                 "gr3_psnr": round(float(np.mean([psnr for psnr, _ in bench.values()])), 3),
                 "gr3_by_iso": [round(psnr, 3) for psnr, _ in bench.values()],
+                "seen_psnr": round(float(np.mean([psnr for psnr, _ in seen.values()])), 3),
                 "lr": schedule.get_last_lr()[0],
                 "scenes": len(train),
                 "time": round(time.time()),
