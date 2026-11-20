@@ -31,8 +31,11 @@ clean mosaic, then come the noisy frames brought to its brightness, then one cle
 them. A tripod still leaves a noisy frame a fraction of a pixel off the clean one, and a camera that
 steadies its sensor turns it a little too, so offsets() fits where each crop sits to a hundredth of a
 pixel. The noisy crop is cut at the nearest whole even pixel and stays as the camera made it; its
-twin is the clean crop resampled onto it. Mosaics are black-subtracted, divided by the white level
-and cut to start on red, so every camera reads as RGGB.
+twin is the clean crop resampled onto it. Both stop at the lower of the two frames' white levels: a
+noisy frame shot darker and brought up holds highlights the clean one clipped, a third brighter on
+the GR IIIx's still life, and the other way round a target would ask for what its frame never held.
+Mosaics are black-subtracted, divided by the white level and cut to start on red, so every camera
+reads as RGGB.
 """
 
 import hashlib
@@ -221,6 +224,14 @@ def tags(path):
     return {"iso": int(iso.group()) if iso else 0, "camera": found.get("camera", "")}
 
 
+def capped(crops, whites):
+    """Crops (N, H, W) with each colour plane cut off at its white."""
+    out = crops.copy()
+    for (i, j), white in zip(((0, 0), (0, 1), (1, 0), (1, 1)), whites):
+        np.minimum(out[:, i::2, j::2], white, out=out[:, i::2, j::2])
+    return out
+
+
 def twinned(meta):
     """Whether a built scene is up to date: it has no noisy frames, or each has its clean twin."""
     return not meta["frames"] or meta.get("twins", False)
@@ -265,6 +276,8 @@ def build(name, clean_path, noisy_paths, meta):
             [noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for (y, x), (dx, dy) in zip(picks, whole)]
         )
         twin = np.stack([resampled(clean, y, x, dx, dy) for (y, x), (dx, dy) in zip(picks, moves - whole)])
+        whites = [min(1.0, gain - black) for gain, black in zip(gains, blacks)]
+        cut, twin = capped(cut, whites), capped(twin, whites)
         # Light that changed between the frames, or a subject that moved, leaves 64 px blocks whose
         # brightness disagrees. A lab ladder is within 3% at nine frames in ten; some reviews' are not.
         means = lambda crops: crops.reshape(len(crops), CROP // 64, 64, CROP // 64, 64).mean((2, 4))
