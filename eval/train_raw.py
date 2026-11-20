@@ -19,8 +19,8 @@ frames. Each crop is scaled to a set brightness first, the same way denoise() sc
 night frames look like any other.
 
 Four settings bring the made-up noise closer to a real camera's, each on its own so runs compare:
---levels data/noise/cameras.json draws its levels as whole rows, one camera at one ISO as fit_noise.py
-measured it, in place of levels drawn apart; --offsets leaves each colour plane on the black offset
+--levels data/noise/cameras.json draws two thirds of its levels as whole rows, one camera at one ISO
+as fit_noise.py measured it, in place of levels drawn apart; --offsets leaves each colour plane on the black offset
 a real frame sits on, for the network to take off, in made-up noise and in the real noisy frames,
 which raw_pairs.py stores with theirs taken off; --tails gives the read noise a real sensor's long
 tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
@@ -77,10 +77,11 @@ POOL, READS = 1024, 4
 RED, BLUE = (1.5, 2.8), (1.4, 3.2)
 TO_SRGB = ((1.703, -0.719, 0.016), (-0.188, 1.563, -0.375), (0.004, -0.406, 1.402))
 EMA = 0.996
+TABLE_SHARE = 2 / 3
 DARK_SHARE = 0.25
 BELL = 0.14
 OFFSET_SHARED, OFFSET_OWN = 0.3, 0.1
-TAILS = (0.1, 0.2)
+TAILS = (0.0, 0.2)
 READ_COUNTS = (1, 300)
 MOST_BANDING = 0.3
 
@@ -320,25 +321,20 @@ def table(rows):
     return {part: torch.tensor(values, device="cuda") for part, values in parts.items()}
 
 
-def drawn(n, device, levels):
-    """n rows of noise levels for crops at LEVEL brightness.
+def drawn(n, device, levels, share):
+    """n rows of noise levels for crops at LEVEL brightness: a share of them a table's, the rest made up.
 
-    From a table, whole rows: the photo is taken as shot 1-16x darker than LEVEL and brought up, as a
-    dim night frame is, but never past FLOOR. Without one every part is made up on its own: from 3,000
-    electrons at LEVEL down to FLOOR, with half to eight electrons of read noise (the GR IIIx has
+    A table's row is taken whole: the photo is taken as shot 1-16x darker than LEVEL and brought up, as
+    a dim night frame is, but never past FLOOR. A made-up row has every part drawn on its own: from
+    3,000 electrons at LEVEL down to FLOOR, with half to eight electrons of read noise (the GR IIIx has
     about 3), an offset of a fraction of the read noise, part shared by the colour planes and part each
-    plane's own, and read noise of 1 to 300 raw counts.
+    plane's own, and read noise of 1 to 300 raw counts. The ladders the table is fitted on start
+    around ISO 800, so the made-up rows are what covers a nearly clean photo.
     """
-    if levels:
-        pick = torch.randint(len(levels["shot"]), (n,), device=device)
-        row = {part: values[pick] for part, values in levels.items()}
-        dim = torch.minimum(spread(n, device, 1, 16), LEVEL / (FLOOR * row["shot"].mean(1))).clamp(min=1)
-        scaled = lambda values: values * dim.view(n, *[1] * (values.dim() - 1))
-        return {part: values if part == "tail" else scaled(values) for part, values in row.items()}
     shot = spread(n, device, LEVEL / 3000, LEVEL / FLOOR)
     read = shot * spread(n, device, 0.5, 8)
     lift = torch.randn(n, 1, device=device) * OFFSET_SHARED + torch.randn(n, 4, device=device) * OFFSET_OWN
-    return {
+    made_up = {
         "shot": shot[:, None].expand(n, 4),
         "read": read[:, None].expand(n, 4),
         "offset": read[:, None] * lift,
@@ -346,14 +342,24 @@ def drawn(n, device, levels):
         "tail": torch.empty(n, 1, device=device).uniform_(*TAILS).expand(n, 4),
         "step": read / spread(n, device, *READ_COUNTS),
     }
+    if not levels:
+        return made_up
+    pick = torch.randint(len(levels["shot"]), (n,), device=device)
+    row = {part: values[pick] for part, values in levels.items()}
+    dim = torch.minimum(spread(n, device, 1, 16), LEVEL / (FLOOR * row["shot"].mean(1))).clamp(min=1)
+    each = lambda values: (n, *[1] * (values.dim() - 1))
+    row = {part: values if part == "tail" else values * dim.view(each(values)) for part, values in row.items()}
+    measured = torch.rand(n, device=device) < share
+    return {part: torch.where(measured.view(each(values)), values, made_up[part]) for part, values in row.items()}
 
 
 def long_tailed(like, tail):
     """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, ELD's read noise.
 
     tail (N, 4) is each colour plane's lambda: BELL is close to a bell curve, lower has longer tails.
+    Held between -0.2 and 0.25: a fit that asks for less tail than that has met rounding, not read noise.
     """
-    lam = sites(tail.clamp(-0.2, 0.5), like)
+    lam = sites(tail.clamp(-0.2, 0.25), like)
     lam = torch.where(lam.abs() < 0.01, torch.full_like(lam, 0.01), lam)
     variance = 2 / lam**2 * (1 / (1 + 2 * lam) - torch.exp(2 * torch.lgamma(lam + 1) - torch.lgamma(2 * lam + 2)))
     u = torch.rand_like(like).clamp(1e-6, 1 - 1e-6)
@@ -440,7 +446,7 @@ def main(args):
     bank = noise_bank(camera) if camera.with_suffix(".npy").exists() else None
     levels = table(measured(args.profile or args.levels)) if args.profile or args.levels else None
     darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
-    share = 1 if args.profile else BANK_SHARE
+    share, rows = (1, 1) if args.profile else (BANK_SHARE, TABLE_SHARE)
     model = network(args.width).cuda().to(memory_format=torch.channels_last)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location="cpu"))
@@ -478,7 +484,8 @@ def main(args):
         g = gains(clean)
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
-            laid = made_up_noise(clean, drawn(len(clean), clean.device, levels), args.offsets, args.tails, darks)
+            row = drawn(len(clean), clean.device, levels, rows)
+            laid = made_up_noise(clean, row, args.offsets, args.tails, darks)
             if bank:
                 laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank, args.offsets), laid)
             noisy = torch.where(synthetic, laid, noisy)
