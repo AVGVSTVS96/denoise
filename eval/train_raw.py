@@ -245,7 +245,10 @@ def spread(n, device, low, high):
 
 
 def windows(fields, n, size):
-    """n windows of mosaics (frames, H, W), each from a frame picked at random and starting on red: the frames, and the windows."""
+    """n windows of mosaics (frames, H, W), each from a frame picked at random and starting on red.
+
+    Returns which frames, and the windows.
+    """
     frame = torch.randint(len(fields), (n,), device=fields.device)
     corner = lambda side: (torch.randint((side - size) // 2, (n,)) * 2).tolist()
     cut = zip(frame.tolist(), corner(fields.shape[1]), corner(fields.shape[2]))
@@ -276,7 +279,7 @@ def bank_noise(clean, bank, offsets):
 
 
 def noise_bank(profile):
-    """A camera's noise fields on the GPU, with each ISO's shot noise, read noise and black offset per colour plane."""
+    """A camera's noise fields on the GPU, and its shot noise, read noise and black offset per ISO and colour plane."""
     levels = json.loads(profile.read_text())["iso"].values()
     fields = torch.from_numpy(np.load(profile.with_suffix(".npy"))).cuda()
     part = lambda kind: torch.tensor([level.get(kind, [0.0] * 4) for level in levels], device="cuda")
@@ -284,7 +287,7 @@ def noise_bank(profile):
 
 
 def dark_bank(path):
-    """Real dark frames at unit strength on the GPU, with each one's black offset per colour plane in units of its read noise."""
+    """Real dark frames at unit strength on the GPU, and each one's black offset per colour plane over its read noise."""
     lifts = [frame["offset"] for frame in json.loads(path.read_text())]
     return torch.from_numpy(np.load(path.with_suffix(".npy"))).cuda(), torch.tensor(lifts, device="cuda")
 
@@ -296,7 +299,7 @@ def measured(path):
 
 
 def table(rows):
-    """Rows of noise levels on the GPU: shot, read, offset and tail (rows, 4) per colour plane, the rest (rows,).
+    """Rows of noise levels on the GPU: shot, read, offset and tail per colour plane (rows, 4), the rest (rows,).
 
     A row is one camera at one ISO, in normalised raw units. One that lacks a part gets none of it: no
     banding, no offset, a bell curve, no rounding. Banding is what a row's lines carry beyond its
@@ -346,7 +349,7 @@ def drawn(n, device, levels):
 
 
 def long_tailed(like, tail):
-    """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, as ELD draws read noise.
+    """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, ELD's read noise.
 
     tail (N, 4) is each colour plane's lambda: BELL is close to a bell curve, lower has longer tails.
     """
@@ -390,7 +393,7 @@ def gains(clean):
 
 
 def scenes(split, pattern):
-    """Each scene's name, and what its json says of its real noisy frames, none for a scene of clean frames only.
+    """Each scene's name, and its json's list of real noisy frames, empty for a scene of clean frames only.
 
     A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out.
     """

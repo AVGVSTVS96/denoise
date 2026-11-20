@@ -4,8 +4,9 @@
     uv run fit_noise.py table      gather them into data/noise/cameras.json
 
 A row is one noisy frame against its camera's lowest ISO. Per colour plane: shot and read noise, the
-black offset, and how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve, lower is
-longer). For the frame: row banding and the raw's rounding step. All in the noisy frame's own units, black-subtracted
+black offset, how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve, lower is
+longer) and the kurtosis of all the noise in the shadows that it was fitted to. For the frame: row
+banding and the raw's rounding step. All in the noisy frame's own units, black-subtracted
 over the white level, as noise_bank.py's are. The cameras bench_raw.py tests on stay out, as they do
 in raw_pairs.py.
 """
@@ -28,6 +29,7 @@ BLOCK = 16
 BINS = 24
 LAMBDAS = np.linspace(-0.2, 0.5, 141)
 KURTOSIS = scipy.stats.tukeylambda.stats(LAMBDAS, moments="k") + 3
+BELL = 0.14
 
 
 def blocks(plane, side=BLOCK):
@@ -42,14 +44,17 @@ def line(truth, plane):
     return np.polyfit(means[0][unclipped], means[1][unclipped], 1)
 
 
-def tail(z, read_share, shot_excess):
-    """The Tukey lambda for read noise that gives these unit-strength samples of all the noise their kurtosis.
+def tail(kurtosis, read_share, shot_excess):
+    """The Tukey lambda for read noise that brings all the noise in the shadows to the kurtosis measured there.
 
-    read_share is how much of their variance is read noise, shot_excess the kurtosis shot noise alone
-    adds. The few samples far out are held to 12.
+    read_share is how much of that noise's variance is read noise, shot_excess the kurtosis shot noise
+    adds by itself. Under a quarter read noise the tails say nothing of it and it stays a bell curve;
+    under a half it gets the tails a half would need, so a small error is not blown up.
     """
-    excess = scipy.stats.kurtosis(z.clip(-12, 12), axis=None) - shot_excess
-    return float(np.interp(3 + excess / max(read_share, 1e-3) ** 2, KURTOSIS[::-1], LAMBDAS[::-1]))
+    if read_share < 0.25:
+        return BELL
+    wanted = 3 + (kurtosis - 3 - shot_excess) / max(read_share, 0.5) ** 2
+    return float(np.interp(wanted, KURTOSIS[::-1], LAMBDAS[::-1]))
 
 
 def step(plane):
@@ -97,6 +102,7 @@ def plane_levels(truth, plane, share):
     dark, level = left[darkest], float(np.median(signal[darkest]))
     spread = shot * level + read
     band = lambda axis: float(np.mean(dark.mean(axis).var(1, ddof=1) - dark.var(axis, ddof=1).mean(1) / BLOCK) * share)
+    kurtosis = float(scipy.stats.kurtosis(unit(signal, left).clip(-12, 12), axis=None, fisher=False))
     return {
         "gain": float(slope),
         "offset": float(offset),
@@ -104,7 +110,8 @@ def plane_levels(truth, plane, share):
         "read": float(np.sqrt(read)),
         "row": band(2),
         "column": band(1),
-        "tail": tail(unit(signal, left), read / spread, shot**3 * level / spread**2),
+        "tail": tail(kurtosis, read / spread, shot**3 * level / spread**2),
+        "kurtosis": kurtosis,
         "step": step(plane),
         "blocks": len(signal),
         "fit": float(np.median(np.abs(np.log(v / (shot * s + read))))),
@@ -120,7 +127,7 @@ def measure(clean, noisy, share=1.0):
     h, w = clean.shape
     clean, noisy = clean[edge : h - edge, edge : w - edge], noisy[edge + dy : h - edge + dy, edge + dx : w - edge + dx]
     planes = [plane_levels(clean[i::2, j::2], noisy[i::2, j::2], share) for i, j in SITES]
-    row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "tail", "gain")}
+    row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "tail", "kurtosis", "gain")}
     banding = lambda key: float(np.sqrt(max(np.mean([plane[key] for plane in planes]), 0)))
     return row | {
         "row": banding("row"),
