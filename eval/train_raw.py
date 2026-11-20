@@ -43,7 +43,8 @@ step, which is steadier than any single step. Every check logs the held-out RawN
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
 102,400, and the mean over the cameras whose other scenes train. The "aligned" ones are against clean
 windows resampled onto the noisy ones, the ones to pick by; the others are what older runs logged.
-The "as shot" ones leave each noisy frame on its black offset, as a photo comes from the camera.
+The "as shot" ones leave each noisy frame on its black offset, as a photo comes from the camera, and
+the "as shot fixed" ones take off what blacks.py knows the body's offsets to be, as raw_denoise.py does.
 run.json beside the log keeps the run's settings.
 """
 
@@ -577,8 +578,8 @@ def main(args):
         running += loss.detach()
         if step % args.check == 0 or step == args.steps:
             clean_up = cleaner(average.module)
-            bench, aligned, shot = bench_raw.scores(bench_raw.as_mosaic(clean_up), "gr3")
-            seen, seen_aligned, seen_shot = bench_raw.scores(bench_raw.as_mosaic(clean_up), "seen")
+            bench, aligned, shot, fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "gr3")
+            seen, seen_aligned, seen_shot, seen_fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "seen")
             mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
             line = {
                 "step": step,
@@ -592,6 +593,9 @@ def main(args):
                 "gr3_as_shot": mean_psnr(shot),
                 "gr3_as_shot_by_iso": [round(psnr, 3) for psnr, _ in shot.values()],
                 "seen_as_shot": mean_psnr(seen_shot),
+                "gr3_as_shot_fixed": mean_psnr(fixed),
+                "gr3_as_shot_fixed_by_iso": [round(psnr, 3) for psnr, _ in fixed.values()],
+                "seen_as_shot_fixed": mean_psnr(seen_fixed),
                 "lr": schedule.get_last_lr()[0],
                 "scenes": len(train),
                 "time": round(time.time()),

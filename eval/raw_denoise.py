@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import rawpy
 
+import blacks
 import night_pairs
 
 ROOT = pathlib.Path(__file__).parent
@@ -120,7 +121,11 @@ def rawforge(path, folder):
 
 
 def faithful(path, weights):
-    """Our model takes the mosaic black-subtracted and over the white level, as train_raw.py trains it."""
+    """Our model takes the mosaic black-subtracted and over the white level, as train_raw.py trains it.
+
+    The black offsets blacks.py knows the photo's body by come off first: the model is trained on
+    frames that sit on none.
+    """
     import torch
 
     import train_raw
@@ -136,7 +141,8 @@ def faithful(path, weights):
         white = float(raw.white_level)
         assert [raw.color_desc.decode()[c] for c in pattern.ravel()] == list("RGGB"), pattern
     span = white - level
-    out = train_raw.denoise(model, (cfa - level) / span)
+    offsets = np.tile(blacks.of(path).reshape(2, 2), (cfa.shape[0] // 2, cfa.shape[1] // 2))
+    out = train_raw.denoise(model, (cfa - level) / span - offsets)
     return np.clip(out * span + level + 0.5, 0, white).astype(np.uint16)
 
 
