@@ -38,7 +38,7 @@ from a poor one. "<test>-colour" can: each camera's lowest ISO frame binned to f
 size (full_colour), which is a picture no demosaic touched, sampled back to a mosaic and put under
 made-up noise as "exact" is. A model that demosaics is scored on its own picture, and a model that
 hands back a mosaic twice: through the bilinear demosaic, and as "<name>-menon" through a good
-classical one (demosaic.py). Its "unseen" cameras are the "exact" ones, every scene of theirs. It has
+classical one (demosaic.py), white-balanced first. Its "unseen" cameras are the "exact" ones, every scene of theirs. It has
 no real noise either: a real noisy frame has no full-colour truth at its own size.
 
     uv run bench_raw.py colour                                         cut only those, into data/bench/colour
@@ -322,14 +322,21 @@ def bilinear(mosaic):
     return torch.nn.functional.conv2d(planes, torch.stack([full, cross, full])[:, None], groups=3)
 
 
-def develop(result, wb, matrix):
+def develop(result, wb, matrix, demosaic=None):
     """A result as linear sRGB (N, 3, H, W) under the white balance and colour matrix.
 
-    RGGB mosaics (N, H, W) go through the bilinear demosaic; camera RGB (N, 3, H, W), from a model
-    that demosaics or from full_colour, has none left to do.
+    RGGB mosaics (N, H, W) go through the bilinear demosaic, or through demosaic, which gets them
+    white-balanced as a raw developer would hand them over: a demosaic that leans on the colours
+    moving together needs grey to be grey. Camera RGB (N, 3, H, W), from a model that demosaics or
+    from full_colour, has none left to do.
     """
+    balance = wb.view(1, 3, 1, 1)
+    if demosaic and result.dim() == 3:
+        return torch.einsum(
+            "ij,njhw->nihw", matrix, demosaic(result * mosaiced(balance.expand(1, 3, *result.shape[1:])))
+        )
     rgb = bilinear(result) if result.dim() == 3 else result
-    return torch.einsum("ij,njhw->nihw", matrix, rgb * wb.view(1, 3, 1, 1))
+    return torch.einsum("ij,njhw->nihw", matrix, rgb * balance)
 
 
 def windows(camera):
@@ -361,18 +368,19 @@ def perceptual():
 
 
 @torch.no_grad()
-def scores(clean_up, camera, with_lpips=False):
+def scores(clean_up, camera, with_lpips=False, demosaic=None):
     """Three {ISO: [PSNR, LPIPS]} for clean_up(mosaics (N, H, W), their frame's mean) -> cleaned mosaics.
 
     The first is against the clean windows as cut, the second against each noisy frame's clean twin,
     the third the same with the noisy frame left on its black offset, as shot. clean_up may hand back
     camera RGB (N, 3, H, W) instead, which is scored as the picture it is. A full-colour test,
-    "colour/<camera>", has one score, three times.
+    "colour/<camera>", has one score, three times. demosaic is what a cleaned mosaic goes through
+    in place of the bilinear one (see develop).
     """
     if camera.split("/")[-1] in CAMERAS:
-        return score_one(clean_up, kept(camera), with_lpips)
+        return score_one(clean_up, kept(camera), with_lpips, demosaic)
     names = [file.relative_to(BENCH).with_suffix("").as_posix() for file in sorted(BENCH.glob(f"{camera}--*.npz"))]
-    each = [score_one(clean_up, windows(name), with_lpips) for name in names]
+    each = [score_one(clean_up, windows(name), with_lpips, demosaic) for name in names]
     had = [{iso: [by_iso[iso] for by_iso in kind if iso in by_iso] for iso in ISOS} for kind in zip(*each)]
     return [{iso: np.mean(found, axis=0).tolist() for iso, found in kind.items() if found} for kind in had]
 
@@ -382,7 +390,7 @@ def score(clean_up, camera, with_lpips=False):
     return scores(clean_up, camera, with_lpips)[0]
 
 
-def score_one(clean_up, cut, with_lpips):
+def score_one(clean_up, cut, with_lpips, demosaic=None):
     frames, isos, means, wb, matrix, twins, offsets = cut
     linear = develop(frames[0], wb, matrix)
     exposure = 0.108 / linear.median()
@@ -395,14 +403,14 @@ def score_one(clean_up, cut, with_lpips):
 
     as_cut, aligned, as_shot = {}, {}, {}
     for k, (iso, noisy, mean) in enumerate(zip(isos, frames[1:], means)):
-        result = picture(develop(clean_up(noisy, mean), wb, matrix))
+        result = picture(develop(clean_up(noisy, mean), wb, matrix, demosaic))
         as_cut[iso] = aligned[iso] = as_shot[iso] = against(result, picture(linear))
         if twins is not None:
             truth = picture(develop(twins[k], wb, matrix))
             black = offsets[k].view(2, 2).repeat(noisy.shape[-2] // 2, noisy.shape[-1] // 2)
             shot = clean_up(noisy + black, mean + offsets[k].mean().item())
             aligned[iso] = against(result, truth)
-            as_shot[iso] = against(picture(develop(shot, wb, matrix)), truth)
+            as_shot[iso] = against(picture(develop(shot, wb, matrix, demosaic)), truth)
     return as_cut, aligned, as_shot
 
 
@@ -415,9 +423,7 @@ def main(specs):
     models = {name: train_raw.trained(weights) for name, weights in (spec.split("=") for spec in specs)}
     cleaners = {"noisy": lambda noisy, mean: noisy}
     cleaners |= {name: train_raw.cleaner(model) for name, model in models.items()}
-    classical = lambda clean_up: lambda noisy, mean: demosaic.menon(clean_up(noisy, mean))
-    pictures = dict(cleaners)
-    pictures |= {f"{name}-menon": classical(cleaners[name]) for name in models if not train_raw.joint(models[name])}
+    faithful = [name for name, model in models.items() if not train_raw.joint(model)]
 
     def show(tests):
         for test in tests:
@@ -433,8 +439,11 @@ def main(specs):
                 table.setdefault(test, {})[name] = by_iso
         show(tests)
     for camera in (*CAMERAS, *groups()):
-        for name, clean_up in pictures.items():
-            table.setdefault(f"{camera}-colour", {})[name] = scores(clean_up, f"colour/{camera}", with_lpips=True)[0]
+        rows = table.setdefault(f"{camera}-colour", {})
+        for name, clean_up in cleaners.items():
+            rows[name] = scores(clean_up, f"colour/{camera}", with_lpips=True)[0]
+            if name in faithful:
+                rows[f"{name}-menon"] = scores(clean_up, f"colour/{camera}", True, demosaic.menon)[0]
         show([f"{camera}-colour"])
     board.write_text(json.dumps(table, indent=1))
 

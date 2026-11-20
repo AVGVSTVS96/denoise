@@ -4,7 +4,8 @@ menon() is Menon, Andriani and Calvagno's "Demosaicing with directional filterin
 decision" (2007) with its refining step, the same sums as colour-demosaicing's
 demosaicing_CFA_Bayer_Menon2007, in torch so the machine that scores needs nothing more. It
 interpolates green along rows and along columns, keeps at each pixel the direction in which colour
-changes less, and fills red and blue from their difference to green.
+changes less, and fills red and blue from their difference to green. That difference only stays
+smooth when grey is grey, so the mosaic has to come white-balanced (bench_raw.develop sees to it).
 """
 
 import torch
@@ -21,9 +22,7 @@ def along(planes, taps, axis):
 
 
 def menon(mosaics):
-    """RGGB mosaics (N, H, W) as camera RGB (N, 3, H, W); a picture comes back as it is."""
-    if mosaics.dim() == 4:
-        return mosaics
+    """White-balanced RGGB mosaics (N, H, W) as RGB (N, 3, H, W)."""
     rows, columns = (lambda planes, taps: along(planes, taps, -1)), (lambda planes, taps: along(planes, taps, -2))
     site = lambda i, j: torch.zeros_like(mosaics[0], dtype=torch.bool).index_put_(
         (torch.arange(i, mosaics.shape[1], 2)[:, None], torch.arange(j, mosaics.shape[2], 2)[None]),
