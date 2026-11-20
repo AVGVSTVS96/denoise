@@ -26,6 +26,18 @@ which raw_pairs.py stores with theirs taken off; --tails gives the read noise a 
 tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
 noise for windows of real dark frames (dark_bank.py).
 
+--joint 16 trains the joint model instead, which denoises and demosaics in one pass: packed RGGB in,
+camera RGB at the mosaic's full size out, the picture a user looks at. It is the same network with
+twelve planes in and out, each colour at each of a 2x2 cell's four places, so --init takes a
+faithful model's weights and starts as that model with every cell's colours spread flat. A mosaic
+never holds its own full-colour truth, so each step adds that many crops whose truth is made:
+the clean crop binned to full colour at half its size (bench_raw.full_colour), sampled back to a
+mosaic, with noise laid over it, and the loss on all three colours of every pixel. The crops of
+--batch go through as before, real noisy frames among them, at their own size and with the faithful
+loss on the picture sampled where the camera measured: binning a real noisy frame would average its
+noise away, and its clean twin is a mosaic too. A joint run saves joint.pth and logs
+bench_raw.py's full-colour scores beside the others, which are of its picture sampled back to a mosaic.
+
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
 step, which is steadier than any single step. Every check logs the held-out RawNIND score and
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
@@ -84,20 +96,54 @@ OFFSET_SHARED, OFFSET_OWN = 0.3, 0.1
 TAILS = (0.0, 0.2)
 READ_COUNTS = (1, 300)
 MOST_BANDING = 0.3
+#: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
+#: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
+SPREAD = (
+    *[(1.0, 0.0, 0.0, 0.0)] * 4,
+    (0.0, 0.5, 0.5, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 0.5, 0.5, 0.0),
+    *[(0.0, 0.0, 0.0, 1.0)] * 4,
+)
 
 
-def network(width=32):
+def network(width=32, joint=False):
     from nafnet import CONFIGS, NAFNet
 
-    return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=4)
+    return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12 if joint else 4)
+
+
+def joint(model):
+    """Whether a network is a joint one, camera RGB out, and not a faithful one, mosaic out."""
+    return model.intro.in_channels == 12
 
 
 def trained(weights):
-    """A saved model, at whatever width it was trained."""
+    """A saved model, faithful or joint, at whatever width it was trained."""
     state = torch.load(weights, map_location="cpu")
-    model = network(state["intro.weight"].shape[0])
+    model = network(state["intro.weight"].shape[0], state["intro.weight"].shape[1] == 12)
     model.load_state_dict(state)
     return model.cuda().eval()
+
+
+def widened(state):
+    """A faithful model's weights as a joint network's, which then gives that model's mosaic spread by SPREAD."""
+    spread = torch.tensor(SPREAD)
+    first = torch.einsum("omyx,mk->okyx", state["intro.weight"], torch.linalg.pinv(spread))
+    last = torch.einsum("km,moyx->koyx", spread, state["ending.weight"])
+    return {**state, "intro.weight": first, "ending.weight": last, "ending.bias": spread @ state["ending.bias"]}
+
+
+def fed(model, mosaics):
+    """What a network takes of mosaics (N, H, W): their four planes, spread to twelve for a joint one."""
+    planes = pack(mosaics)
+    return torch.nn.functional.conv2d(planes, planes.new_tensor(SPREAD)[:, :, None, None]) if joint(model) else planes
+
+
+def made(model, planes):
+    """What a network's planes are: cleaned mosaics (N, H, W), or camera RGB (N, 3, H, W) from a joint one."""
+    return torch.nn.functional.pixel_shuffle(planes, 2) if joint(model) else unpack(planes)
 
 
 def pack(mosaic):
@@ -140,13 +186,28 @@ def loss_of(result, clean):
     return (l1(tone(a), tone(b)) + l1(tone(cells(a)), tone(cells(b)))) / 2
 
 
+def picture_loss(result, truth):
+    """loss_of for camera RGB (N, 3, H, W) with every colour known at every pixel.
+
+    Half on the three colours under a white balance, half on them as sRGB.
+    """
+    n = truth.shape[0]
+    draw = lambda low, high: torch.empty(n, device=truth.device).uniform_(low, high)
+    balance = torch.stack([draw(*RED), torch.ones(n, device=truth.device), draw(*BLUE)], 1).view(n, 3, 1, 1)
+    a, b = result * balance, truth * balance
+    srgb = lambda p: torch.einsum("ij,njhw->nihw", p.new_tensor(TO_SRGB), p)
+    l1 = torch.nn.functional.l1_loss
+    return (l1(tone(a), tone(b)) + l1(tone(srgb(a)), tone(srgb(b)))) / 2
+
+
 def cleaner(model):
-    """bench_raw.score's view of a model: mosaics (N, H, W) in, cleaned mosaics out, scaled as denoise() does."""
+    """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled as denoise() does, and out
+    cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model."""
 
     def clean_up(mosaics, mean):
         gain = min(max(LEVEL / mean, 1), MAX_GAIN)
         with torch.autocast("cuda", torch.bfloat16):
-            parts = [unpack(model(pack(part * gain)).float()) for part in mosaics.split(8)]
+            parts = [made(model, model(fed(model, part * gain)).float()) for part in mosaics.split(8)]
         return torch.cat(parts) / gain
 
     return clean_up
@@ -154,7 +215,7 @@ def cleaner(model):
 
 @torch.no_grad()
 def denoise(model, mosaic, tile=1024, overlap=64):
-    """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
+    """A whole normalised RGGB mosaic (H, W float32 numpy) through a faithful model, in overlapping tiles.
 
     Every tile keeps only its middle; the last row and column of tiles sit flush with the far edge.
     """
@@ -429,7 +490,7 @@ def validate(model, val):
             noisy = torch.from_numpy(stack[frame, :4, 64:448, 64:448].astype(np.float32)).cuda()
             g = (LEVEL / clean.mean(dim=(1, 2)).clamp(min=1e-6)).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
             with torch.autocast("cuda", torch.bfloat16):
-                out = unpack(model(pack(noisy * g)).float())
+                out = bench_raw.mosaiced(made(model, model(fed(model, noisy * g)).float()))
             error = ((tone(out).clamp(0, 1) - tone(clean * g).clamp(0, 1)) ** 2).mean(dim=(1, 2))
             scores += (-10 * torch.log10(error)).tolist()
     model.train()
@@ -447,9 +508,10 @@ def main(args):
     levels = table(measured(args.profile or args.levels)) if args.profile or args.levels else None
     darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
     share, rows = (1, 1) if args.profile else (BANK_SHARE, TABLE_SHARE)
-    model = network(args.width).cuda().to(memory_format=torch.channels_last)
+    model = network(args.width, bool(args.joint)).cuda().to(memory_format=torch.channels_last)
     if args.init:
-        model.load_state_dict(torch.load(args.init, map_location="cpu"))
+        state = torch.load(args.init, map_location="cpu")
+        model.load_state_dict(widened(state) if args.joint and state["intro.weight"].shape[1] == 4 else state)
     else:
         sidd = torch.load(evaluate.MODELS / f"NAFNet-SIDD-width{args.width}.pth", map_location="cpu")["params"]
         model.load_state_dict({k: v for k, v in sidd.items() if not k.startswith(("intro", "ending"))}, strict=False)
@@ -477,6 +539,19 @@ def main(args):
     running = torch.zeros((), device="cuda")
     train = scenes("train", args.scenes)
     crops = Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
+
+    def under_noise(clean):
+        row = drawn(len(clean), clean.device, levels, rows)
+        laid = made_up_noise(clean, row, args.offsets, args.tails, darks)
+        if bank:
+            real = torch.rand(len(clean), 1, 1, device=clean.device) < share
+            laid = torch.where(real, bank_noise(clean, bank, args.offsets), laid)
+        return laid
+
+    def cleaned(noisy):
+        with torch.autocast("cuda", torch.bfloat16):
+            return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
+
     while step < args.steps:
         pair, synthetic = crops.batch(args.batch)
         clean, noisy = pair[:, 0], pair[:, 1]
@@ -484,14 +559,12 @@ def main(args):
         g = gains(clean)
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
-            row = drawn(len(clean), clean.device, levels, rows)
-            laid = made_up_noise(clean, row, args.offsets, args.tails, darks)
-            if bank:
-                laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank, args.offsets), laid)
-            noisy = torch.where(synthetic, laid, noisy)
-        with torch.autocast("cuda", torch.bfloat16):
-            result = unpack(compiled(pack(noisy).contiguous(memory_format=torch.channels_last)).float())
-        loss = loss_of(result, clean)
+            noisy = torch.where(synthetic, under_noise(clean), noisy)
+        loss = loss_of(bench_raw.mosaiced(cleaned(noisy)), clean)
+        if args.joint:
+            truth = bench_raw.full_colour(crops.batch(args.joint)[0][:, 0])
+            truth = truth * gains(bench_raw.mosaiced(truth))[:, None]
+            loss = loss + picture_loss(cleaned(under_noise(bench_raw.mosaiced(truth))), truth)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -502,8 +575,9 @@ def main(args):
             average.update_parameters(model)
         running += loss.detach()
         if step % args.check == 0 or step == args.steps:
-            bench, aligned, shot = bench_raw.scores(cleaner(average.module), "gr3")
-            seen, seen_aligned, seen_shot = bench_raw.scores(cleaner(average.module), "seen")
+            clean_up = cleaner(average.module)
+            bench, aligned, shot = bench_raw.scores(bench_raw.as_mosaic(clean_up), "gr3")
+            seen, seen_aligned, seen_shot = bench_raw.scores(bench_raw.as_mosaic(clean_up), "seen")
             mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
             line = {
                 "step": step,
@@ -521,6 +595,13 @@ def main(args):
                 "scenes": len(train),
                 "time": round(time.time()),
             }
+            if args.joint:
+                colour = bench_raw.scores(clean_up, "colour/gr3")[0]
+                line |= {
+                    "gr3_colour": mean_psnr(colour),
+                    "gr3_colour_by_iso": [round(psnr, 3) for psnr, _ in colour.values()],
+                    "seen_colour": mean_psnr(bench_raw.scores(clean_up, "colour/seen")[0]),
+                }
             print(json.dumps(line), flush=True)
             log.write(json.dumps(line) + "\n")
             log.flush()
@@ -540,7 +621,7 @@ def main(args):
             # Crops raw_pairs.py finished meanwhile join in.
             train = scenes("train", args.scenes)
             crops.use(train)
-    torch.save(average.module.state_dict(), out / "faithful.pth")
+    torch.save(average.module.state_dict(), out / ("joint.pth" if args.joint else "faithful.pth"))
 
 
 if __name__ == "__main__":
@@ -564,4 +645,7 @@ if __name__ == "__main__":
     parser.add_argument("--offsets", action="store_true", help="noisy frames keep their black offset per colour plane")
     parser.add_argument("--tails", action="store_true", help="long-tailed read noise, rounded to the raw's steps")
     parser.add_argument("--darks", help="a bank of real dark frames for part of the read noise")
+    parser.add_argument(
+        "--joint", type=int, default=0, help="train the joint model, on this many crops of made truth a step"
+    )
     main(parser.parse_args())

@@ -4,6 +4,10 @@
     uv run bench_raw.py faithful=data/models/raw/faithful/faithful.pth ...    score models next to the noisy frames,
                                                                                added to data/out/bench.json
 
+A model is a faithful one, mosaic in and mosaic out, or a joint one, which demosaics too and hands
+back camera RGB (train_raw.py --joint). On the tests with real noise a joint model's picture is
+sampled back to a mosaic first, so both kinds are scored on their denoising alone, alike.
+
 Each camera gives 32 windows of 512 px, the same at every ISO, against its ISO 100 frame. A cleaned
 mosaic and the clean one are developed alike (bilinear demosaic, the camera's white balance and colour
 matrix, gamma 2.2) and compared as pictures: PSNR, and LPIPS, the perceptual distance (lower is better).
@@ -28,6 +32,16 @@ the resampled window: what a photo straight from the camera would get.
 leaves a ninth of their noise, under noise made up at the levels measured from each camera's own high
 ISO frames. What it lacks is the camera's real noise, so it ranks models and shows what a test costs,
 and "<test>-aligned" stays the test of real photos.
+
+All of those develop both sides with the same bilinear demosaic, so none can tell a good demosaic
+from a poor one. "<test>-colour" can: each camera's lowest ISO frame binned to full colour at half the
+size (full_colour), which is a picture no demosaic touched, sampled back to a mosaic and put under
+made-up noise as "exact" is. A model that demosaics is scored on its own picture, and a model that
+hands back a mosaic twice: through the bilinear demosaic, and as "<name>-menon" through a good
+classical one (demosaic.py). Its "unseen" cameras are the "exact" ones, every scene of theirs. It has
+no real noise either: a real noisy frame has no full-colour truth at its own size.
+
+    uv run bench_raw.py colour                                         cut only those, into data/bench/colour
 """
 
 import functools
@@ -101,7 +115,7 @@ def colour(path):
 
 def save(name, **arrays):
     """A test's windows, renamed into place whole: the PC scores from this folder while a build runs."""
-    BENCH.mkdir(parents=True, exist_ok=True)
+    (BENCH / name).parent.mkdir(parents=True, exist_ok=True)
     with (BENCH / f"{name}.tmp").open("wb") as file:
         np.savez(file, **arrays)
     (BENCH / f"{name}.tmp").rename(BENCH / f"{name}.npz")
@@ -208,43 +222,130 @@ def build_exact(camera, path, base, isos):
             for x in range(0, frame.shape[1] - side + 1, side)
         ]
     )
+    frames, means = under_noise(camera, clean, full, path, isos, cut)
+    wb, matrix = colour(path(base))
+    frames = np.stack([cut(clean), *frames]).astype(np.float16)
+    save(f"exact--{camera}", frames=frames, means=means, wb=wb, matrix=matrix, isos=isos)
+
+
+def under_noise(camera, clean, full, path, isos, cut):
+    """Windows of a clean mosaic under each high ISO's noise, as measured on the frame it was made from, and their means."""
     rng = np.random.default_rng(0)
-    frames, means = [cut(clean)], []
+    frames, means = [], []
     for iso in isos:
         shot, read = noise_levels(full, raw_pairs.match(full, raw_pairs.mosaic(path(iso)))[0])
         noisy = rng.poisson(clean.clip(min=0) / shot) * shot + rng.standard_normal(clean.shape) * read**0.5
         frames.append(cut(noisy.astype(np.float32)))
         means.append(float(noisy.mean()))
         print(camera, iso, "shot", f"{shot:.3g}", "read", f"{read**0.5:.3g}", flush=True)
+    return frames, means
+
+
+def full_colour(mosaics):
+    """RGGB mosaics (N, H, W) as camera RGB at half the size (N, 3, H/2, W/2), every colour measured, none guessed.
+
+    Each 2x2 cell becomes one pixel at the cell's middle. Its four samples sit half a sensor pixel off
+    that middle, each its own way, so each colour plane is first read a quarter of its own pixel
+    along (Lanczos) and the two greens are averaged. Taken as they are the colours would sit apart
+    by that much, a fringe on every edge that a model would learn to draw.
+    """
+    taps = torch.arange(-4, 5, dtype=mosaics.dtype, device=mosaics.device)
+    lanczos = lambda at: torch.sinc(at) * torch.sinc(at / 4) * (at.abs() < 4)
+    onto_middle = lambda side: lanczos(taps - (0.25 - side / 2)) / lanczos(taps - (0.25 - side / 2)).sum()
+    kernels = torch.stack([torch.outer(onto_middle(i), onto_middle(j)) for i in (0, 1) for j in (0, 1)])
+    planes = torch.stack([mosaics[:, i::2, j::2] for i in (0, 1) for j in (0, 1)], 1)
+    planes = torch.nn.functional.pad(planes, (4, 4, 4, 4), mode="reflect")
+    red, green, also_green, blue = torch.nn.functional.conv2d(planes, kernels[:, None], groups=4).unbind(1)
+    return torch.stack([red, (green + also_green) / 2, blue], 1)
+
+
+def mosaiced(picture):
+    """Camera RGB (N, 3, H, W) as the RGGB mosaic a sensor would have made of it; a mosaic comes back as it is."""
+    if picture.dim() == 3:
+        return picture
+    mosaic = picture[:, 1].clone()
+    mosaic[:, 0::2, 0::2] = picture[:, 0, 0::2, 0::2]
+    mosaic[:, 1::2, 1::2] = picture[:, 2, 1::2, 1::2]
+    return mosaic
+
+
+def as_mosaic(clean_up):
+    """clean_up with a picture it hands back sampled to a mosaic, so only its denoising is scored."""
+    return lambda mosaics, mean: mosaiced(clean_up(mosaics, mean))
+
+
+def build_colour(name, path, base, isos, count):
+    """Windows whose truth is full colour: the lowest ISO frame binned (full_colour), and its mosaic under noise."""
+    full = raw_pairs.mosaic(path(base))
+    if full is None or not isos:
+        return
+    truth = full_colour(torch.from_numpy(full)[None])
+    truth = truth[..., : truth.shape[-2] // 2 * 2, : truth.shape[-1] // 2 * 2]
+    clean = mosaiced(truth)[0].numpy()
+    picks = raw_pairs.corners(clean, np.random.default_rng(0), count)
+    cut = lambda frame: np.stack([frame[..., y : y + raw_pairs.CROP, x : x + raw_pairs.CROP] for y, x in picks])
+    frames, means = under_noise(name, clean, full, path, isos, cut)
     wb, matrix = colour(path(base))
-    frames = np.stack(frames).astype(np.float16)
-    save(f"exact--{camera}", frames=frames, means=means, wb=wb, matrix=matrix, isos=isos)
+    save(
+        f"colour/{name}",
+        truth=cut(truth[0].numpy()).astype(np.float16),
+        frames=np.stack(frames).astype(np.float16),
+        means=means,
+        wb=wb,
+        matrix=matrix,
+        isos=isos,
+    )
 
 
-def develop(mosaic, wb, matrix):
-    """RGGB mosaics (N, H, W) as linear sRGB (N, 3, H, W): bilinear demosaic, white balance, colour matrix."""
+def held_out():
+    """Every still-life and other lab folder of the cameras no scene of which trains."""
+    folders = sorted(STILL_LIFES.glob("*/*"))
+    return [f for f in folders if any(name in f.parent.name for name in raw_pairs.HELD_OUT) and any(f.iterdir())]
+
+
+def build_colours():
+    for camera in CAMERAS:
+        build_colour(camera, ricoh(camera), 100, ISOS, WINDOWS // 2)
+    for folder in groups()["seen"]:
+        build_colour(f"seen--{folder.parent.name}", *ladder(folder), WINDOWS // 4)
+    for folder in held_out():
+        build_colour(f"unseen--{folder.parent.name}-{folder.name}", *ladder(folder), WINDOWS // 4)
+
+
+def bilinear(mosaic):
+    """RGGB mosaics (N, H, W) as camera RGB (N, 3, H, W) by the plainest demosaic."""
     sites = mosaic.new_zeros(3, *mosaic.shape[1:])
     sites[0, 0::2, 0::2] = sites[1, 0::2, 1::2] = sites[1, 1::2, 0::2] = sites[2, 1::2, 1::2] = 1
     cross = mosaic.new_tensor([[0, 1, 0], [1, 4, 1], [0, 1, 0]]) / 4
     full = mosaic.new_tensor([[1, 2, 1], [2, 4, 2], [1, 2, 1]]) / 4
     planes = torch.nn.functional.pad(mosaic[:, None] * sites, (1, 1, 1, 1), mode="reflect")
-    rgb = torch.nn.functional.conv2d(planes, torch.stack([full, cross, full])[:, None], groups=3)
+    return torch.nn.functional.conv2d(planes, torch.stack([full, cross, full])[:, None], groups=3)
+
+
+def develop(result, wb, matrix):
+    """A result as linear sRGB (N, 3, H, W) under the white balance and colour matrix.
+
+    RGGB mosaics (N, H, W) go through the bilinear demosaic; camera RGB (N, 3, H, W), from a model
+    that demosaics or from full_colour, has none left to do.
+    """
+    rgb = bilinear(result) if result.dim() == 3 else result
     return torch.einsum("ij,njhw->nihw", matrix, rgb * wb.view(1, 3, 1, 1))
 
 
 def windows(camera):
     """Frames (1 + ISOs, windows, 512, 512) with the clean one first, their ISOs and means, the colour,
-    and each noisy frame's clean twin and black offsets (ISOs, 4), which only an exact test goes without."""
+    and each noisy frame's clean twin and black offsets (ISOs, 4), which a test under made-up noise goes
+    without. A full-colour test's clean frame is its truth, camera RGB (windows, 3, 512, 512)."""
     data = np.load(BENCH / f"{camera}.npz")
-    on_gpu = lambda name: torch.from_numpy(data[name].astype(np.float32)).cuda()
+    on_gpu = lambda name: torch.from_numpy(data[name].astype(np.float32)).cuda() if name in data else None
     return (
-        on_gpu("frames"),
+        on_gpu("frames") if "truth" not in data else [on_gpu("truth"), *on_gpu("frames")],
         data["isos"].tolist(),
         data["means"].tolist(),
         on_gpu("wb"),
         on_gpu("matrix"),
-        None if camera.startswith("exact--") else on_gpu("twins"),
-        None if camera.startswith("exact--") else on_gpu("offsets"),
+        on_gpu("twins"),
+        on_gpu("offsets"),
     )
 
 
@@ -264,11 +365,14 @@ def scores(clean_up, camera, with_lpips=False):
     """Three {ISO: [PSNR, LPIPS]} for clean_up(mosaics (N, H, W), their frame's mean) -> cleaned mosaics.
 
     The first is against the clean windows as cut, the second against each noisy frame's clean twin,
-    the third the same with the noisy frame left on its black offset, as shot.
+    the third the same with the noisy frame left on its black offset, as shot. clean_up may hand back
+    camera RGB (N, 3, H, W) instead, which is scored as the picture it is. A full-colour test,
+    "colour/<camera>", has one score, three times.
     """
-    if camera in CAMERAS:
+    if camera.split("/")[-1] in CAMERAS:
         return score_one(clean_up, kept(camera), with_lpips)
-    each = [score_one(clean_up, windows(file.stem), with_lpips) for file in sorted(BENCH.glob(f"{camera}--*.npz"))]
+    names = [file.relative_to(BENCH).with_suffix("").as_posix() for file in sorted(BENCH.glob(f"{camera}--*.npz"))]
+    each = [score_one(clean_up, windows(name), with_lpips) for name in names]
     had = [{iso: [by_iso[iso] for by_iso in kind if iso in by_iso] for iso in ISOS} for kind in zip(*each)]
     return [{iso: np.mean(found, axis=0).tolist() for iso, found in kind.items() if found} for kind in had]
 
@@ -302,25 +406,36 @@ def score_one(clean_up, cut, with_lpips):
     return as_cut, aligned, as_shot
 
 
-def main(models):
+def main(specs):
+    import demosaic
     import train_raw
 
     board = raw_pairs.DATA / "out" / "bench.json"
     table = json.loads(board.read_text()) if board.exists() else {}
+    models = {name: train_raw.trained(weights) for name, weights in (spec.split("=") for spec in specs)}
     cleaners = {"noisy": lambda noisy, mean: noisy}
-    for spec in models:
-        name, weights = spec.split("=")
-        cleaners[name] = train_raw.cleaner(train_raw.trained(weights))
-    for camera in (*CAMERAS, *groups(), "exact"):
-        tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned", f"{camera}-as-shot")
-        for name, clean_up in cleaners.items():
-            for test, by_iso in zip(tests, scores(clean_up, camera, with_lpips=True)):
-                table.setdefault(test, {})[name] = by_iso
+    cleaners |= {name: train_raw.cleaner(model) for name, model in models.items()}
+    classical = lambda clean_up: lambda noisy, mean: demosaic.menon(clean_up(noisy, mean))
+    pictures = dict(cleaners)
+    pictures |= {f"{name}-menon": classical(cleaners[name]) for name in models if not train_raw.joint(models[name])}
+
+    def show(tests):
         for test in tests:
             print(f"\n{test}  PSNR / LPIPS\n{'':24}" + "".join(f"{iso:>14}" for iso in ISOS) + f"{'mean':>14}")
             for name, by_iso in table[test].items():
                 cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
                 print(f"{name:24}" + "".join(f"{p:8.2f} {d:.3f}" for p, d in cells))
+
+    for camera in (*CAMERAS, *groups(), "exact"):
+        tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned", f"{camera}-as-shot")
+        for name, clean_up in cleaners.items():
+            for test, by_iso in zip(tests, scores(as_mosaic(clean_up), camera, with_lpips=True)):
+                table.setdefault(test, {})[name] = by_iso
+        show(tests)
+    for camera in (*CAMERAS, *groups()):
+        for name, clean_up in pictures.items():
+            table.setdefault(f"{camera}-colour", {})[name] = scores(clean_up, f"colour/{camera}", with_lpips=True)[0]
+        show([f"{camera}-colour"])
     board.write_text(json.dumps(table, indent=1))
 
 
@@ -332,8 +447,10 @@ if __name__ == "__main__":
             for folder in folders:
                 build_group(group, folder)
         build_exact("gr3x", ricoh("gr3x"), 100, ISOS)
-        for folder in sorted(STILL_LIFES.glob("*/*")):
-            if any(name in folder.parent.name for name in raw_pairs.HELD_OUT) and any(folder.iterdir()):
-                build_exact(f"{folder.parent.name}-{folder.name}", *ladder(folder))
+        for folder in held_out():
+            build_exact(f"{folder.parent.name}-{folder.name}", *ladder(folder))
+        build_colours()
+    elif sys.argv[1:] == ["colour"]:
+        build_colours()
     else:
         main(sys.argv[1:])
