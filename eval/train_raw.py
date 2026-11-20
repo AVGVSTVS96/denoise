@@ -21,7 +21,8 @@ night frames look like any other.
 Four settings bring the made-up noise closer to a real camera's, each on its own so runs compare:
 --levels data/noise/cameras.json draws its levels as whole rows, one camera at one ISO as fit_noise.py
 measured it, in place of levels drawn apart; --offsets leaves each colour plane on the black offset
-a real frame sits on, for the network to take off; --tails gives the read noise a real sensor's long
+a real frame sits on, for the network to take off, in made-up noise and in the real noisy frames,
+which raw_pairs.py stores with theirs taken off; --tails gives the read noise a real sensor's long
 tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
 noise for windows of real dark frames (dark_bank.py).
 
@@ -30,6 +31,7 @@ step, which is steadier than any single step. Every check logs the held-out RawN
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
 102,400, and the mean over the cameras whose other scenes train. The "aligned" ones are against clean
 windows resampled onto the noisy ones, the ones to pick by; the others are what older runs logged.
+The "as shot" ones leave each noisy frame on its black offset, as a photo comes from the camera.
 run.json beside the log keeps the run's settings.
 """
 
@@ -176,17 +178,17 @@ class Crops:
     before it leaves, each time under another window, flip and noise.
     """
 
-    def __init__(self, scenes, size, seed, real):
-        self.size, self.real, self.rng, self.pool = size, real, random.Random(seed), []
+    def __init__(self, scenes, size, seed, real, as_shot):
+        self.size, self.real, self.as_shot, self.rng, self.pool = size, real, as_shot, random.Random(seed), []
         self.use(scenes)
         threading.Thread(target=self.read, daemon=True).start()
 
     def use(self, scenes):
         weights = [next((w for start, w in WEIGHTS.items() if s.startswith(start)), 1) for s in scenes]
-        paired = list(scenes.values())
+        paired = [bool(frames) for frames in scenes.values()]
         total = {kind: sum(w for w, p in zip(weights, paired) if p == kind) for kind in (True, False)}
         weights = [w * (PAIR_SHARE if p else 1 - PAIR_SHARE) / total[p] for w, p in zip(weights, paired)]
-        self.draw = list(scenes), weights
+        self.scenes, self.draw = scenes, (list(scenes), weights)
 
     def read(self):
         rng = random.Random(self.rng.random())
@@ -203,7 +205,11 @@ class Crops:
             # Read by offset: through the memory map the kernel fetches about three times what a crop holds.
             starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in picks]
             planes = [np.fromfile(path, stack.dtype, side * side, offset=start) for start in starts]
-            fresh = np.stack(planes).reshape(-1, side, side), synthetic
+            pair = np.stack(planes).reshape(-1, side, side)
+            if self.as_shot and not synthetic:
+                black = self.scenes[scene][frame - 1].get("offset", [0.0] * 4)
+                pair[1] += np.tile(np.asarray(black, pair.dtype).reshape(2, 2), (side // 2, side // 2))
+            fresh = pair, synthetic
             if len(self.pool) < POOL:
                 self.pool.append(fresh)
             else:
@@ -384,7 +390,7 @@ def gains(clean):
 
 
 def scenes(split, pattern):
-    """Each scene's name, and whether it has real noisy frames.
+    """Each scene's name, and what its json says of its real noisy frames, none for a scene of clean frames only.
 
     A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out.
     """
@@ -393,7 +399,7 @@ def scenes(split, pattern):
         info = json.loads(meta.read_text())
         if info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.with_suffix(".npy").exists():
             if raw_pairs.twinned(info):
-                found[meta.stem] = bool(info["frames"])
+                found[meta.stem] = info["frames"]
             else:
                 stale += 1
     if stale:
@@ -461,7 +467,7 @@ def main(args):
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
     train = scenes("train", args.scenes)
-    crops = Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*")
+    crops = Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
     while step < args.steps:
         pair, synthetic = crops.batch(args.batch)
         clean, noisy = pair[:, 0], pair[:, 1]
@@ -486,8 +492,8 @@ def main(args):
             average.update_parameters(model)
         running += loss.detach()
         if step % args.check == 0 or step == args.steps:
-            bench, aligned = bench_raw.scores(cleaner(average.module), "gr3")
-            seen, seen_aligned = bench_raw.scores(cleaner(average.module), "seen")
+            bench, aligned, shot = bench_raw.scores(cleaner(average.module), "gr3")
+            seen, seen_aligned, seen_shot = bench_raw.scores(cleaner(average.module), "seen")
             mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
             line = {
                 "step": step,
@@ -498,6 +504,9 @@ def main(args):
                 "seen_psnr": mean_psnr(seen),
                 "gr3_aligned": mean_psnr(aligned),
                 "seen_aligned": mean_psnr(seen_aligned),
+                "gr3_as_shot": mean_psnr(shot),
+                "gr3_as_shot_by_iso": [round(psnr, 3) for psnr, _ in shot.values()],
+                "seen_as_shot": mean_psnr(seen_shot),
                 "lr": schedule.get_last_lr()[0],
                 "scenes": len(train),
                 "time": round(time.time()),

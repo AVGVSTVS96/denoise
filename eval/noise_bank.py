@@ -7,8 +7,8 @@ ladder's noisy frames, minus their ISO 100 twin and divided by the noise level e
 are kept as fields of unit strength. train_raw.py scales a window of one back up for the clean crop
 under it. The still-life ladders stay out: they are bench_raw.py's test.
 
-Writes data/noise/gr3.npy, float16 (ISOs, H, W), and gr3.json with each ISO's shot and read noise per
-colour plane, in the frame's own normalised raw units.
+Writes data/noise/gr3.npy, float16 (ISOs, H, W), and gr3.json with each ISO's shot noise, read noise
+and black offset per colour plane, in the frame's own normalised raw units.
 """
 
 import json
@@ -38,7 +38,7 @@ def main():
     for iso in ISOS:
         noisy = raw_pairs.mosaic(path(iso))
         assert raw_pairs.shift_between(clean, noisy) == (0, 0), iso
-        matched, gains, _ = raw_pairs.match(clean, noisy)
+        matched, gains, blacks = raw_pairs.match(clean, noisy)
         field = np.empty_like(clean)
         shot, read = [], []
         for (i, j), gain in zip(SITES, gains):
@@ -63,7 +63,7 @@ def main():
                 flush=True,
             )
         fields.append(field)
-        levels[iso] = {"shot": shot, "read": read}
+        levels[iso] = {"shot": shot, "read": read, "offset": [black / gain for black, gain in zip(blacks, gains)]}
     np.save(OUT / "gr3.npy", np.stack(fields).astype(np.float16))
     (OUT / "gr3.json").write_text(json.dumps({"camera": "Ricoh GR III", "iso": levels}, indent=1))
 
