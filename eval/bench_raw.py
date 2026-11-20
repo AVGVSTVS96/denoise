@@ -15,11 +15,14 @@ Two groups of cameras from fetch_ladders.py's still lifes widen it past the Rico
 camera, and "seen" are cameras whose other scenes do train, for picking between runs. A group scores
 as one camera would: each ISO's mean over the cameras that have it.
 
-Every test scores twice. The first score, under the test's own name, is against the ISO 100 window
-as it was cut: whole even pixels from the noisy one, by raw_pairs.shift_between, which leaves most
-cameras a fraction of a pixel off and some two pixels, and no denoiser can score past that. The
+Every test scores three times. The first score, under the test's own name, is against the ISO 100
+window as it was cut: whole even pixels from the noisy one, by raw_pairs.shift_between, which leaves
+most cameras a fraction of a pixel off and some two pixels, and no denoiser can score past that. The
 second, "<test>-aligned", is against the same window resampled onto the noisy one (raw_pairs.offsets),
-and is the one to read; the first stays so old runs compare.
+and is the one to read; the first stays so old runs compare. In both the noisy frame's black offset
+was taken off with the clean frame's help (raw_pairs.match), which a real photo never gets. The
+third, "<test>-as-shot", puts that offset back before the denoiser sees the frame and scores against
+the resampled window: what a photo straight from the camera would get.
 
 "exact" has no such limit at all: the unseen cameras' ISO 100 frames binned three to one, which
 leaves a ninth of their noise, under noise made up at the levels measured from each camera's own high
@@ -224,7 +227,7 @@ def develop(mosaic, wb, matrix):
 
 def windows(camera):
     """Frames (1 + ISOs, windows, 512, 512) with the clean one first, their ISOs and means, the colour,
-    and each noisy frame's clean twin, which only an exact test goes without."""
+    and each noisy frame's clean twin and black offsets (ISOs, 4), which only an exact test goes without."""
     data = np.load(BENCH / f"{camera}.npz")
     on_gpu = lambda name: torch.from_numpy(data[name].astype(np.float32)).cuda()
     return (
@@ -234,6 +237,7 @@ def windows(camera):
         on_gpu("wb"),
         on_gpu("matrix"),
         None if camera.startswith("exact--") else on_gpu("twins"),
+        None if camera.startswith("exact--") else on_gpu("offsets"),
     )
 
 
@@ -250,9 +254,10 @@ def perceptual():
 
 @torch.no_grad()
 def scores(clean_up, camera, with_lpips=False):
-    """Two {ISO: [PSNR, LPIPS]} for clean_up(mosaics (N, H, W), their frame's mean) -> cleaned mosaics.
+    """Three {ISO: [PSNR, LPIPS]} for clean_up(mosaics (N, H, W), their frame's mean) -> cleaned mosaics.
 
-    The first is against the clean windows as cut, the second against each noisy frame's clean twin.
+    The first is against the clean windows as cut, the second against each noisy frame's clean twin,
+    the third the same with the noisy frame left on its black offset, as shot.
     """
     if camera in CAMERAS:
         return score_one(clean_up, kept(camera), with_lpips)
@@ -267,7 +272,7 @@ def score(clean_up, camera, with_lpips=False):
 
 
 def score_one(clean_up, cut, with_lpips):
-    frames, isos, means, wb, matrix, twins = cut
+    frames, isos, means, wb, matrix, twins, offsets = cut
     linear = develop(frames[0], wb, matrix)
     exposure = 0.108 / linear.median()
     picture = lambda lin: ((lin * exposure).clamp(0, 1) ** (1 / 2.2))[..., EDGE:-EDGE, EDGE:-EDGE]
@@ -277,12 +282,17 @@ def score_one(clean_up, cut, with_lpips):
         distance = perceptual()(result * 2 - 1, truth * 2 - 1) if with_lpips else torch.full((1,), float("nan"))
         return [psnr.mean().item(), distance.mean().item()]
 
-    as_cut, aligned = {}, {}
+    as_cut, aligned, as_shot = {}, {}, {}
     for k, (iso, noisy, mean) in enumerate(zip(isos, frames[1:], means)):
         result = picture(develop(clean_up(noisy, mean), wb, matrix))
-        as_cut[iso] = against(result, picture(linear))
-        aligned[iso] = as_cut[iso] if twins is None else against(result, picture(develop(twins[k], wb, matrix)))
-    return as_cut, aligned
+        as_cut[iso] = aligned[iso] = as_shot[iso] = against(result, picture(linear))
+        if twins is not None:
+            truth = picture(develop(twins[k], wb, matrix))
+            black = offsets[k].view(2, 2).repeat(noisy.shape[-2] // 2, noisy.shape[-1] // 2)
+            shot = clean_up(noisy + black, mean + offsets[k].mean().item())
+            aligned[iso] = against(result, truth)
+            as_shot[iso] = against(picture(develop(shot, wb, matrix)), truth)
+    return as_cut, aligned, as_shot
 
 
 def main(models):
@@ -295,7 +305,7 @@ def main(models):
         name, weights = spec.split("=")
         cleaners[name] = train_raw.cleaner(train_raw.trained(weights))
     for camera in (*CAMERAS, *groups(), "exact"):
-        tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned")
+        tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned", f"{camera}-as-shot")
         for name, clean_up in cleaners.items():
             for test, by_iso in zip(tests, scores(clean_up, camera, with_lpips=True)):
                 table.setdefault(test, {})[name] = by_iso
