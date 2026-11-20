@@ -287,7 +287,7 @@ def noise_bank(profile):
 
 
 def dark_bank(path):
-    """Real dark frames at unit strength on the GPU, and each one's black offset per colour plane over its read noise."""
+    """Real dark frames at unit strength on the GPU, each with its black offset per colour plane over its read noise."""
     lifts = [frame["offset"] for frame in json.loads(path.read_text())]
     return torch.from_numpy(np.load(path.with_suffix(".npy"))).cuda(), torch.tensor(lifts, device="cuda")
 

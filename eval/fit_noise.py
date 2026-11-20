@@ -75,6 +75,8 @@ def flat(truth, plane):
     mean = blocks(truth).mean((1, 2))
     busy = smooth.std((1, 2)) / (mean + 0.002)
     usable = (mean > 0.0005) & (mean < 0.6) & (blocks(plane).max((1, 2)) < 0.9)
+    if usable.sum() < 16 * BINS:
+        raise ValueError("too few blocks that are neither black nor clipped")
     keep = usable & (busy < np.percentile(busy[usable], 25))
     return slope * mean[keep], blocks(plane - slope * truth)[keep], slope, offset
 
@@ -160,7 +162,11 @@ def fit(name, steps):
         noisy = raw_pairs.mosaic(path)
         if noisy is None or noisy.shape != clean.shape:
             continue
-        row = measure(clean, noisy, iso / (iso + base))
+        try:
+            row = measure(clean, noisy, iso / (iso + base))
+        except ValueError as error:
+            print(name, iso, "failed", error, flush=True)
+            continue
         if row:
             rows.append({"camera": camera, "site": site, "scene": scene, "iso": iso, "base": base} | row)
     out.write_text(json.dumps(rows))
