@@ -215,22 +215,23 @@ def cleaner(model):
 
 @torch.no_grad()
 def denoise(model, mosaic, tile=1024, overlap=64):
-    """A whole normalised RGGB mosaic (H, W float32 numpy) through a faithful model, in overlapping tiles.
+    """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
     Every tile keeps only its middle; the last row and column of tiles sit flush with the far edge.
+    Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model.
     """
     gain = float(np.clip(LEVEL / max(float(mosaic.mean()), 1e-6), 1, MAX_GAIN))
     padded = np.pad(mosaic * gain, overlap, "reflect")
-    out = np.zeros_like(padded)
+    out = np.zeros((3, *padded.shape) if joint(model) else padded.shape, padded.dtype)
     starts = lambda side: sorted({*range(0, side - tile, tile - 2 * overlap), side - tile})
     for y in starts(padded.shape[0]):
         for x in starts(padded.shape[1]):
             piece = torch.from_numpy(np.ascontiguousarray(padded[y : y + tile, x : x + tile])).cuda()[None]
             with torch.autocast("cuda", torch.bfloat16):
-                result = unpack(model(pack(piece)).float())[0].cpu().numpy()
-            core = np.s_[overlap:-overlap, overlap:-overlap]
-            out[y : y + tile, x : x + tile][core] = result[core]
-    return out[overlap:-overlap, overlap:-overlap] / gain
+                result = made(model, model(fed(model, piece)).float())[0].cpu().numpy()
+            core = np.s_[..., overlap:-overlap, overlap:-overlap]
+            out[..., y : y + tile, x : x + tile][core] = result[core]
+    return out[..., overlap:-overlap, overlap:-overlap] / gain
 
 
 class Crops:
