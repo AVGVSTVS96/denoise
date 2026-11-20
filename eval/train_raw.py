@@ -290,7 +290,7 @@ def measured(path):
 
 
 def table(rows):
-    """Rows of noise levels on the GPU: shot, read and offset (rows, 4) per colour plane, the rest (rows,).
+    """Rows of noise levels on the GPU: shot, read, offset and tail (rows, 4) per colour plane, the rest (rows,).
 
     A row is one camera at one ISO, in normalised raw units. One that lacks a part gets none of it: no
     banding, no offset, a bell curve, no rounding. Banding is what a row's lines carry beyond its
@@ -305,7 +305,7 @@ def table(rows):
         "read": [planes(row["read"]) for row in rows],
         "offset": [planes(row.get("offset", 0.0)) for row in rows],
         "row": [banding(row) for row in rows],
-        "tail": [row.get("tail", BELL) for row in rows],
+        "tail": [planes(row.get("tail", BELL)) for row in rows],
         "step": [row.get("step", 0.0) for row in rows],
     }
     return {part: torch.tensor(values, device="cuda") for part, values in parts.items()}
@@ -334,7 +334,7 @@ def drawn(n, device, levels):
         "read": read[:, None].expand(n, 4),
         "offset": read[:, None] * lift,
         "row": read * torch.empty(n, device=device).uniform_(0, MOST_BANDING),
-        "tail": torch.empty(n, device=device).uniform_(*TAILS),
+        "tail": torch.empty(n, 1, device=device).uniform_(*TAILS).expand(n, 4),
         "step": read / spread(n, device, *READ_COUNTS),
     }
 
@@ -342,9 +342,9 @@ def drawn(n, device, levels):
 def long_tailed(like, tail):
     """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, as ELD draws read noise.
 
-    tail (N,) is each crop's lambda: BELL is close to a bell curve, lower has longer tails.
+    tail (N, 4) is each colour plane's lambda: BELL is close to a bell curve, lower has longer tails.
     """
-    lam = tail.clamp(-0.2, 0.5).view(-1, 1, 1)
+    lam = sites(tail.clamp(-0.2, 0.5), like)
     lam = torch.where(lam.abs() < 0.01, torch.full_like(lam, 0.01), lam)
     variance = 2 / lam**2 * (1 / (1 + 2 * lam) - torch.exp(2 * torch.lgamma(lam + 1) - torch.lgamma(2 * lam + 2)))
     u = torch.rand_like(like).clamp(1e-6, 1 - 1e-6)

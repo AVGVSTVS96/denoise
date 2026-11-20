@@ -3,9 +3,9 @@
     uv run fit_noise.py 3 0        the first of three workers, one file a ladder into data/noise/fit
     uv run fit_noise.py table      gather them into data/noise/cameras.json
 
-A row is one noisy frame against its camera's lowest ISO: shot and read noise and the black offset per
-colour plane, row banding, how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve,
-lower is longer) and the raw's rounding step. All in the noisy frame's own units, black-subtracted
+A row is one noisy frame against its camera's lowest ISO. Per colour plane: shot and read noise, the
+black offset, and how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve, lower is
+longer). For the frame: row banding and the raw's rounding step. All in the noisy frame's own units, black-subtracted
 over the white level, as noise_bank.py's are. The cameras bench_raw.py tests on stay out, as they do
 in raw_pairs.py.
 """
@@ -26,8 +26,8 @@ FITS = OUT / "fit"
 SITES = ((0, 0), (0, 1), (1, 0), (1, 1))
 BLOCK = 16
 BINS = 24
-LAMBDAS = np.linspace(-0.4, 0.6, 201)
-TAIL = scipy.stats.tukeylambda.ppf(0.995, LAMBDAS) / scipy.stats.tukeylambda.ppf(0.75, LAMBDAS)
+LAMBDAS = np.linspace(-0.2, 0.5, 141)
+KURTOSIS = scipy.stats.tukeylambda.stats(LAMBDAS, moments="k") + 3
 
 
 def blocks(plane, side=BLOCK):
@@ -42,10 +42,14 @@ def line(truth, plane):
     return np.polyfit(means[0][unclipped], means[1][unclipped], 1)
 
 
-def tail(z):
-    """The Tukey lambda whose far quantile sits where these unit-strength samples' does."""
-    middle, far = np.quantile(np.abs(z), (0.5, 0.99))
-    return float(np.interp(far / middle, TAIL[::-1], LAMBDAS[::-1]))
+def tail(z, read_share, shot_excess):
+    """The Tukey lambda for read noise that gives these unit-strength samples of all the noise their kurtosis.
+
+    read_share is how much of their variance is read noise, shot_excess the kurtosis shot noise alone
+    adds. The few samples far out are held to 12.
+    """
+    excess = scipy.stats.kurtosis(z.clip(-12, 12), axis=None) - shot_excess
+    return float(np.interp(3 + excess / max(read_share, 1e-3) ** 2, KURTOSIS[::-1], LAMBDAS[::-1]))
 
 
 def step(plane):
@@ -89,7 +93,9 @@ def plane_levels(truth, plane, share):
     signal, left, slope, offset = flat(truth, plane)
     s, v = curve(signal, left, share)
     (shot, read), _ = scipy.optimize.nnls(np.stack([s / v, 1 / v], 1), np.ones(BINS))
-    dark = left[signal < np.percentile(signal, 25)]
+    darkest = signal < np.percentile(signal, 25)
+    dark, level = left[darkest], float(np.median(signal[darkest]))
+    spread = shot * level + read
     band = lambda axis: float(np.mean(dark.mean(axis).var(1, ddof=1) - dark.var(axis, ddof=1).mean(1) / BLOCK) * share)
     return {
         "gain": float(slope),
@@ -98,7 +104,7 @@ def plane_levels(truth, plane, share):
         "read": float(np.sqrt(read)),
         "row": band(2),
         "column": band(1),
-        "tail": tail(unit(signal, left)),
+        "tail": tail(unit(signal, left), read / spread, shot**3 * level / spread**2),
         "step": step(plane),
         "blocks": len(signal),
         "fit": float(np.median(np.abs(np.log(v / (shot * s + read))))),
@@ -114,12 +120,11 @@ def measure(clean, noisy, share=1.0):
     h, w = clean.shape
     clean, noisy = clean[edge : h - edge, edge : w - edge], noisy[edge + dy : h - edge + dy, edge + dx : w - edge + dx]
     planes = [plane_levels(clean[i::2, j::2], noisy[i::2, j::2], share) for i, j in SITES]
-    row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "gain")}
+    row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "tail", "gain")}
     banding = lambda key: float(np.sqrt(max(np.mean([plane[key] for plane in planes]), 0)))
     return row | {
         "row": banding("row"),
         "column": banding("column"),
-        "tail": float(np.median([plane["tail"] for plane in planes])),
         "step": float(np.median([plane["step"] for plane in planes])),
         "mean": float(noisy.mean()),
         "blocks": min(plane["blocks"] for plane in planes),
