@@ -1,0 +1,191 @@
+"""Every ladder camera's noise at every ISO, for train_raw.py --levels to draw whole rows from.
+
+    uv run fit_noise.py 3 0        the first of three workers, one file a ladder into data/noise/fit
+    uv run fit_noise.py table      gather them into data/noise/cameras.json
+
+A row is one noisy frame against its camera's lowest ISO: shot and read noise and the black offset per
+colour plane, row banding, how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve,
+lower is longer) and the raw's rounding step. All in the noisy frame's own units, black-subtracted
+over the white level, as noise_bank.py's are. The cameras bench_raw.py tests on stay out, as they do
+in raw_pairs.py.
+"""
+
+import json
+import sys
+
+import cv2
+import numpy as np
+import rawpy
+import scipy.optimize
+import scipy.stats
+
+import raw_pairs
+
+OUT = raw_pairs.DATA / "noise"
+FITS = OUT / "fit"
+SITES = ((0, 0), (0, 1), (1, 0), (1, 1))
+BLOCK = 16
+BINS = 24
+LAMBDAS = np.linspace(-0.4, 0.6, 201)
+TAIL = scipy.stats.tukeylambda.ppf(0.995, LAMBDAS) / scipy.stats.tukeylambda.ppf(0.75, LAMBDAS)
+
+
+def blocks(plane, side=BLOCK):
+    h, w = plane.shape[0] // side * side, plane.shape[1] // side * side
+    return plane[:h, :w].reshape(h // side, side, w // side, side).swapaxes(1, 2).reshape(-1, side, side)
+
+
+def line(truth, plane):
+    """The plane's gain and offset against the clean one, as raw_pairs.match fits them."""
+    means = [blocks(p, 64).mean((1, 2)) for p in (truth, plane)]
+    unclipped = means[0] < 0.5
+    return np.polyfit(means[0][unclipped], means[1][unclipped], 1)
+
+
+def tail(z):
+    """The Tukey lambda whose far quantile sits where these unit-strength samples' does."""
+    middle, far = np.quantile(np.abs(z), (0.5, 0.99))
+    return float(np.interp(far / middle, TAIL[::-1], LAMBDAS[::-1]))
+
+
+def step(plane):
+    """The raw's rounding step: the commonest gap between the values its darkest pixels take."""
+    values = np.unique(plane.ravel()[:: max(plane.size // 400000, 1)])
+    gaps = np.diff(values[: len(values) // 4 + 2])
+    return float(np.median(gaps))
+
+
+def flat(truth, plane):
+    """A colour plane where the clean one is flat, in 16 px blocks: their brightness, and what is left of them.
+
+    Left is the plane with the clean one taken off: both frames' noise and none of the scene. Also the
+    plane's gain and offset.
+    """
+    slope, offset = line(truth, plane)
+    smooth = blocks(cv2.GaussianBlur(truth, (0, 0), 1.5))
+    mean = blocks(truth).mean((1, 2))
+    busy = smooth.std((1, 2)) / (mean + 0.002)
+    usable = (mean > 0.0005) & (mean < 0.6) & (blocks(plane).max((1, 2)) < 0.9)
+    keep = usable & (busy < np.percentile(busy[usable], 25))
+    return slope * mean[keep], blocks(plane - slope * truth)[keep], slope, offset
+
+
+def curve(signal, left, share):
+    """Noise variance against brightness: the medians of both over 24 runs of blocks, darkest first."""
+    inside = left.var(2, ddof=1).mean(1) * share
+    order = np.argsort(signal)
+    medians = lambda values: np.array([np.median(part) for part in np.array_split(values[order], BINS)])
+    return medians(signal), medians(inside)
+
+
+def unit(signal, left):
+    """The darkest quarter of the blocks, each line centred and the block brought to unit strength."""
+    dark = left[signal < np.percentile(signal, 25)]
+    return (dark - dark.mean(2, keepdims=True)) / np.sqrt(dark.var(2, ddof=1).mean(1))[:, None, None]
+
+
+def plane_levels(truth, plane, share):
+    """One colour plane's levels; share is how much of the noise left over is the noisy frame's."""
+    signal, left, slope, offset = flat(truth, plane)
+    s, v = curve(signal, left, share)
+    (shot, read), _ = scipy.optimize.nnls(np.stack([s / v, 1 / v], 1), np.ones(BINS))
+    dark = left[signal < np.percentile(signal, 25)]
+    band = lambda axis: float(np.mean(dark.mean(axis).var(1, ddof=1) - dark.var(axis, ddof=1).mean(1) / BLOCK) * share)
+    return {
+        "gain": float(slope),
+        "offset": float(offset),
+        "shot": float(shot),
+        "read": float(np.sqrt(read)),
+        "row": band(2),
+        "column": band(1),
+        "tail": tail(unit(signal, left)),
+        "step": step(plane),
+        "blocks": len(signal),
+        "fit": float(np.median(np.abs(np.log(v / (shot * s + read))))),
+    }
+
+
+def measure(clean, noisy, share=1.0):
+    """A noisy frame's row, or None when it sits too far from the clean one to compare."""
+    dx, dy = raw_pairs.shift_between(clean, noisy)
+    edge = raw_pairs.MAX_SHIFT
+    if max(abs(dx), abs(dy)) > edge:
+        return None
+    h, w = clean.shape
+    clean, noisy = clean[edge : h - edge, edge : w - edge], noisy[edge + dy : h - edge + dy, edge + dx : w - edge + dx]
+    planes = [plane_levels(clean[i::2, j::2], noisy[i::2, j::2], share) for i, j in SITES]
+    row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "gain")}
+    banding = lambda key: float(np.sqrt(max(np.mean([plane[key] for plane in planes]), 0)))
+    return row | {
+        "row": banding("row"),
+        "column": banding("column"),
+        "tail": float(np.median([plane["tail"] for plane in planes])),
+        "step": float(np.median([plane["step"] for plane in planes])),
+        "mean": float(noisy.mean()),
+        "blocks": min(plane["blocks"] for plane in planes),
+        "fit": float(np.mean([plane["fit"] for plane in planes])),
+    }
+
+
+def ladders():
+    for folder in sorted(raw_pairs.LADDERS.glob("*/*/*/")):
+        site, camera, scene = folder.relative_to(raw_pairs.LADDERS).parts
+        steps = sorted((int(file.stem), file) for file in folder.iterdir() if file.stem.isdigit())
+        held = (site, scene) == ("ir", "sli") or any(name in camera for name in raw_pairs.HELD_OUT)
+        if not held and len(steps) > 1 and steps[0][0] <= 400:
+            yield f"{site}--{camera}--{scene}", steps
+
+
+def fit(name, steps):
+    out = FITS / f"{name}.json"
+    if out.exists():
+        return
+    site, camera, scene = name.split("--")
+    (base, path), *rest = steps
+    clean = raw_pairs.mosaic(path)
+    rows = []
+    for iso, path in rest if clean is not None else []:
+        noisy = raw_pairs.mosaic(path)
+        if noisy is None or noisy.shape != clean.shape:
+            continue
+        row = measure(clean, noisy, iso / (iso + base))
+        if row:
+            rows.append({"camera": camera, "site": site, "scene": scene, "iso": iso, "base": base} | row)
+    out.write_text(json.dumps(rows))
+    print(name, [row["iso"] for row in rows], flush=True)
+
+
+def sound(row):
+    """Whether a frame's fit can be trusted: it matched the clean frame's light, and every plane has a level."""
+    gains = np.array(row["gain"])
+    return (
+        row["blocks"] >= 2000
+        and row["fit"] < 0.25
+        and min(row["shot"]) > 0
+        and np.ptp(gains) / gains.mean() < 0.2
+        and 0.25 < gains.mean() < 4
+    )
+
+
+def table():
+    rows = [row for file in sorted(FITS.glob("*.json")) for row in json.loads(file.read_text())]
+    kept = [row for row in rows if sound(row)]
+    (OUT / "cameras.json").write_text(json.dumps(kept))
+    print(len(kept), "of", len(rows), "rows from", len({row["camera"] for row in kept}), "cameras")
+
+
+def main(workers, worker):
+    FITS.mkdir(parents=True, exist_ok=True)
+    cv2.setNumThreads(1)
+    for name, steps in list(ladders())[worker::workers]:
+        try:
+            fit(name, steps)
+        except (OSError, ValueError, rawpy.LibRawError, np.linalg.LinAlgError) as error:
+            print(name, "failed", repr(error), flush=True)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["table"]:
+        table()
+    else:
+        main(int(sys.argv[1]), int(sys.argv[2]))
