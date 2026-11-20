@@ -33,6 +33,9 @@ balance and matrix, so its own demosaic is scored against the clean frame's bili
 "<name>-cfa" takes the picture's pixels back to a mosaic first, which is what RawForge's --cfa saves,
 so it goes through the same bilinear demosaic as the clean frame and as ours: the like-for-like row.
 
+On bench_raw.py's full-colour tests, "<camera>-colour", a rival gets one row: its own picture
+against truth no demosaic made, or its mosaic through the bilinear demosaic.
+
 A model of ours gets "<name>-x8", the mean over the mosaic's eight flips and turns.
 """
 
@@ -106,7 +109,7 @@ def shots():
     """
     known = json.loads((RIVALS / "cameras.json").read_text())
     table = {}
-    for file in bench_raw.BENCH.glob("*.npz"):
+    for file in bench_raw.BENCH.rglob("*.npz"):
         data = np.load(file)
         camera = file.stem.split("--")[-1]
         camera = camera if camera in known else camera.rsplit("-", 1)[0]
@@ -152,14 +155,6 @@ def fetch():
     model = unet.UtNet2(in_channels=4, funit=32, activation="LeakyReLU").eval()
     model.load_state_dict({w.name: torch.from_numpy(numpy_helper.to_array(w).copy()) for w in graph.initializer})
     torch.jit.trace(model, torch.zeros(1, 4, 512, 512)).save(str(RIVALS / "darktable" / "model_bayer.pt"))
-
-
-def sampled(rgb):
-    """A picture (N, 3, H, W) as the RGGB mosaic its pixels would have come from."""
-    mosaic = rgb[:, 1].clone()
-    mosaic[:, 0::2, 0::2] = rgb[:, 0, 0::2, 0::2]
-    mosaic[:, 1::2, 1::2] = rgb[:, 2, 1::2, 1::2]
-    return mosaic
 
 
 def darktable():
@@ -336,16 +331,6 @@ def ensemble(clean_up):
     return run
 
 
-def develop(result, wb, matrix):
-    """bench_raw.develop, for a result that may be camera RGB (N, 3, H, W) already and so has no demosaic left."""
-    if result.dim() == 3:
-        return develop_mosaic(result, wb, matrix)
-    return torch.einsum("ij,njhw->nihw", matrix, result * wb.view(1, 3, 1, 1))
-
-
-develop_mosaic, bench_raw.develop = bench_raw.develop, develop
-
-
 def replayed(clean_up):
     """clean_up, and a second cleaner that hands the first one's pictures back in order, as mosaics."""
     pictures = []
@@ -354,34 +339,41 @@ def replayed(clean_up):
         pictures.append(clean_up(mosaics, mean))
         return pictures[-1]
 
-    return first, lambda mosaics, mean: sampled(pictures.pop(0))
+    return first, lambda mosaics, mean: bench_raw.mosaiced(pictures.pop(0))
 
 
 def rows(spec):
-    """The rows a name on the command line adds: {row name: cleaner}, in the order they must run."""
+    """What a name on the command line adds: {row name: cleaner} for the tests with real noise, in the
+    order they must run, and the cleaner a full-colour test scores, which ours get from bench_raw.py."""
     if "=" in spec:
         name, weights = spec.split("=")
-        return {f"{name}-x8": ensemble(train_raw.cleaner(train_raw.trained(weights)))}
+        return {f"{name}-x8": ensemble(train_raw.cleaner(train_raw.trained(weights)))}, None
     if spec in MOSAICS:
-        return {spec: MOSAICS[spec]()}
-    first, second = replayed(PICTURES[spec]())
-    return {spec: first, f"{spec}-cfa": second}
+        clean_up = MOSAICS[spec]()
+        return {spec: clean_up}, clean_up
+    clean_up = PICTURES[spec]()
+    first, second = replayed(clean_up)
+    return {spec: first, f"{spec}-cfa": second}, clean_up
 
 
 def main(specs):
+    def add(test, name, by_iso):
+        table = json.loads(BOARD.read_text()) if BOARD.exists() else {}
+        table.setdefault(test, {})[name] = by_iso
+        BOARD.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
+        BOARD.with_suffix(".tmp").rename(BOARD)
+        cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
+        print(f"{test:16}{name:20}" + "".join(f"{p:8.2f} {d:.3f}" for p, d in cells), flush=True)
+
     for spec in specs:
-        cleaners = rows(spec)
+        cleaners, own = rows(spec)
         for camera in (*bench_raw.CAMERAS, *bench_raw.groups(), "exact"):
             tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned")
-            added = {name: bench_raw.scores(clean_up, camera, with_lpips=True) for name, clean_up in cleaners.items()}
-            table = json.loads(BOARD.read_text()) if BOARD.exists() else {}
-            for name, kinds in added.items():
-                for test, by_iso in zip(tests, kinds):
-                    table.setdefault(test, {})[name] = by_iso
-                    cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
-                    print(f"{test:16}{name:20}" + "".join(f"{p:8.2f} {d:.3f}" for p, d in cells), flush=True)
-            BOARD.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
-            BOARD.with_suffix(".tmp").rename(BOARD)
+            for name, clean_up in cleaners.items():
+                for test, by_iso in zip(tests, bench_raw.scores(clean_up, camera, with_lpips=True)):
+                    add(test, name, by_iso)
+        for camera in (*bench_raw.CAMERAS, *bench_raw.groups()) if own else ():
+            add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", with_lpips=True)[0])
 
 
 if __name__ == "__main__":
