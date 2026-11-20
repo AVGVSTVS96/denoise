@@ -38,7 +38,7 @@ def main():
     for iso in ISOS:
         noisy = raw_pairs.mosaic(path(iso))
         assert raw_pairs.shift_between(clean, noisy) == (0, 0), iso
-        matched, gains = raw_pairs.match(clean, noisy)
+        matched, gains, _ = raw_pairs.match(clean, noisy)
         field = np.empty_like(clean)
         shot, read = [], []
         for (i, j), gain in zip(SITES, gains):

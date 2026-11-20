@@ -7,7 +7,8 @@
 The network sees the mosaic packed into four half-size planes (R, G, G, B), so a phone runs it at a
 quarter of the pixels. Its body starts from the SIDD sRGB weights; the first and last layers are new.
 --width 64 trains the wider NAFNet, four times the work for a picture, for when quality matters more.
-Batches come from raw_pairs.py's crops: real noisy frames, and clean frames with noise laid over them.
+Batches come from raw_pairs.py's crops: real noisy frames, each against the clean twin resampled onto
+it, and clean frames with noise laid over them.
 A third of the draws go to the scenes that have real noisy frames, however many clean ones there are.
 Without --profile that noise is either made up (shot noise, read noise and row banding, from a wide
 range of cameras) or a window of the Ricoh GR III's real noise (noise_bank.py). A profile narrows the
@@ -20,8 +21,9 @@ night frames look like any other.
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
 step, which is steadier than any single step. Every check logs the held-out RawNIND score and
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
-102,400, and the mean over the cameras whose other scenes train. run.json beside the log keeps the
-run's settings.
+102,400, and the mean over the cameras whose other scenes train. The "aligned" ones are against clean
+windows resampled onto the noisy ones, the ones to pick by; the others are what older runs logged.
+run.json beside the log keeps the run's settings.
 """
 
 import argparse
@@ -38,6 +40,7 @@ import torch
 
 import bench_raw
 import evaluate
+import raw_pairs
 
 PAIRS = evaluate.DATA / "rawpairs"
 NOISE = evaluate.DATA / "noise"
@@ -180,10 +183,12 @@ class Crops:
             stack = np.load(path, mmap_mode="r")
             frames, crops, side, _ = stack.shape
             crop = rng.randrange(crops)
-            synthetic = frames == 1 or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
-            frame = 0 if synthetic else rng.randrange(1, frames)
+            noisy = frames // 2
+            synthetic = not noisy or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
+            frame = 0 if synthetic else rng.randrange(1, noisy + 1)
+            picks = [0] if synthetic else [frame + noisy, frame]
             # Read by offset: through the memory map the kernel fetches about three times what a crop holds.
-            starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in sorted({0, frame})]
+            starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in picks]
             planes = [np.fromfile(path, stack.dtype, side * side, offset=start) for start in starts]
             fresh = np.stack(planes).reshape(-1, side, side), synthetic
             if len(self.pool) < POOL:
@@ -285,12 +290,20 @@ def gains(clean):
 
 
 def scenes(split, pattern):
-    """Each scene's name, and whether it has real noisy frames."""
-    found = {}
+    """Each scene's name, and whether it has real noisy frames.
+
+    A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out.
+    """
+    found, stale = {}, 0
     for meta in sorted(PAIRS.glob("*.json")):
         info = json.loads(meta.read_text())
         if info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.with_suffix(".npy").exists():
-            found[meta.stem] = bool(info["frames"])
+            if raw_pairs.twinned(info):
+                found[meta.stem] = bool(info["frames"])
+            else:
+                stale += 1
+    if stale:
+        print(f"{stale} {split} scenes left out for want of clean twins: rerun raw_pairs.py", flush=True)
     return found
 
 
@@ -301,8 +314,9 @@ def validate(model, val):
     scores = []
     for scene in val:
         stack = np.load(PAIRS / f"{scene}.npy", mmap_mode="r")
-        for frame in range(1, stack.shape[0]):
-            clean = torch.from_numpy(stack[0, :4, 64:448, 64:448].astype(np.float32)).cuda()
+        twins = stack.shape[0] // 2
+        for frame in range(1, twins + 1):
+            clean = torch.from_numpy(stack[frame + twins, :4, 64:448, 64:448].astype(np.float32)).cuda()
             noisy = torch.from_numpy(stack[frame, :4, 64:448, 64:448].astype(np.float32)).cuda()
             g = (LEVEL / clean.mean(dim=(1, 2)).clamp(min=1e-6)).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
             with torch.autocast("cuda", torch.bfloat16):
@@ -347,6 +361,7 @@ def main(args):
         schedule.load_state_dict(state["schedule"])
         step = state["step"]
     compiled = torch.compile(model)
+    bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
@@ -376,15 +391,18 @@ def main(args):
             average.update_parameters(model)
         running += loss.detach()
         if step % args.check == 0 or step == args.steps:
-            bench = bench_raw.score(cleaner(average.module), "gr3")
-            seen = bench_raw.score(cleaner(average.module), "seen")
+            bench, aligned = bench_raw.scores(cleaner(average.module), "gr3")
+            seen, seen_aligned = bench_raw.scores(cleaner(average.module), "seen")
+            mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
             line = {
                 "step": step,
                 "loss": round(running.item() / args.check, 5),
                 "val_psnr": round(validate(average.module, val), 3) if val else float("nan"),
-                "gr3_psnr": round(float(np.mean([psnr for psnr, _ in bench.values()])), 3),
+                "gr3_psnr": mean_psnr(bench),
                 "gr3_by_iso": [round(psnr, 3) for psnr, _ in bench.values()],
-                "seen_psnr": round(float(np.mean([psnr for psnr, _ in seen.values()])), 3),
+                "seen_psnr": mean_psnr(seen),
+                "gr3_aligned": mean_psnr(aligned),
+                "seen_aligned": mean_psnr(seen_aligned),
                 "lr": schedule.get_last_lr()[0],
                 "scenes": len(train),
                 "time": round(time.time()),

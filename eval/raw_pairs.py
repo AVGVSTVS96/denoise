@@ -27,8 +27,12 @@ A frame that turns out too noisy or not Bayer leaves <scene>.skip with its ISO a
 worker fetches it twice.
 
 Each scene becomes data/rawpairs/<scene>.npy, float16 (frames, crops, 512, 512): frame 0 is the
-clean mosaic, the rest are noisy frames brought to its brightness. Mosaics are black-subtracted,
-divided by the white level and cut to start on red, so every camera reads as RGGB.
+clean mosaic, then come the noisy frames brought to its brightness, then one clean twin for each of
+them. A tripod still leaves a noisy frame a fraction of a pixel off the clean one, and a camera that
+steadies its sensor turns it a little too, so offsets() fits where each crop sits to a hundredth of a
+pixel. The noisy crop is cut at the nearest whole even pixel and stays as the camera made it; its
+twin is the clean crop resampled onto it. Mosaics are black-subtracted, divided by the white level
+and cut to start on red, so every camera reads as RGGB.
 """
 
 import hashlib
@@ -60,6 +64,7 @@ DOI = "doi:10.14428/DVN/DEQCIM"
 CROP = 512
 CROPS = 24
 MAX_SHIFT = 16
+TILE, ROUNDS, MARGIN = 64, 5, 8
 BANDS = ((3200, 6400), (12800, 20000), (25600, 40000), (51200, 10**9))
 NIND_TEST = ("bark", "blombukett", "bruegel", "museel-bobo", "ursulines", "stefantiek", "courtine", "pen-pile")
 IR_SCENES = {
@@ -105,6 +110,62 @@ def shift_between(clean, noisy):
     return round(dx * 2) * 2, round(dy * 2) * 2
 
 
+def detail(cfa):
+    """Green without its fine noise or its slow changes of brightness: what a fit to a fraction of a pixel holds on to."""
+    plane = green(cfa)
+    return cv2.GaussianBlur(plane, (0, 0), 2) - cv2.GaussianBlur(plane, (0, 0), 8)
+
+
+def offsets(clean, noisy):
+    """The noisy frame's offset from the clean one at any place, to a fraction of a sensor pixel.
+
+    shift_between gets within a few pixels. From there the offset is fitted as a plane over the frame,
+    which covers a shift, a turn and a change of scale, in ROUNDS Gauss-Newton steps on tiles of green
+    detail, TILE green pixels a side. The slopes are the clean frame's, so the noisy one's noise cannot
+    pull the fit. Returns at(y, x), the (dx, dy) for which noisy[y + dy, x + dx] shows what clean[y, x]
+    does.
+    """
+    c, n = detail(clean), detail(noisy)
+    h, w = c.shape
+    rows, cols = (h - 2 * TILE) // TILE, (w - 2 * TILE) // TILE
+    tiles = lambda a: (
+        a[TILE : TILE + rows * TILE, TILE : TILE + cols * TILE].reshape(rows, TILE, cols, TILE).sum((1, 3))
+    )
+    y, x = np.mgrid[:rows, :cols] * TILE + 1.5 * TILE
+    place = np.stack([np.ones(rows * cols), x.ravel() / w, y.ravel() / w], 1)
+    outer = place[:, :, None] * place[:, None, :]
+    dx, dy = shift_between(clean, noisy)
+    plane = np.array([[dx / 2, 0, 0], [dy / 2, 0, 0]], np.float64)
+    for _ in range(ROUNDS):
+        (ax, bx, cx), (ay, by, cy) = plane
+        to_clean = np.array([[1 - bx / w, -cx / w, -ax], [-by / w, 1 - cy / w, -ay]])
+        moved = cv2.warpAffine(c, to_clean, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP)
+        gx, gy = np.gradient(moved, axis=1), np.gradient(moved, axis=0)
+        rest = n - moved
+        weigh = lambda a: (tiles(a).ravel()[:, None, None] * outer).sum(0)
+        pull = lambda a: (tiles(a).ravel()[:, None] * place).sum(0)
+        hessian = np.block([[weigh(gx * gx), weigh(gx * gy)], [weigh(gx * gy), weigh(gy * gy)]])
+        plane -= np.linalg.solve(hessian, np.concatenate([pull(gx * rest), pull(gy * rest)])).reshape(2, 3)
+    return lambda y, x: tuple(2 * plane @ (1, x / 2 / w, y / 2 / w))
+
+
+def resampled(clean, y, x, dx, dy):
+    """The clean crop at (y, x) as a frame (dx, dy) sensor pixels off shows it, each colour plane on its own.
+
+    Lanczos reads MARGIN pixels past the crop's edge.
+    """
+    region = clean[y - MARGIN : y + CROP + MARGIN, x - MARGIN : x + CROP + MARGIN]
+    out = np.empty_like(region)
+    move = np.float32([[1, 0, dx / 2], [0, 1, dy / 2]])
+    for i in range(2):
+        for j in range(2):
+            plane = np.ascontiguousarray(region[i::2, j::2])
+            out[i::2, j::2] = cv2.warpAffine(
+                plane, move, plane.shape[::-1], flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT
+            )
+    return out[MARGIN:-MARGIN, MARGIN:-MARGIN]
+
+
 def corners(clean, rng, count):
     """Even top-left corners on a 512 px grid: the most detailed crops, and a third at random."""
     h, w = clean.shape
@@ -129,10 +190,11 @@ def match(clean, noisy):
 
     One gain isn't enough: a noisy frame sits on an offset of its own that the file's black level
     misses, a quarter of the shadows' brightness on the GR III at ISO 102,400 and far more in SID and
-    ELD's darkest frames.
+    ELD's darkest frames. Returns the frame, and each plane's gain and the offset taken off it, on the
+    clean frame's scale: the frame plus those offsets is the noisy frame as shot.
     """
     out = np.empty_like(noisy)
-    slopes = []
+    slopes, blacks = [], []
     for i in range(2):
         for j in range(2):
             means = [
@@ -144,7 +206,8 @@ def match(clean, noisy):
             slope, offset = np.polyfit(means[1][unclipped], means[0][unclipped], 1)
             out[i::2, j::2] = (noisy[i::2, j::2] - offset) / slope
             slopes.append(1 / float(slope))
-    return out, slopes
+            blacks.append(float(offset / slope))
+    return out, slopes, blacks
 
 
 def tags(path):
@@ -158,9 +221,15 @@ def tags(path):
     return {"iso": int(iso.group()) if iso else 0, "camera": found.get("camera", "")}
 
 
+def twinned(meta):
+    """Whether a built scene is up to date: it has no noisy frames, or each has its clean twin."""
+    return not meta["frames"] or meta.get("twins", False)
+
+
 def build(name, clean_path, noisy_paths, meta):
     out, skip = OUT / f"{name}.npy", OUT / f"{name}.skip"
-    if out.exists() or skip.exists():
+    built = OUT / f"{name}.json"
+    if skip.exists() or out.exists() and built.exists() and twinned(json.loads(built.read_text())):
         return
     path = clean_path()
     limit = meta.pop("clean_iso", None)
@@ -174,38 +243,46 @@ def build(name, clean_path, noisy_paths, meta):
     rng = np.random.default_rng(int(hashlib.sha1(name.encode()).hexdigest()[:8], 16))
     picks = corners(clean, rng, meta.pop("crops", CROPS))
     frames = [np.stack([clean[y : y + CROP, x : x + CROP] for y, x in picks])]
-    kept = []
+    twins, kept = [], []
     for iso, path in noisy_paths:
         noisy = mosaic(path())
         if noisy is None or noisy.shape != clean.shape:
             continue
-        dx, dy = shift_between(clean, noisy)
-        if max(abs(dx), abs(dy)) > MAX_SHIFT:
-            print(name, iso, "shifted", dx, dy, flush=True)
+        at = offsets(clean, noisy)
+        moves = np.array([at(y + CROP // 2, x + CROP // 2) for y, x in picks])
+        whole = (np.round(moves / 2) * 2).astype(int)
+        if np.abs(whole).max() > MAX_SHIFT:
+            print(name, iso, "shifted", *moves.mean(0).round(1), flush=True)
             continue
-        noisy, gains = match(clean, noisy)
+        noisy, gains, blacks = match(clean, noisy)
         dark = green(clean) < np.percentile(green(clean), 20)
         lift = float(green(noisy)[dark].mean() / green(clean)[dark].mean())
         # SID and ELD's darkest frames glow unevenly; a model taught on them learns the glow as signal.
         if not 0.8 < lift < 1.25:
             print(name, iso, "shadows off", round(lift, 2), flush=True)
             continue
-        cut = np.stack([noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for y, x in picks])
+        cut = np.stack(
+            [noisy[y + dy : y + dy + CROP, x + dx : x + dx + CROP] for (y, x), (dx, dy) in zip(picks, whole)]
+        )
+        twin = np.stack([resampled(clean, y, x, dx, dy) for (y, x), (dx, dy) in zip(picks, moves - whole)])
         # Light that changed between the frames, or a subject that moved, leaves 64 px blocks whose
         # brightness disagrees. A lab ladder is within 3% at nine frames in ten; some reviews' are not.
         means = lambda crops: crops.reshape(len(crops), CROP // 64, 64, CROP // 64, 64).mean((2, 4))
-        drift = float(np.median(np.abs(means(cut) - means(frames[0])) / (means(frames[0]) + 0.01)))
+        drift = float(np.median(np.abs(means(cut) - means(twin)) / (means(twin) + 0.01)))
         if drift > 0.05:
             print(name, iso, "drifted", round(drift, 3), flush=True)
             continue
         frames.append(cut)
-        kept.append({"iso": iso, "shift": [dx, dy], "gain": round(float(np.mean(gains)), 3)})
+        twins.append(twin)
+        shift = moves.mean(0).round(2).tolist()
+        offset = [round(black, 6) for black in blacks]
+        kept.append({"iso": iso, "shift": shift, "gain": round(float(np.mean(gains)), 3), "offset": offset})
     if noisy_paths and not kept:
         return
-    np.save(OUT / f"{name}.tmp.npy", np.stack(frames).astype(np.float16))
+    np.save(OUT / f"{name}.tmp.npy", np.stack(frames + twins).astype(np.float16))
     (OUT / f"{name}.tmp.npy").rename(out)
     # Renamed into place whole: train_raw.py reads these while a build is still writing them.
-    (OUT / f"{name}.tmp").write_text(json.dumps({**meta, "frames": kept}))
+    (OUT / f"{name}.tmp").write_text(json.dumps({**meta, "frames": kept, "twins": True}))
     (OUT / f"{name}.tmp").rename(OUT / f"{name}.json")
     print(name, kept, flush=True)
 
