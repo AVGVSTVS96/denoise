@@ -18,6 +18,13 @@ camera's own scenes (named <profile>-..., as ir-gr3-inbi is for gr3.json) keep t
 frames. Each crop is scaled to a set brightness first, the same way denoise() scales a photo, so dark
 night frames look like any other.
 
+Four settings bring the made-up noise closer to a real camera's, each on its own so runs compare:
+--levels data/noise/cameras.json draws its levels as whole rows, one camera at one ISO as fit_noise.py
+measured it, in place of levels drawn apart; --offsets leaves each colour plane on the black offset
+a real frame sits on, for the network to take off; --tails gives the read noise a real sensor's long
+tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
+noise for windows of real dark frames (dark_bank.py).
+
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
 step, which is steadier than any single step. Every check logs the held-out RawNIND score and
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
@@ -68,6 +75,12 @@ POOL, READS = 1024, 4
 RED, BLUE = (1.5, 2.8), (1.4, 3.2)
 TO_SRGB = ((1.703, -0.719, 0.016), (-0.188, 1.563, -0.375), (0.004, -0.406, 1.402))
 EMA = 0.996
+DARK_SHARE = 0.25
+BELL = 0.14
+OFFSET_SHARED, OFFSET_OWN = 0.3, 0.1
+TAILS = (0.1, 0.2)
+READ_COUNTS = (1, 300)
+MOST_BANDING = 0.3
 
 
 def network(width=32):
@@ -225,59 +238,140 @@ def spread(n, device, low, high):
     return torch.exp(torch.empty(n, device=device).uniform_(math.log(low), math.log(high)))
 
 
-def bank_noise(clean, bank):
+def windows(fields, n, size):
+    """n windows of mosaics (frames, H, W), each from a frame picked at random and starting on red: the frames, and the windows."""
+    frame = torch.randint(len(fields), (n,), device=fields.device)
+    corner = lambda side: (torch.randint((side - size) // 2, (n,)) * 2).tolist()
+    cut = zip(frame.tolist(), corner(fields.shape[1]), corner(fields.shape[2]))
+    return frame, torch.stack([fields[i, y : y + size, x : x + size] for i, y, x in cut]).float()
+
+
+def sites(planes, like):
+    """Values per colour plane (N, 4) laid out as mosaics the shape of like (N, H, W)."""
+    n, h, w = like.shape
+    return unpack(planes.view(n, 4, 1, 1).expand(n, 4, h // 2, w // 2))
+
+
+def bank_noise(clean, bank, offsets):
     """The GR III's real noise on clean mosaics (N, H, W) already at LEVEL brightness.
 
     Each crop gets a window of one ISO's unit-strength field, scaled by that ISO's shot and read noise
     at the brightness under it. The photo is taken as shot 1-16x darker than LEVEL and brought up, as
-    a dim night frame is, but never past FLOOR.
+    a dim night frame is, but never past FLOOR. With offsets it keeps the black offset that ISO's
+    frame sat on.
     """
-    fields, shot, read = bank
-    n, size = clean.shape[0], clean.shape[-1]
-    iso = torch.randint(len(fields), (n,), device=clean.device)
-    corner = lambda side: (torch.randint((side - size) // 2, (n,)) * 2).tolist()
-    unit = torch.stack(
-        [
-            fields[i, y : y + size, x : x + size]
-            for i, y, x in zip(iso.tolist(), corner(fields.shape[1]), corner(fields.shape[2]))
-        ]
-    ).float()
+    fields, shot, read, offset = bank
+    n = clean.shape[0]
+    iso, unit = windows(fields, n, clean.shape[-1])
     darkest = LEVEL / (FLOOR * shot[iso].mean(1))
-    dim = torch.minimum(spread(n, clean.device, 1, 16), darkest).clamp(min=1).view(n, 1, 1, 1)
-    variance = pack(clean).clamp(min=0) * shot[iso].view(n, 4, 1, 1) * dim + (read[iso].view(n, 4, 1, 1) * dim) ** 2
-    return clean + unit * unpack(variance.sqrt())
+    dim = torch.minimum(spread(n, clean.device, 1, 16), darkest).clamp(min=1).view(n, 1)
+    variance = clean.clamp(min=0) * sites(shot[iso] * dim, clean) + sites(read[iso] * dim, clean) ** 2
+    return clean + unit * variance.sqrt() + sites(offset[iso] * dim * offsets, clean)
 
 
 def noise_bank(profile):
-    """A camera's noise fields on the GPU, with each ISO's shot and read noise per colour plane."""
+    """A camera's noise fields on the GPU, with each ISO's shot noise, read noise and black offset per colour plane."""
     levels = json.loads(profile.read_text())["iso"].values()
     fields = torch.from_numpy(np.load(profile.with_suffix(".npy"))).cuda()
-    return fields, *(torch.tensor([level[kind] for level in levels], device="cuda") for kind in ("shot", "read"))
+    part = lambda kind: torch.tensor([level.get(kind, [0.0] * 4) for level in levels], device="cuda")
+    return fields, part("shot"), part("read"), part("offset")
 
 
-def made_up_noise(clean, profile):
-    """Shot, read and row noise on clean mosaics (N, H, W) already at LEVEL brightness.
+def dark_bank(path):
+    """Real dark frames at unit strength on the GPU, with each one's black offset per colour plane in units of its read noise."""
+    lifts = [frame["offset"] for frame in json.loads(path.read_text())]
+    return torch.from_numpy(np.load(path.with_suffix(".npy"))).cuda(), torch.tensor(lifts, device="cuda")
 
-    A profile holds a camera's measured levels per ISO in normalised raw units; the photo is taken as
-    shot 1-16x darker than LEVEL and brought up, as a dim night frame is.
+
+def measured(path):
+    """A file's rows of noise levels: fit_noise.py's table of cameras, or one camera's profile by ISO."""
+    found = json.loads(pathlib.Path(path).read_text())
+    return found if isinstance(found, list) else list(found["iso"].values())
+
+
+def table(rows):
+    """Rows of noise levels on the GPU: shot, read and offset (rows, 4) per colour plane, the rest (rows,).
+
+    A row is one camera at one ISO, in normalised raw units. One that lacks a part gets none of it: no
+    banding, no offset, a bell curve, no rounding. Banding is what a row's lines carry beyond its
+    columns, since noise that is only smeared shows in both, and no more than MOST_BANDING of the read
+    noise: on a nearly clean frame the measured banding is mostly what was left of the scene.
+    """
+    planes = lambda value: value if isinstance(value, list) else [value] * 4
+    across = lambda row: max(row.get("row", 0.0) ** 2 - row.get("column", 0.0) ** 2, 0.0) ** 0.5
+    banding = lambda row: min(across(row), MOST_BANDING * float(np.mean(row["read"])))
+    parts = {
+        "shot": [planes(row["shot"]) for row in rows],
+        "read": [planes(row["read"]) for row in rows],
+        "offset": [planes(row.get("offset", 0.0)) for row in rows],
+        "row": [banding(row) for row in rows],
+        "tail": [row.get("tail", BELL) for row in rows],
+        "step": [row.get("step", 0.0) for row in rows],
+    }
+    return {part: torch.tensor(values, device="cuda") for part, values in parts.items()}
+
+
+def drawn(n, device, levels):
+    """n rows of noise levels for crops at LEVEL brightness.
+
+    From a table, whole rows: the photo is taken as shot 1-16x darker than LEVEL and brought up, as a
+    dim night frame is, but never past FLOOR. Without one every part is made up on its own: from 3,000
+    electrons at LEVEL down to FLOOR, with half to eight electrons of read noise (the GR IIIx has
+    about 3), an offset of a fraction of the read noise, part shared by the colour planes and part each
+    plane's own, and read noise of 1 to 300 raw counts.
+    """
+    if levels:
+        pick = torch.randint(len(levels["shot"]), (n,), device=device)
+        row = {part: values[pick] for part, values in levels.items()}
+        dim = torch.minimum(spread(n, device, 1, 16), LEVEL / (FLOOR * row["shot"].mean(1))).clamp(min=1)
+        scaled = lambda values: values * dim.view(n, *[1] * (values.dim() - 1))
+        return {part: values if part == "tail" else scaled(values) for part, values in row.items()}
+    shot = spread(n, device, LEVEL / 3000, LEVEL / FLOOR)
+    read = shot * spread(n, device, 0.5, 8)
+    lift = torch.randn(n, 1, device=device) * OFFSET_SHARED + torch.randn(n, 4, device=device) * OFFSET_OWN
+    return {
+        "shot": shot[:, None].expand(n, 4),
+        "read": read[:, None].expand(n, 4),
+        "offset": read[:, None] * lift,
+        "row": read * torch.empty(n, device=device).uniform_(0, MOST_BANDING),
+        "tail": torch.empty(n, device=device).uniform_(*TAILS),
+        "step": read / spread(n, device, *READ_COUNTS),
+    }
+
+
+def long_tailed(like, tail):
+    """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, as ELD draws read noise.
+
+    tail (N,) is each crop's lambda: BELL is close to a bell curve, lower has longer tails.
+    """
+    lam = tail.clamp(-0.2, 0.5).view(-1, 1, 1)
+    lam = torch.where(lam.abs() < 0.01, torch.full_like(lam, 0.01), lam)
+    variance = 2 / lam**2 * (1 / (1 + 2 * lam) - torch.exp(2 * torch.lgamma(lam + 1) - torch.lgamma(2 * lam + 2)))
+    u = torch.rand_like(like).clamp(1e-6, 1 - 1e-6)
+    return (u**lam - (1 - u) ** lam) / lam / variance.sqrt()
+
+
+def made_up_noise(clean, row, offsets, tails, darks):
+    """Shot, read and row noise on clean mosaics (N, H, W) already at LEVEL brightness, at drawn()'s levels.
+
+    With tails the read noise is long-tailed and the result rounded to the raw's steps, with offsets
+    each colour plane keeps its black offset, and with a dark bank some crops get a window of a real
+    dark frame, at the row's read level, in place of made-up read noise, banding and offset.
     """
     n, device = clean.shape[0], clean.device
-    uniform = lambda low, high: spread(n, device, low, high)
-    if profile:
-        levels = [random.choice(list(profile["iso"].values())) for _ in range(n)]
-        dim = uniform(1, 16)
-        shot = torch.tensor([lv["shot"] for lv in levels], device=device) * dim
-        read = torch.tensor([lv["read"] for lv in levels], device=device) * dim
-        row = torch.tensor([lv.get("row", 0.0) for lv in levels], device=device) * dim
-    else:
-        # From 3,000 electrons at LEVEL down to FLOOR, with half to eight electrons of read noise; the
-        # GR IIIx has about 3.
-        shot = uniform(LEVEL / 3000, LEVEL / FLOOR)
-        read = shot * uniform(0.5, 8)
-        row = read * torch.empty(n, device=device).uniform_(0, 0.3)
-    view = lambda t: t.view(n, 1, 1)
-    photons = torch.poisson(clean.clamp(min=0) / view(shot)) * view(shot)
-    return photons + torch.randn_like(clean) * view(read) + torch.randn(n, clean.shape[1], 1, device=device) * view(row)
+    shot, read = sites(row["shot"], clean), sites(row["read"], clean)
+    unit = long_tailed(clean, row["tail"]) if tails else torch.randn_like(clean)
+    dark = unit * read + torch.randn(n, clean.shape[1], 1, device=device) * row["row"].view(n, 1, 1)
+    lift = row["offset"]
+    if darks:
+        fields, lifts = darks
+        frame, real = windows(fields, n, clean.shape[-1])
+        swapped = torch.rand(n, device=device) < DARK_SHARE
+        dark = torch.where(swapped.view(n, 1, 1), real * read, dark)
+        lift = torch.where(swapped.view(n, 1), lifts[frame] * row["read"], lift)
+    noisy = torch.poisson(clean.clamp(min=0) / shot) * shot + dark + sites(lift * offsets, clean)
+    step = row["step"].view(n, 1, 1) * tails
+    return torch.where(step > 0, torch.round(noisy / step.clamp(min=1e-12)) * step, noisy)
 
 
 def gains(clean):
@@ -335,7 +429,8 @@ def main(args):
     (out / "run.json").write_text(json.dumps(vars(args)))
     camera = pathlib.Path(args.profile or NOISE / "gr3.json")
     bank = noise_bank(camera) if camera.with_suffix(".npy").exists() else None
-    profile = json.loads(camera.read_text()) if args.profile and not bank else None
+    levels = table(measured(args.profile or args.levels)) if args.profile or args.levels else None
+    darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
     share = 1 if args.profile else BANK_SHARE
     model = network(args.width).cuda().to(memory_format=torch.channels_last)
     if args.init:
@@ -374,9 +469,9 @@ def main(args):
         g = gains(clean)
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
-            laid = made_up_noise(clean, profile)
+            laid = made_up_noise(clean, drawn(len(clean), clean.device, levels), args.offsets, args.tails, darks)
             if bank:
-                laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank), laid)
+                laid = torch.where(torch.rand_like(g) < share, bank_noise(clean, bank, args.offsets), laid)
             noisy = torch.where(synthetic, laid, noisy)
         with torch.autocast("cuda", torch.bfloat16):
             result = unpack(compiled(pack(noisy).contiguous(memory_format=torch.channels_last)).float())
@@ -446,4 +541,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--scenes", default="*")
     parser.add_argument("--profile")
+    parser.add_argument("--levels", help="noise levels drawn as whole (camera, ISO) rows of this table")
+    parser.add_argument("--offsets", action="store_true", help="noisy frames keep their black offset per colour plane")
+    parser.add_argument("--tails", action="store_true", help="long-tailed read noise, rounded to the raw's steps")
+    parser.add_argument("--darks", help="a bank of real dark frames for part of the read noise")
     main(parser.parse_args())
