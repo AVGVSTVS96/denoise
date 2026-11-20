@@ -99,6 +99,14 @@ def colour(path):
     return wb / wb[1], matrix
 
 
+def save(name, **arrays):
+    """A test's windows, renamed into place whole: the PC scores from this folder while a build runs."""
+    BENCH.mkdir(parents=True, exist_ok=True)
+    with (BENCH / f"{name}.tmp").open("wb") as file:
+        np.savez(file, **arrays)
+    (BENCH / f"{name}.tmp").rename(BENCH / f"{name}.npz")
+
+
 def build(camera, path, base=100, isos=ISOS, count=WINDOWS):
     clean = raw_pairs.mosaic(path(base))
     picks = raw_pairs.corners(clean, np.random.default_rng(0), count)
@@ -109,11 +117,11 @@ def build(camera, path, base=100, isos=ISOS, count=WINDOWS):
     for iso in isos:
         noisy = raw_pairs.mosaic(path(iso))
         dx, dy = raw_pairs.shift_between(clean, noisy)
-        at = raw_pairs.offsets(clean, noisy)
         noisy, _, blacks = raw_pairs.match(clean, noisy)
         offsets.append(blacks)
         frames.append(cut(noisy, dx, dy))
-        left = np.array([at(y + raw_pairs.CROP // 2, x + raw_pairs.CROP // 2) for y, x in picks]) - (dx, dy)
+        at = raw_pairs.offsets(clean, noisy)
+        left = np.array([at(y, x)[0] for y, x in picks]) - (dx, dy)
         whole = (np.round(left / 2) * 2).astype(int)
         twins.append(
             np.stack(
@@ -126,10 +134,9 @@ def build(camera, path, base=100, isos=ISOS, count=WINDOWS):
         means.append(float(noisy.mean()))
         print(camera, iso, "shift", dx, dy, "left", round(float(np.hypot(*left.T).mean()), 2), flush=True)
     wb, matrix = colour(path(base))
-    BENCH.mkdir(parents=True, exist_ok=True)
     stacked = lambda crops: np.stack(crops).astype(np.float16)
-    np.savez(
-        BENCH / f"{camera}.npz",
+    save(
+        camera,
         frames=stacked(frames),
         twins=stacked(twins),
         means=means,
@@ -211,7 +218,7 @@ def build_exact(camera, path, base, isos):
         print(camera, iso, "shot", f"{shot:.3g}", "read", f"{read**0.5:.3g}", flush=True)
     wb, matrix = colour(path(base))
     frames = np.stack(frames).astype(np.float16)
-    np.savez(BENCH / f"exact--{camera}.npz", frames=frames, means=means, wb=wb, matrix=matrix, isos=isos)
+    save(f"exact--{camera}", frames=frames, means=means, wb=wb, matrix=matrix, isos=isos)
 
 
 def develop(mosaic, wb, matrix):

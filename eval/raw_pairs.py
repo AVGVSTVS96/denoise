@@ -28,10 +28,12 @@ worker fetches it twice.
 
 Each scene becomes data/rawpairs/<scene>.npy, float16 (frames, crops, 512, 512): frame 0 is the
 clean mosaic, then come the noisy frames brought to its brightness, then one clean twin for each of
-them. A tripod still leaves a noisy frame a fraction of a pixel off the clean one, and a camera that
-steadies its sensor turns it a little too, so offsets() fits where each crop sits to a hundredth of a
-pixel. The noisy crop is cut at the nearest whole even pixel and stays as the camera made it; its
-twin is the clean crop resampled onto it. Both stop at the lower of the two frames' white levels: a
+them. A tripod still leaves a noisy frame a fraction of a pixel off the clean one, a camera that
+steadies its sensor turns it a little too, and a few reviewers moved the camera twenty pixels, so
+offsets() fits where each crop sits to a hundredth of a pixel. A frame is dropped when its crops,
+once laid on the clean ones, show under SHARE of their detail, or one crop under SHARE of what the
+others show: something in the scene moved. The noisy crop is cut at the nearest whole even
+pixel and stays as the camera made it; its twin is the clean crop resampled onto it. Both stop at the lower of the two frames' white levels: a
 noisy frame shot darker and brought up holds highlights the clean one clipped, a third brighter on
 the GR IIIx's still life, and the other way round a target would ask for what its frame never held.
 Mosaics are black-subtracted, divided by the white level and cut to start on red, so every camera
@@ -67,7 +69,9 @@ DOI = "doi:10.14428/DVN/DEQCIM"
 CROP = 512
 CROPS = 24
 MAX_SHIFT = 16
-TILE, ROUNDS, MARGIN = 64, 5, 8
+TILE, ROUNDS, MARGIN = 64, 3, 8
+SCALES = (8, 4, 2, 1)
+FIRM, SLACK, SHARE = 0.05, 0.5, 0.8
 BANDS = ((3200, 6400), (12800, 20000), (25600, 40000), (51200, 10**9))
 NIND_TEST = ("bark", "blombukett", "bruegel", "museel-bobo", "ursulines", "stefantiek", "courtine", "pen-pile")
 IR_SCENES = {
@@ -113,43 +117,82 @@ def shift_between(clean, noisy):
     return round(dx * 2) * 2, round(dy * 2) * 2
 
 
-def detail(cfa):
-    """Green without its fine noise or its slow changes of brightness: what a fit to a fraction of a pixel holds on to."""
+def detail(cfa, scale):
+    """Green at 1/scale of its size, without its fine noise or its slow changes of brightness."""
     plane = green(cfa)
+    if scale > 1:
+        plane = cv2.resize(plane, None, fx=1 / scale, fy=1 / scale, interpolation=cv2.INTER_AREA)
     return cv2.GaussianBlur(plane, (0, 0), 2) - cv2.GaussianBlur(plane, (0, 0), 8)
 
 
-def offsets(clean, noisy):
-    """The noisy frame's offset from the clean one at any place, to a fraction of a sensor pixel.
-
-    shift_between gets within a few pixels. From there the offset is fitted as a plane over the frame,
-    which covers a shift, a turn and a change of scale, in ROUNDS Gauss-Newton steps on tiles of green
-    detail, TILE green pixels a side. The slopes are the clean frame's, so the noisy one's noise cannot
-    pull the fit. Returns at(y, x), the (dx, dy) for which noisy[y + dy, x + dx] shows what clean[y, x]
-    does.
-    """
-    c, n = detail(clean), detail(noisy)
+def laid(c, plane):
+    """Clean detail moved by an offset plane: rows for x and y, columns a constant and a slope along x and y."""
     h, w = c.shape
-    rows, cols = (h - 2 * TILE) // TILE, (w - 2 * TILE) // TILE
+    (ax, bx, cx), (ay, by, cy) = plane
+    to_clean = np.array([[1 - bx / w, -cx / w, -ax], [-by / w, 1 - cy / w, -ay]])
+    return cv2.warpAffine(c, to_clean, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP)
+
+
+def nudged(c, n, plane, tile):
+    """The offset plane after one Gauss-Newton step toward laying clean detail c on noisy detail n.
+
+    The slopes are the clean frame's, so the noisy one's noise cannot pull the fit. Sums are taken over
+    tiles, each with its place in the frame, which is what lets the offset tilt across it.
+    """
+    h, w = c.shape
+    rows, cols = h // tile - 2, w // tile - 2
     tiles = lambda a: (
-        a[TILE : TILE + rows * TILE, TILE : TILE + cols * TILE].reshape(rows, TILE, cols, TILE).sum((1, 3))
+        a[tile : tile + rows * tile, tile : tile + cols * tile].reshape(rows, tile, cols, tile).sum((1, 3))
     )
-    y, x = np.mgrid[:rows, :cols] * TILE + 1.5 * TILE
+    y, x = np.mgrid[:rows, :cols] * tile + 1.5 * tile
     place = np.stack([np.ones(rows * cols), x.ravel() / w, y.ravel() / w], 1)
     outer = place[:, :, None] * place[:, None, :]
-    dx, dy = shift_between(clean, noisy)
-    plane = np.array([[dx / 2, 0, 0], [dy / 2, 0, 0]], np.float64)
-    for _ in range(ROUNDS):
-        (ax, bx, cx), (ay, by, cy) = plane
-        to_clean = np.array([[1 - bx / w, -cx / w, -ax], [-by / w, 1 - cy / w, -ay]])
-        moved = cv2.warpAffine(c, to_clean, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP)
-        gx, gy = np.gradient(moved, axis=1), np.gradient(moved, axis=0)
-        rest = n - moved
-        weigh = lambda a: (tiles(a).ravel()[:, None, None] * outer).sum(0)
-        pull = lambda a: (tiles(a).ravel()[:, None] * place).sum(0)
-        hessian = np.block([[weigh(gx * gx), weigh(gx * gy)], [weigh(gx * gy), weigh(gy * gy)]])
-        plane -= np.linalg.solve(hessian, np.concatenate([pull(gx * rest), pull(gy * rest)])).reshape(2, 3)
-    return lambda y, x: tuple(2 * plane @ (1, x / 2 / w, y / 2 / w))
+    moved = laid(c, plane)
+    gx, gy = np.gradient(moved, axis=1), np.gradient(moved, axis=0)
+    weigh = lambda a: (tiles(a).ravel()[:, None, None] * outer).sum(0)
+    pull = lambda a: (tiles(a).ravel()[:, None] * place).sum(0)
+    hessian = np.block([[weigh(gx * gx), weigh(gx * gy)], [weigh(gx * gy), weigh(gy * gy)]])
+    return plane - np.linalg.solve(hessian, np.concatenate([pull(gx * (n - moved)), pull(gy * (n - moved))])).reshape(
+        2, 3
+    )
+
+
+def offsets(clean, noisy):
+    """Where a crop of the noisy frame sits against the clean one, to a fraction of a sensor pixel.
+
+    The noisy frame comes at the clean one's brightness. Its offset is first fitted as a plane over the
+    frame, which covers a shift, a turn and a change of scale, on green detail from an eighth of the
+    size up to full size, so a frame tens of pixels off is found as surely as one a tenth off. A camera
+    that moved leaves near and far things apart by more than a plane can say, so each crop then gets
+    its own few steps from there, held back along stripes and in flat crops, where the crop alone says
+    nothing: by FIRM of its detail, and by noise against a SLACK green pixels' leave from the plane.
+
+    Returns at(y, x) for the crop whose corner that is: the (dx, dy) for which noisy[y + dy, x + dx]
+    shows what clean[y, x] does, and the share of the clean crop's detail the noisy one shows once laid
+    so, about 1 when they line up, whatever the noise, and far under it when something moved.
+    """
+    plane = np.zeros((2, 3))
+    for scale in SCALES:
+        c, n = detail(clean, scale), detail(noisy, scale)
+        for _ in range(ROUNDS):
+            plane = nudged(c, n, plane / scale, max(TILE // scale, 8)) * scale
+    width = c.shape[1]
+
+    def at(y, x):
+        ys, xs = np.mgrid[y // 2 : (y + CROP) // 2, x // 2 : (x + CROP) // 2].astype(np.float32)
+        lay = lambda d: cv2.remap(c, xs - np.float32(d[0]), ys - np.float32(d[1]), cv2.INTER_CUBIC)
+        want = n[y // 2 : (y + CROP) // 2, x // 2 : (x + CROP) // 2]
+        d = plane @ (1, (x + CROP / 2) / 2 / width, (y + CROP / 2) / 2 / width)
+        for _ in range(ROUNDS):
+            moved = lay(d)
+            slopes = np.stack([np.gradient(moved, axis=1).ravel(), np.gradient(moved, axis=0).ravel()])
+            rest = (want - moved).ravel()
+            firm = slopes @ slopes.T
+            d = d - np.linalg.solve(firm + np.eye(2) * (FIRM * np.trace(firm) + rest.var() / SLACK**2), slopes @ rest)
+        moved = lay(d)
+        return (2 * d[0], 2 * d[1]), float((want * moved).sum() / (moved * moved).sum())
+
+    return at
 
 
 def resampled(clean, y, x, dx, dy):
@@ -259,13 +302,16 @@ def build(name, clean_path, noisy_paths, meta):
         noisy = mosaic(path())
         if noisy is None or noisy.shape != clean.shape:
             continue
+        noisy, gains, blacks = match(clean, noisy)
         at = offsets(clean, noisy)
-        moves = np.array([at(y + CROP // 2, x + CROP // 2) for y, x in picks])
+        moves, shares = (np.array(found) for found in zip(*(at(y, x) for y, x in picks)))
         whole = (np.round(moves / 2) * 2).astype(int)
         if np.abs(whole).max() > MAX_SHIFT:
             print(name, iso, "shifted", *moves.mean(0).round(1), flush=True)
             continue
-        noisy, gains, blacks = match(clean, noisy)
+        if min(np.median(shares), shares.min() / np.median(shares)) < SHARE:
+            print(name, iso, "not lined up", shares.min().round(2), np.median(shares).round(2), flush=True)
+            continue
         dark = green(clean) < np.percentile(green(clean), 20)
         lift = float(green(noisy)[dark].mean() / green(clean)[dark].mean())
         # SID and ELD's darkest frames glow unevenly; a model taught on them learns the glow as signal.
