@@ -1,14 +1,30 @@
-import manifest from "../public/model/manifest.json";
+import photo from "../public/model/manifest.json";
+import raw from "../public/model/raw.json";
+import type { Brightest } from "./raw";
 
-export const modelBytes = manifest.bytes;
+type Manifest = { name: string; bytes: number; sha256: string; parts: string[]; brightest?: Brightest };
 
-const cacheName = `model-${manifest.sha256.slice(0, 12)}`;
+type Models = { photo: Manifest; raw: Manifest };
+
+export const models: Models = { photo, raw };
+
+export type ModelKind = keyof typeof models;
+
+const cacheName = (kind: ModelKind) => `model-${models[kind].sha256.slice(0, 12)}`;
 const ATTEMPTS = 3;
 
-export async function loadModel(onProgress: (loaded: number) => void): Promise<Uint8Array> {
-  const cache = await caches.open(cacheName).catch(() => undefined);
+async function forgetOld() {
+  const current = [cacheName("photo"), cacheName("raw")];
+  const names = await caches.keys();
+  await Promise.all(names.filter((n) => n.startsWith("model-") && !current.includes(n)).map((n) => caches.delete(n)));
+}
+
+export async function loadModel(kind: ModelKind, onProgress: (loaded: number) => void): Promise<Uint8Array> {
+  const manifest = models[kind];
+  const cache = await caches.open(cacheName(kind)).catch(() => undefined);
   const out = new Uint8Array(manifest.bytes);
   let offset = 0;
+  forgetOld().catch(() => {});
 
   for (const part of manifest.parts) {
     const url = `/model/${part}`;
