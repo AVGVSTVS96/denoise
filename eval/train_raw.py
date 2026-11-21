@@ -330,7 +330,7 @@ def denoise(model, mosaic, tile=1024, overlap=64):
                 result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()
             out[..., y : y + tile, x : x + tile] += result / own * fade
             weight[y : y + tile, x : x + tile] += fade
-    return (out / weight)[..., overlap:-overlap, overlap:-overlap]
+    return out[..., overlap:-overlap, overlap:-overlap] / weight[overlap:-overlap, overlap:-overlap]
 
 
 class Crops:
