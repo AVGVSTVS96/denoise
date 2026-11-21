@@ -48,6 +48,14 @@ that truth is 224 px, as without either. --perceptual 0.05 adds LPIPS, at that w
 picture and its truth, both developed as bench_raw.py looks at them: it is there to make the picture
 look closer to the truth where L1 settles for a blur, and the truth is all it can pull towards.
 
+denoise() scales a whole photo by one gain, so a lamp-lit part of a dark photo reaches the network
+tens of times brighter than any crop in training, which a model answers with garbage. Two cures, to
+compare: denoise() now holds each tile's gain down so no tile is brighter than training's brightest
+crop, and blends tiles where they meet; and --bright 0.25 shows that share of crops as such a part,
+at a gain from the top of the usual range up to MAX_GAIN, the noisy one stopped at white. bright()
+measures it, and every check logs it at the whole photo's gain: a flat tile at 1 to 640 times LEVEL,
+and the brightest tiles of dark photos (highlights.py).
+
 A step hands the GPU its work without stopping for it: the crops of both kinds go up in one piece,
 which is the one place the CPU waits, and the small tables the loss and the joint network need stay
 on the GPU. Each pass through the network, forward or backward, is recorded once as a CUDA graph and
@@ -87,6 +95,10 @@ MODELS = evaluate.MODELS / "raw"
 #: Mean a crop or photo is scaled to before the network sees it.
 LEVEL = 0.1
 MAX_GAIN = 64.0
+#: A crop in training has its mean between LEVEL / DIM and LEVEL * BRIGHT, and no gain under LEAST_GAIN.
+DIM, BRIGHT, LEAST_GAIN = 6, 2, 1 / 4
+#: The flat tiles bright() tries, in times LEVEL: the last is a blown tile of the darkest photo denoise() takes.
+FLATS = (1, 2, 5, 10, 20, 50, 100, 200, 640)
 SYNTHETIC_SHARE = 0.4
 #: How much of the laid-over noise is the GR III's real noise: one camera's, in a model for any camera.
 BANK_SHARE = 0.2
@@ -237,38 +249,88 @@ def perceptual_loss(result, truth):
     return bench_raw.perceptual()(look(a), look(b)).mean()
 
 
-def cleaner(model):
-    """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled as denoise() does, and out
-    cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model."""
+def tile_gain(mean, gain):
+    """The gain denoise() gives a tile of that mean in a photo of that gain: the photo's, held down so the
+    tile is no brighter than the brightest crop of training."""
+    return float(np.clip(min(gain, BRIGHT * LEVEL / max(mean, 1e-6)), LEAST_GAIN, MAX_GAIN))
 
-    def clean_up(mosaics, mean):
-        gain = min(max(LEVEL / mean, 1), MAX_GAIN)
+
+def cleaner(model, tiled=False):
+    """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled by their photo's mean, and out
+    cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model. With tiled each mosaic gets the
+    gain denoise() gives a tile."""
+
+    def at(mosaics, gain):
         with torch.autocast("cuda", torch.bfloat16):
             parts = [made(model, model(fed(model, part * gain)).float()) for part in mosaics.split(8)]
         return torch.cat(parts) / gain
 
+    def clean_up(mosaics, mean):
+        gain = min(max(LEVEL / mean, 1), MAX_GAIN)
+        if tiled:
+            return torch.cat([at(tile[None], tile_gain(tile.mean().item(), gain)) for tile in mosaics])
+        return at(mosaics, gain)
+
     return clean_up
+
+
+@torch.no_grad()
+def bright(clean_up):
+    """How far clean_up moves bright areas: each of FLATS's flat tiles, and the brightest tiles of dark photos.
+
+    A flat tile is a tile of the darkest photo denoise() takes, the one whose gain is MAX_GAIN, and its
+    number is the mean distance of what comes back from the flat, as a share of it. A photo's tile
+    (highlights.py) has no clean twin, but a bright area holds little noise against its light, so its
+    number is how far the means of 16 px blocks move, as a share of them, over the blocks the photo's
+    gain shows brighter than training's brightest crop.
+    """
+    darkest = LEVEL / MAX_GAIN
+    flats = [torch.full((1, 256, 256), level * darkest).cuda() for level in FLATS]
+    found = {
+        "flats": [
+            ((bench_raw.mosaiced(clean_up(flat, darkest)) - flat).abs().mean() / flat.mean()).item() for flat in flats
+        ]
+    }
+    path = bench_raw.BENCH / "bright.npz"
+    if path.exists():
+        data = np.load(path)
+        blocks = lambda mosaic: torch.nn.functional.avg_pool2d(pack(mosaic), 8)
+        moved = []
+        for tile, mean in zip(torch.from_numpy(data["tiles"].astype(np.float32)).cuda(), data["means"].tolist()):
+            seen, made_of = blocks(tile[None]), blocks(bench_raw.mosaiced(clean_up(tile[None], mean)))
+            lit = seen * min(max(LEVEL / mean, 1), MAX_GAIN) > BRIGHT * LEVEL
+            moved.append(((made_of - seen).abs() / seen)[lit].mean().item())
+        found["tiles"] = float(np.mean(moved))
+    return found
 
 
 @torch.no_grad()
 def denoise(model, mosaic, tile=1024, overlap=64):
     """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
-    Every tile keeps only its middle; the last row and column of tiles sit flush with the far edge.
+    The photo's mean sets the gain, as a crop's does in training, and tile_gain() holds it down for a
+    tile brighter than training showed. Tiles then differ in gain, so they fade into each other over
+    the middle half of what they share; the last row and column of tiles sit flush with the far edge.
     Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model.
     """
     gain = float(np.clip(LEVEL / max(float(mosaic.mean()), 1e-6), 1, MAX_GAIN))
-    padded = np.pad(mosaic * gain, overlap, "reflect")
+    padded = np.pad(mosaic, overlap, "reflect")
     out = np.zeros((3, *padded.shape) if joint(model) else padded.shape, padded.dtype)
+    weight = np.zeros(padded.shape, padded.dtype)
+    inward = np.minimum(np.arange(tile), np.arange(tile)[::-1]) + 0.5
+    fade = np.clip((inward - overlap / 2) / overlap, 0, 1).astype(padded.dtype)
+    fade = np.outer(fade, fade)
     starts = lambda side: sorted({*range(0, side - tile, tile - 2 * overlap), side - tile})
     for y in starts(padded.shape[0]):
         for x in starts(padded.shape[1]):
-            piece = torch.from_numpy(np.ascontiguousarray(padded[y : y + tile, x : x + tile])).cuda()[None]
+            piece = padded[y : y + tile, x : x + tile]
+            own = tile_gain(float(piece.mean()), gain)
+            shown = torch.from_numpy(np.ascontiguousarray(piece * own)).cuda()[None]
             with torch.autocast("cuda", torch.bfloat16):
-                result = made(model, model(fed(model, piece)).float())[0].cpu().numpy()
-            core = np.s_[..., overlap:-overlap, overlap:-overlap]
-            out[..., y : y + tile, x : x + tile][core] = result[core]
-    return out[..., overlap:-overlap, overlap:-overlap] / gain
+                result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()
+            out[..., y : y + tile, x : x + tile] += result / own * fade
+            weight[y : y + tile, x : x + tile] += fade
+    return (out / weight)[..., overlap:-overlap, overlap:-overlap]
 
 
 class Crops:
@@ -497,13 +559,20 @@ def made_up_noise(clean, row, offsets, tails, darks):
     return torch.where(step > 0, torch.round(noisy / step.clamp(min=1e-12)) * step, noisy)
 
 
-def gains(clean):
+def gains(clean, lit=0.0):
     """Scale each crop to LEVEL, from six times darker to twice brighter.
 
     denoise() scales a whole photo to LEVEL, and a night photo's tiles are mostly darker than its mean.
+    Its lamps are not: with lit, that share of crops gets a gain from the top of that range up to
+    MAX_GAIN, as a lit part of a dark photo does, and what the camera clipped then sits at the gain.
     """
     mean = clean.mean(dim=(1, 2)).clamp(min=1e-6)
-    return (LEVEL / mean * spread(len(mean), mean.device, 1 / 6, 2)).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
+    gain = (LEVEL / mean * spread(len(mean), mean.device, 1 / DIM, BRIGHT)).clamp(LEAST_GAIN, MAX_GAIN)
+    if lit:
+        least = (BRIGHT * LEVEL / mean).clamp(1, MAX_GAIN)
+        lamp = least * (MAX_GAIN / least) ** torch.rand_like(mean)
+        gain = torch.where(torch.rand_like(mean) < lit, lamp, gain)
+    return gain.view(-1, 1, 1)
 
 
 def scenes(split, pattern, folder=PAIRS):
@@ -603,6 +672,9 @@ def main(args):
             laid = torch.where(real, bank_noise(clean, bank, args.offsets), laid)
         return laid
 
+    def at_white(noisy, gain):
+        return torch.minimum(noisy, gain) if args.bright else noisy
+
     def cleaned(noisy):
         with torch.autocast("cuda", torch.bfloat16):
             return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
@@ -612,15 +684,16 @@ def main(args):
         alone = big.batch(args.joint)[0][:, 0] if big else pair[args.batch :, 0]
         clean, noisy = pair[: args.batch, 0], pair[: args.batch, 1]
         synthetic = synthetic[: args.batch].view(-1, 1, 1)
-        g = gains(clean)
+        g = gains(clean, args.bright)
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
             noisy = torch.where(synthetic, under_noise(clean), noisy)
-        loss = loss_of(bench_raw.mosaiced(cleaned(noisy)), clean)
+        loss = loss_of(bench_raw.mosaiced(cleaned(at_white(noisy, g))), clean)
         if args.joint:
             truth = bench_raw.full_colour(alone, args.bin)
-            truth = truth * gains(bench_raw.mosaiced(truth))[:, None]
-            picture = cleaned(under_noise(bench_raw.mosaiced(truth)))
+            g = gains(bench_raw.mosaiced(truth), args.bright)
+            truth = truth * g[:, None]
+            picture = cleaned(at_white(under_noise(bench_raw.mosaiced(truth)), g))
             loss = loss + picture_loss(picture, truth)
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
@@ -658,6 +731,9 @@ def main(args):
                 "scenes": len(train),
                 "time": round(time.time()),
             }
+            lit = bright(clean_up)
+            line |= {"bright_flats": [round(error, 4) for error in lit["flats"]]}
+            line |= {"bright_tiles": round(lit["tiles"], 4)} if "tiles" in lit else {}
             if args.joint:
                 colour = bench_raw.scores(clean_up, "colour/gr3", with_lpips=True)[0]
                 seen_colour = bench_raw.scores(clean_up, "colour/seen", with_lpips=True)[0]
@@ -725,4 +801,5 @@ if __name__ == "__main__":
     )
     parser.add_argument("--bin", type=int, default=2, choices=(2, 4), help="sensor pixels a side to one of the truth")
     parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
+    parser.add_argument("--bright", type=float, default=0, help="share of crops shown as a lit part of a dark photo")
     main(parser.parse_args())
