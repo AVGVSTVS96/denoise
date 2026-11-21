@@ -50,8 +50,8 @@ look closer to the truth where L1 settles for a blur, and the truth is all it ca
 
 denoise() scales a whole photo by one gain, so a lamp-lit part of a dark photo reaches the network
 tens of times brighter than any crop in training, which a model answers with garbage. Two cures, to
-compare: denoise() now holds each tile's gain down so no tile is brighter than training's brightest
-crop, and blends tiles where they meet; and --bright 0.25 shows that share of crops as such a part,
+compare: denoise() now holds each tile's gain down until no block of BLOCK px in it is brighter than
+BRIGHTEST, and blends tiles where they meet; and --bright 0.25 shows that share of crops as such a part,
 at a gain from the top of the usual range up to MAX_GAIN, the noisy one stopped at white. bright()
 measures it, and every check logs it at the whole photo's gain: a flat tile at 1 to 640 times LEVEL,
 and the brightest tiles of dark photos (highlights.py).
@@ -97,6 +97,7 @@ LEVEL = 0.1
 MAX_GAIN = 64.0
 #: A crop in training has its mean between LEVEL / DIM and LEVEL * BRIGHT, and no gain under LEAST_GAIN.
 DIM, BRIGHT, LEAST_GAIN = 6, 2, 1 / 4
+BLOCK, BRIGHTEST = 128, 1.0
 #: The flat tiles bright() tries, in times LEVEL: the last is a blown tile of the darkest photo denoise() takes.
 FLATS = (1, 2, 5, 10, 20, 50, 100, 200, 640)
 SYNTHETIC_SHARE = 0.4
@@ -249,10 +250,14 @@ def perceptual_loss(result, truth):
     return bench_raw.perceptual()(look(a), look(b)).mean()
 
 
-def tile_gain(mean, gain):
-    """The gain denoise() gives a tile of that mean in a photo of that gain: the photo's, held down so the
-    tile is no brighter than the brightest crop of training."""
-    return float(np.clip(min(gain, BRIGHT * LEVEL / max(mean, 1e-6)), LEAST_GAIN, MAX_GAIN))
+def tile_gain(tile, gain):
+    """The gain denoise() gives a tile (H, W) of a photo of that gain, and the app with it (ship_raw.py
+    writes BLOCK and BRIGHTEST into the model's manifest): the photo's, held down until no whole block of
+    BLOCK px in the tile is brighter than BRIGHTEST, which is where a blown block sits in a photo that
+    needs no gain. Never under 1, so such a photo keeps every tile as it is."""
+    h, w = (side // BLOCK * BLOCK for side in tile.shape)
+    blocks = tile[:h, :w].reshape(h // BLOCK, BLOCK, w // BLOCK, BLOCK).mean((1, 3))
+    return float(np.clip(BRIGHTEST / max(float(blocks.max()), 1e-6), 1, gain))
 
 
 def cleaner(model, tiled=False):
@@ -268,7 +273,7 @@ def cleaner(model, tiled=False):
     def clean_up(mosaics, mean):
         gain = min(max(LEVEL / mean, 1), MAX_GAIN)
         if tiled:
-            return torch.cat([at(tile[None], tile_gain(tile.mean().item(), gain)) for tile in mosaics])
+            return torch.cat([at(tile[None], tile_gain(tile, gain)) for tile in mosaics])
         return at(mosaics, gain)
 
     return clean_up
@@ -309,7 +314,7 @@ def denoise(model, mosaic, tile=1024, overlap=64):
     """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
     The photo's mean sets the gain, as a crop's does in training, and tile_gain() holds it down for a
-    tile brighter than training showed. Tiles then differ in gain, so they fade into each other over
+    tile with a light in it. Tiles then differ in gain, so they fade into each other over
     the middle half of what they share; the last row and column of tiles sit flush with the far edge.
     Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model.
     """
@@ -324,7 +329,7 @@ def denoise(model, mosaic, tile=1024, overlap=64):
     for y in starts(padded.shape[0]):
         for x in starts(padded.shape[1]):
             piece = padded[y : y + tile, x : x + tile]
-            own = tile_gain(float(piece.mean()), gain)
+            own = tile_gain(piece, gain)
             shown = torch.from_numpy(np.ascontiguousarray(piece * own)).cuda()[None]
             with torch.autocast("cuda", torch.bfloat16):
                 result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()
