@@ -1,11 +1,11 @@
 {
-  "name": "NAFNet width 32, joint denoise and demosaic on raw Bayer, joint-v1, fp16",
+  "name": "NAFNet width 32, joint denoise and demosaic on raw Bayer, r8-p00, fp16",
   "bytes": 59358208,
-  "sha256": "5c66f5ce3c7c38145f2e89a865b7f9a201afa51524871c96a257780580877822",
+  "sha256": "0a73052d98b13c12d541f46452ec562d39e139b4c6fb2290228e746727624aec",
   "parts": [
-    "5c66f5ce/raw-joint-fp16.part0",
-    "5c66f5ce/raw-joint-fp16.part1",
-    "5c66f5ce/raw-joint-fp16.part2"
+    "0a73052d/raw-joint-fp16.part0",
+    "0a73052d/raw-joint-fp16.part1",
+    "0a73052d/raw-joint-fp16.part2"
   ],
   "brightest": {
     "block": 128,
