@@ -2,9 +2,9 @@ import photo from "../public/model/manifest.json";
 import raw from "../public/model/raw.json";
 import type { Brightest } from "./raw";
 
-type Manifest = { name: string; bytes: number; sha256: string; parts: string[]; brightest?: Brightest };
+type Manifest = { name: string; bytes: number; sha256: string; parts: string[] };
 
-type Models = { photo: Manifest; raw: Manifest };
+type Models = { photo: Manifest; raw: Manifest & { brightest: Brightest } };
 
 export const models: Models = { photo, raw };
 

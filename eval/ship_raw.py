@@ -8,20 +8,14 @@ back, so the file holds train_raw's fed() and made() around the network: the fix
 planes, NAFNet, the pixel shuffle. Half precision, with the layer norms and pools left in fp32 as
 ship.py leaves them (Hush's export), because WebGPU computes fp16 for real and those overflow it.
 
-Two things differ from train_raw.denoise(), both for light far brighter than the photo's mean, and
-both set here, for a model that no longer needs them to drop:
-
-BRIGHTEST: denoise() scales a whole photo by one gain, where training scaled each crop by its own, so
-a lamp in a night photo reaches the network 5 to 60 times brighter than anything it trained on, and
-it draws grids and holes into the light (in full precision too: a flat tile at 2 comes back between
--8 and 19). The app gives a tile a lower gain of its own when any block of that many pixels in it
-would pass that level, and blends the tiles it changed into their neighbours. A tile with no such
-block is left exactly as denoise() runs it. None in place of the numbers turns it off.
+The app scales and tiles a photo as train_raw.denoise() does, tile_gain() and the fade between tiles
+with it, and reads tile_gain()'s two numbers from the manifest this writes. One thing differs, for
+light far brighter than the photo's mean:
 
 CEILING: the network sees its input held under it, and what is held back is added to its picture as
 it is. NAFNet adds its input to its output, so below the ceiling nothing changes. Above it the
 network's values grow with the input: a lamp at the top gain drives them past 100,000, where fp16
-ends at 65,504 and WebGPU would hand back a tile of NaN. After BRIGHTEST only lights smaller than
+ends at 65,504 and WebGPU would hand back a tile of NaN. After tile_gain() only lights smaller than
 its block still pass the ceiling.
 
 Three checks before anything is written into the app:
@@ -64,7 +58,6 @@ OUT = evaluate.MODELS / "raw-joint"
 PART = 20_000_000
 TILE = 1024
 CEILING = 8.0
-BRIGHTEST = {"block": 128, "level": 1.0}
 PHOTOS = (
     raw_pairs.DATA / "his" / "R0006362.DNG",
     raw_pairs.LADDERS / "ir" / "ricoh-gr-iii" / "sli" / "102400.dng",
@@ -120,19 +113,6 @@ def packed(mosaic):
     return train_raw.pack(torch.from_numpy(np.ascontiguousarray(mosaic))[None]).numpy()
 
 
-def levels(scaled, block):
-    """The mean of each block of a mosaic already at its photo's gain, the last row and column of blocks cut short."""
-    rows, columns = (np.arange(0, side, block) for side in scaled.shape)
-    sums = np.add.reduceat(np.add.reduceat(scaled.astype(np.float64), rows, 0), columns, 1)
-    sizes = [np.diff(np.append(at, side)) for at, side in zip((rows, columns), scaled.shape)]
-    return sums / np.outer(*sizes)
-
-
-def own_gain(blocks):
-    """What a tile's input is scaled by on top of the photo's gain, from the blocks that lie in it."""
-    return min(1.0, BRIGHTEST["level"] / max(float(blocks.max()), 1e-6)) if BRIGHTEST else 1.0
-
-
 def photo_tiles(path, count=3):
     """Tiles of a photo as the app feeds them: its darkest, its brightest, and the rest spread between."""
     mosaic = raw_pairs.mosaic(path)
@@ -140,8 +120,8 @@ def photo_tiles(path, count=3):
     corners = [(y, x) for y in range(0, mosaic.shape[0] - TILE, TILE) for x in range(0, mosaic.shape[1] - TILE, TILE)]
     corners.sort(key=lambda corner: mosaic[corner[0] : corner[0] + TILE, corner[1] : corner[1] + TILE].mean())
     picks = [corners[round(i * (len(corners) - 1) / (count - 1))] for i in range(count)]
-    cut = lambda y, x: mosaic[y : y + TILE, x : x + TILE] * gain
-    scaled = lambda tile: tile * own_gain(levels(tile, BRIGHTEST["block"] if BRIGHTEST else TILE))
+    cut = lambda y, x: mosaic[y : y + TILE, x : x + TILE]
+    scaled = lambda tile: tile * train_raw.tile_gain(tile, gain)
     return {f"{path.parent.name}/{path.name} {y},{x}": packed(scaled(cut(y, x))) for y, x in picks}
 
 
@@ -242,8 +222,9 @@ def shipped(fp16, name):
     for i, start in enumerate(range(0, len(blob), PART)):
         (folder / f"raw-joint-fp16.part{i}").write_bytes(blob[start : start + PART])
         parts.append(f"{digest[:8]}/raw-joint-fp16.part{i}")
-    found = {"name": name, "bytes": len(blob), "sha256": digest, "parts": parts}
-    manifest.write_text(json.dumps(found | ({"brightest": BRIGHTEST} if BRIGHTEST else {}), indent=2) + "\n")
+    brightest = {"block": train_raw.BLOCK, "level": train_raw.BRIGHTEST}
+    found = {"name": name, "bytes": len(blob), "sha256": digest, "parts": parts, "brightest": brightest}
+    manifest.write_text(json.dumps(found, indent=2) + "\n")
     named = lambda body: hashlib.sha256(body.encode()).hexdigest()[:16]
     rounded = {named(body): {iso: [round(v, 6) for v in row] for iso, row in rows.items()} for body, rows in blacks.table().items()}
     (APP / "src" / "blacks.json").write_text(json.dumps(rounded, separators=(",", ":")) + "\n")

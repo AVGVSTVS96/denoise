@@ -18,7 +18,7 @@ bun dev
 A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG preview:
 
 1. The worker reads the mosaic itself (uncompressed or lossless JPEG, strips or tiles, 8 to 16 bits), the black and white levels, and the camera's colour from the DNG's tags.
-2. The mosaic is scaled the way `eval/train_raw.py`'s `denoise()` scales it and runs through the joint model in 1024 px tiles (64 px of mirrored border, each tile keeps its middle). The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
+2. The mosaic is scaled and tiled the way `eval/train_raw.py`'s `denoise()` does it and runs through the joint model in 1024 px tiles (64 px of mirrored border, tiles fade into each other over the middle of what they share). A tile with a light in it gets a lower gain of its own, by `train_raw.tile_gain`'s rule: no 128 px block brighter than a blown block in a photo that needs no gain. The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
 3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
 
 Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`). Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.

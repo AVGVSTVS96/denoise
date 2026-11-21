@@ -4,7 +4,7 @@ import * as ort from "onnxruntime-web";
 import manifest from "../public/model/raw.json";
 import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
-import { clean, levelsOf, type Brightest } from "../src/raw";
+import { clean, photoGain } from "../src/raw";
 
 const [photo, out] = process.argv.slice(2);
 const model = join(import.meta.dirname, "../public/model");
@@ -22,15 +22,12 @@ const { width, height } = raw.crop;
 const picture = new Uint8Array(width * height * 3);
 const started = performance.now();
 
-const brightest: Brightest | undefined = manifest.brightest;
-const { gain } = levelsOf(raw, offsets, brightest?.block ?? 1024);
-
-console.log(JSON.stringify({ body: raw.body, iso: raw.iso, offsets, gain, width, height }));
+console.log(JSON.stringify({ body: raw.body, iso: raw.iso, offsets, gain: photoGain(raw, offsets), width, height }));
 
 await clean(
   raw,
   offsets,
-  brightest,
+  manifest.brightest,
   async (planes, h, w) => {
     const result = await session.run({ [session.inputNames[0]]: new ort.Tensor("float32", planes, [1, 4, h, w]) });
 

@@ -5,10 +5,8 @@
 
 The reference for the app's raw path (src/dng.ts, src/raw.ts), built from other parts: rawpy reads the
 mosaic and the camera's colour, exiv2 the DNG's crop and exposure, blacks.py's offsets come off as in
-raw_denoise.py, and the model runs in full precision. A photo none of whose tiles ship_raw.BRIGHTEST
-touches goes through train_raw.denoise() itself. One with lights in it goes tile by tile as the app
-does: the same tiles, each bright one at its own gain, a tile that differs from a neighbour faded
-into it over the middle of their overlap.
+raw_denoise.py, and the model runs in full precision through train_raw.denoise() itself, whose tiles,
+tile gains and fades the app follows.
 
 What is shared with the app is the recipe after the model: white balance with highlights clipped
 where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone
@@ -34,8 +32,6 @@ import train_raw
 
 EXPOSURE = 1.4
 STEPS = 65535
-TILE, OVERLAP = 1024, 64
-BLEND = OVERLAP // 2
 TURNS = {3: cv2.ROTATE_180, 5: cv2.ROTATE_90_COUNTERCLOCKWISE, 6: cv2.ROTATE_90_CLOCKWISE}
 
 
@@ -68,45 +64,6 @@ def developed(picture, balance, matrix, curve):
     return curve[np.floor(np.clip(linear, 0, 1) * STEPS + 0.5).astype(np.int32)]
 
 
-def tile_by_tile(model, mosaic, colour):
-    """The app's way through a photo: the developed picture, or None when every tile runs as denoise() runs it."""
-    gain = float(np.clip(train_raw.LEVEL / max(float(mosaic.mean()), 1e-6), 1, train_raw.MAX_GAIN))
-    block = ship_raw.BRIGHTEST["block"] if ship_raw.BRIGHTEST else TILE
-    blocks = ship_raw.levels(mosaic * gain, block)
-    padded = np.pad(mosaic * gain, OVERLAP, "reflect")
-    starts = [sorted({*range(0, side - TILE, TILE - 2 * OVERLAP), side - TILE}) for side in padded.shape]
-    inside = lambda start, side: slice(max(0, start - OVERLAP) // block, (min(side, start - OVERLAP + TILE) - 1) // block + 1)
-    own = [
-        [ship_raw.own_gain(blocks[inside(y, mosaic.shape[0]), inside(x, mosaic.shape[1])]) for x in starts[1]]
-        for y in starts[0]
-    ]
-    if all(scale == 1 for row in own for scale in row):
-        return None
-    canvas = np.zeros((*mosaic.shape, 3), np.float64)
-    ends = [[*along[1:], side] for along, side in zip(starts, mosaic.shape)]
-
-    def faded(first, start, low, high, blended):
-        at = np.arange(low, high)
-        ramp = np.clip((at + 0.5 - start + BLEND) / (2 * BLEND), 0, 1) if blended else (at >= start).astype(np.float64)
-        return np.ones(high - low) if first else ramp
-
-    for r, y in enumerate(starts[0]):
-        y0, y1 = (y - BLEND if r else 0), min(ends[0][r] + BLEND, mosaic.shape[0])
-        for c, x in enumerate(starts[1]):
-            x0, x1 = (x - BLEND if c else 0), min(ends[1][c] + BLEND, mosaic.shape[1])
-            piece = torch.from_numpy(np.ascontiguousarray(padded[y : y + TILE, x : x + TILE] * own[r][c])).cuda()[None]
-            result = train_raw.made(model, model(train_raw.fed(model, piece)).float())[0].cpu().numpy()
-            kept = result[:, y0 - y + OVERLAP : y1 - y + OVERLAP, x0 - x + OVERLAP : x1 - x + OVERLAP]
-            shown = np.outer(
-                faded(r == 0, y, y0, y1, r > 0 and own[r - 1][c] != own[r][c]),
-                faded(c == 0, x, x0, x1, c > 0 and own[r][c - 1] != own[r][c]),
-            )
-            shown = np.floor(255 * shown + 0.5)[..., None] / 255
-            new = developed(kept / (gain * own[r][c]), *colour)
-            canvas[y0:y1, x0:x1] = np.floor(new * shown + canvas[y0:y1, x0:x1] * (1 - shown) + 0.5)
-    return canvas.astype(np.uint8)
-
-
 def main(weights, photo, out, app=None):
     photo = pathlib.Path(photo)
     model = ship_raw.loaded(pathlib.Path(weights))[0].model.cuda()
@@ -115,10 +72,7 @@ def main(weights, photo, out, app=None):
     red = next((i, j) for i in range(2) for j in range(2) if colours[pattern[i, j]] == "R")
     mosaic = raw_pairs.mosaic(photo)
     mosaic = mosaic - np.tile(blacks.of(photo).reshape(2, 2), (mosaic.shape[0] // 2, mosaic.shape[1] // 2))
-    colour = look(photo)
-    whole = tile_by_tile(model, mosaic, colour)
-    if whole is None:
-        whole = developed(train_raw.denoise(model, mosaic), *colour)
+    whole = developed(train_raw.denoise(model, mosaic), *look(photo))
     x, y = (max(0, round(at) - shift) for at, shift in zip(tag(photo, "DefaultCropOrigin", [0, 0]), red[::-1]))
     width, height = (round(side) for side in tag(photo, "DefaultCropSize", mosaic.shape[::-1]))
     level = whole[y : y + height, x : x + width]
