@@ -48,7 +48,7 @@ MARGIN = 128
 SHEET = pathlib.Path(os.environ.get("BLIND_SHEET", pathlib.Path.home() / "Developer/pages/pages/denoise-blind"))
 PICKS = SHEET.parents[1] / "data" / f"{SHEET.name}.json"
 CROPS = raw_pairs.DATA / "blind" / "crops.json"
-SMALLEST_PREVIEW = 1000
+SHARPEST = 0.5
 Shot = collections.namedtuple("Shot", "photo path mosaic look flip red iso camera rival")
 
 
@@ -85,10 +85,11 @@ def upright(picture, flip):
 
 
 def camera_jpeg(taken, top, left):
-    """The camera's own JPEG of a crop, from the preview its raw carries, or None when that is too small to show.
+    """The camera's own JPEG of a crop, from the preview its raw carries, or None when that is under SHARPEST of
+    the frame's size: a small preview blown up says nothing of what the camera made.
 
     A DNG says which part of the frame its preview is. Elsewhere a preview about the frame's size is
-    taken to be the frame's middle, and a smaller one the whole frame.
+    taken to be the frame's middle.
     """
     with rawpy.imread(str(taken.path)) as raw:
         height, width = raw.sizes.height, raw.sizes.width
@@ -100,13 +101,13 @@ def camera_jpeg(taken, top, left):
         return None
     picture = cv2.imdecode(np.frombuffer(preview.data, np.uint8), cv2.IMREAD_COLOR)
     tall, wide = picture.shape[:2]
-    if wide < SMALLEST_PREVIEW or (wide > tall) != (width > height):
-        return None
     if abs(wide - width) < width / 50:
         across, down, scale = (width - wide) / 2, (height - tall) / 2, 1.0
     else:
         across, down = raw_develop.tag(taken.path, "DefaultCropOrigin", [0, 0])
         scale = wide / raw_develop.tag(taken.path, "DefaultCropSize", [width, height])[0]
+    if scale < SHARPEST or (wide > tall) != (width > height):
+        return None
     x, y = (left + taken.red[1] - across) * scale, (top + taken.red[0] - down) * scale
     onto = np.array([[1 / scale, 0, -x / scale], [0, 1 / scale, -y / scale]])
     return upright(cv2.warpAffine(picture, onto, (SIDE, SIDE), flags=cv2.INTER_CUBIC), taken.flip)
