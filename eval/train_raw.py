@@ -38,6 +38,10 @@ loss on the picture sampled where the camera measured: binning a real noisy fram
 noise away, and its clean twin is a mosaic too. A joint run saves joint.pth and logs
 bench_raw.py's full-colour scores beside the others, which are of its picture sampled back to a mosaic.
 
+A step hands the GPU its work without stopping for it: the crops of both kinds go up in one piece,
+which is the one place the CPU waits, and the small tables the loss and the joint network need stay
+on the GPU.
+
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
 step, which is steadier than any single step. Every check logs the held-out RawNIND score and
 bench_raw.py's scores for picking between runs: the GR III's, its mean and each ISO from 3,200 to
@@ -50,6 +54,7 @@ run.json beside the log keeps the run's settings.
 
 import argparse
 import fnmatch
+import functools
 import json
 import math
 import pathlib
@@ -109,6 +114,12 @@ SPREAD = (
 )
 
 
+@functools.cache
+def held(numbers, device):
+    """A table of numbers on a device, sent there once: every sending waits for the GPU to finish what it holds."""
+    return torch.tensor(numbers, device=device)
+
+
 def network(width=32, joint=False):
     from nafnet import CONFIGS, NAFNet
 
@@ -139,7 +150,7 @@ def widened(state):
 def fed(model, mosaics):
     """What a network takes of mosaics (N, H, W): their four planes, spread to twelve for a joint one."""
     planes = pack(mosaics)
-    return torch.nn.functional.conv2d(planes, planes.new_tensor(SPREAD)[:, :, None, None]) if joint(model) else planes
+    return torch.nn.functional.conv2d(planes, held(SPREAD, planes.device)[:, :, None, None]) if joint(model) else planes
 
 
 def made(model, planes):
@@ -181,7 +192,7 @@ def loss_of(result, clean):
     balance = torch.stack([red, green, green, blue], 1).view(n, 4, 1, 1)
     a, b = pack(result) * balance, pack(clean) * balance
     cells = lambda p: torch.einsum(
-        "ij,njhw->nihw", p.new_tensor(TO_SRGB), torch.stack([p[:, 0], (p[:, 1] + p[:, 2]) / 2, p[:, 3]], 1)
+        "ij,njhw->nihw", held(TO_SRGB, p.device), torch.stack([p[:, 0], (p[:, 1] + p[:, 2]) / 2, p[:, 3]], 1)
     )
     l1 = torch.nn.functional.l1_loss
     return (l1(tone(a), tone(b)) + l1(tone(cells(a)), tone(cells(b)))) / 2
@@ -196,7 +207,7 @@ def picture_loss(result, truth):
     draw = lambda low, high: torch.empty(n, device=truth.device).uniform_(low, high)
     balance = torch.stack([draw(*RED), torch.ones(n, device=truth.device), draw(*BLUE)], 1).view(n, 3, 1, 1)
     a, b = result * balance, truth * balance
-    srgb = lambda p: torch.einsum("ij,njhw->nihw", p.new_tensor(TO_SRGB), p)
+    srgb = lambda p: torch.einsum("ij,njhw->nihw", held(TO_SRGB, p.device), p)
     l1 = torch.nn.functional.l1_loss
     return (l1(tone(a), tone(b)) + l1(tone(srgb(a)), tone(srgb(b)))) / 2
 
@@ -314,9 +325,10 @@ def windows(fields, n, size):
     Returns which frames, and the windows.
     """
     frame = torch.randint(len(fields), (n,), device=fields.device)
-    corner = lambda side: (torch.randint((side - size) // 2, (n,)) * 2).tolist()
-    cut = zip(frame.tolist(), corner(fields.shape[1]), corner(fields.shape[2]))
-    return frame, torch.stack([fields[i, y : y + size, x : x + size] for i, y, x in cut]).float()
+    along = torch.arange(size, device=fields.device)
+    span = lambda side: torch.randint((side - size) // 2, (n,), device=fields.device)[:, None] * 2 + along
+    rows, columns = span(fields.shape[1]), span(fields.shape[2])
+    return frame, fields[frame[:, None, None], rows[:, :, None], columns[:, None, :]].float()
 
 
 def sites(planes, like):
@@ -555,16 +567,16 @@ def main(args):
             return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
 
     while step < args.steps:
-        pair, synthetic = crops.batch(args.batch)
-        clean, noisy = pair[:, 0], pair[:, 1]
-        synthetic = synthetic.view(-1, 1, 1)
+        pair, synthetic = crops.batch(args.batch + args.joint)
+        clean, noisy = pair[: args.batch, 0], pair[: args.batch, 1]
+        synthetic = synthetic[: args.batch].view(-1, 1, 1)
         g = gains(clean)
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
             noisy = torch.where(synthetic, under_noise(clean), noisy)
         loss = loss_of(bench_raw.mosaiced(cleaned(noisy)), clean)
         if args.joint:
-            truth = bench_raw.full_colour(crops.batch(args.joint)[0][:, 0])
+            truth = bench_raw.full_colour(pair[args.batch :, 0])
             truth = truth * gains(bench_raw.mosaiced(truth))[:, None]
             loss = loss + picture_loss(cleaned(under_noise(bench_raw.mosaiced(truth))), truth)
         optimizer.zero_grad(set_to_none=True)
