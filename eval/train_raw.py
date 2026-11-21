@@ -317,14 +317,16 @@ def bright(clean_up):
 
 
 @torch.no_grad()
-def denoise(model, mosaic, tile=1024, overlap=64):
+def denoise(model, mosaic, tile=1024, overlap=64, window=None):
     """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
     The photo's mean sets the gain, as a crop's does in training, and tile_gain() holds it down for a
     tile with a light in it. Tiles then differ in gain, so they fade into each other over
     the middle half of what they share; the last row and column of tiles sit flush with the far edge.
-    Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model.
+    Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model. With window (y, x, height,
+    width) only the tiles that reach it run and only it comes back, the same pixels the whole photo gives.
     """
+    top, left, height, width = window or (0, 0, *mosaic.shape)
     gain = float(np.clip(LEVEL / max(float(mosaic.mean()), 1e-6), 1, MAX_GAIN))
     padded = np.pad(mosaic, overlap, "reflect")
     out = np.zeros((3, *padded.shape) if joint(model) else padded.shape, padded.dtype)
@@ -332,9 +334,10 @@ def denoise(model, mosaic, tile=1024, overlap=64):
     inward = np.minimum(np.arange(tile), np.arange(tile)[::-1]) + 0.5
     fade = np.clip((inward - overlap / 2) / overlap, 0, 1).astype(padded.dtype)
     fade = np.outer(fade, fade)
-    starts = lambda side: sorted({*range(0, side - tile, tile - 2 * overlap), side - tile})
-    for y in starts(padded.shape[0]):
-        for x in starts(padded.shape[1]):
+    every = lambda side: sorted({*range(0, side - tile, tile - 2 * overlap), side - tile})
+    starts = lambda side, at, span: [s for s in every(side) if s < at + span + overlap and at + overlap < s + tile]
+    for y in starts(padded.shape[0], top, height):
+        for x in starts(padded.shape[1], left, width):
             piece = padded[y : y + tile, x : x + tile]
             own = tile_gain(piece, gain)
             shown = torch.from_numpy(np.ascontiguousarray(piece * own)).cuda()[None]
@@ -342,7 +345,8 @@ def denoise(model, mosaic, tile=1024, overlap=64):
                 result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()
             out[..., y : y + tile, x : x + tile] += result / own * fade
             weight[y : y + tile, x : x + tile] += fade
-    return out[..., overlap:-overlap, overlap:-overlap] / weight[overlap:-overlap, overlap:-overlap]
+    kept = slice(top + overlap, top + overlap + height), slice(left + overlap, left + overlap + width)
+    return out[(..., *kept)] / weight[kept]
 
 
 class Crops:
