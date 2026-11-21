@@ -48,6 +48,13 @@ that truth is 224 px, as without either. --perceptual 0.05 adds LPIPS, at that w
 picture and its truth, both developed as bench_raw.py looks at them: it is there to make the picture
 look closer to the truth where L1 settles for a blur, and the truth is all it can pull towards.
 
+--teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
+trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
+against its picture, times --distil. Its picture is steadier than the truth, which keeps most of its
+own frame's noise, and on --batch's crops it is the one target for the two colours in three a camera
+did not measure. It is not compiled: without gradients it costs the CPU little to hand over, and a
+recorded graph would keep its memory beside the trained network's. A run without --teacher is what it was.
+
 denoise() scales a whole photo by one gain, so a lamp-lit part of a dark photo reaches the network
 tens of times brighter than any crop in training, which a model answers with garbage. Two cures, to
 compare: denoise() now holds each tile's gain down until no block of BLOCK px in it is brighter than
@@ -656,6 +663,9 @@ def main(args):
         schedule.load_state_dict(state["schedule"])
         step = state["step"]
     compiled = torch.compile(model, mode="reduce-overhead", dynamic=False)
+    teacher = trained(args.teacher).to(memory_format=torch.channels_last) if args.teacher else None
+    if teacher and not (args.joint and joint(teacher)):
+        raise SystemExit("--teacher is a joint model's weights, for a --joint run")
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
@@ -684,6 +694,11 @@ def main(args):
         with torch.autocast("cuda", torch.bfloat16):
             return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
 
+    @torch.no_grad()
+    def taught(noisy):
+        with torch.autocast("cuda", torch.bfloat16):
+            return made(teacher, teacher(fed(teacher, noisy).contiguous(memory_format=torch.channels_last)).float())
+
     while step < args.steps:
         pair, synthetic = crops.batch(args.batch if big else args.batch + args.joint)
         alone = big.batch(args.joint)[0][:, 0] if big else pair[args.batch :, 0]
@@ -693,13 +708,20 @@ def main(args):
         clean, noisy = clean * g, noisy * g
         if synthetic.any():
             noisy = torch.where(synthetic, under_noise(clean), noisy)
-        loss = loss_of(bench_raw.mosaiced(cleaned(at_white(noisy, g))), clean)
+        noisy = at_white(noisy, g)
+        picture = cleaned(noisy)
+        loss = loss_of(bench_raw.mosaiced(picture), clean)
+        if teacher:
+            loss = loss + args.distil * picture_loss(picture, taught(noisy))
         if args.joint:
             truth = bench_raw.full_colour(alone, args.bin)
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
-            picture = cleaned(at_white(under_noise(bench_raw.mosaiced(truth)), g))
+            noisy = at_white(under_noise(bench_raw.mosaiced(truth)), g)
+            picture = cleaned(noisy)
             loss = loss + picture_loss(picture, truth)
+            if teacher:
+                loss = loss + args.distil * picture_loss(picture, taught(noisy))
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
         optimizer.zero_grad(set_to_none=True)
@@ -807,4 +829,6 @@ if __name__ == "__main__":
     parser.add_argument("--bin", type=int, default=2, choices=(2, 4), help="sensor pixels a side to one of the truth")
     parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
     parser.add_argument("--bright", type=float, default=0, help="share of crops shown as a lit part of a dark photo")
+    parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
+    parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
     main(parser.parse_args())
