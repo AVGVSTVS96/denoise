@@ -111,6 +111,8 @@ def shots():
     table = {}
     for file in bench_raw.BENCH.rglob("*.npz"):
         data = np.load(file)
+        if "isos" not in data:
+            continue
         camera = file.stem.split("--")[-1]
         camera = camera if camera in known else camera.rsplit("-", 1)[0]
         for iso, mean in zip(data["isos"].tolist(), data["means"].tolist()):
