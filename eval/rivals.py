@@ -36,6 +36,11 @@ so it goes through the same bilinear demosaic as the clean frame and as ours: th
 On bench_raw.py's full-colour tests, "<camera>-colour" and "shift", a rival gets one row: its own
 picture against truth no demosaic made, or its mosaic through the bilinear demosaic.
 
+On the night test a rival gets its like-for-like row alone, "<name>-cfa" for one that puts out a
+picture, and is fed each frame as shot, with no gain: none of these apps brightens a photo before its network.
+
+    uv run rivals.py night rawforge-jdd darktable             the night test alone
+
 A model of ours gets "<name>-x8", the mean over the mosaic's eight flips and turns.
 """
 
@@ -104,19 +109,35 @@ def shots():
     """Every test frame's Shot by its mean, which is all bench_raw hands a cleaner beside the pixels.
 
     A Shot is what a rival's own app knows of a frame: its ISO, the camera's matrix from XYZ to its
-    own colour, and its black level over its white level.
+    own colour, and its black level over its white level, which a night pair's file carries itself.
+    A frame scored on its black offset comes with that added to its mean, so it is listed under
+    those means too.
     """
     known = json.loads((RIVALS / "cameras.json").read_text())
     table = {}
     for file in bench_raw.BENCH.rglob("*.npz"):
         data = np.load(file)
-        if "isos" not in data:
+        if "iso" in data:
+            taken = [(int(data["iso"]), float(data["mean"]))]
+            black = float(data["black_over_white"])
+            facts = {"camera_from_xyz": data["camera_from_xyz"].tolist(), "black_over_white": black}
+        elif "isos" in data:
+            taken = list(zip(data["isos"].tolist(), data["means"].tolist()))
+            camera = file.stem.split("--")[-1]
+            facts = known[camera if camera in known else camera.rsplit("-", 1)[0]]
+        else:
             continue
-        camera = file.stem.split("--")[-1]
-        camera = camera if camera in known else camera.rsplit("-", 1)[0]
-        for iso, mean in zip(data["isos"].tolist(), data["means"].tolist()):
-            table[mean] = Shot(iso, **known[camera])
+        lifts = data["offsets"].mean(1) if "offsets" in data else np.zeros(len(taken))
+        fixed = lifts - data["fixes"].mean(1) if "fixes" in data else lifts
+        for (iso, mean), lift, left in zip(taken, lifts, fixed):
+            for as_scored in (mean, mean + float(lift), mean + float(left)):
+                table[as_scored] = Shot(iso, **facts)
     return table
+
+
+def shot(mean):
+    """The Shot of the test frame scored under a mean, to the rounding it was added up with."""
+    return shots()[min(shots(), key=lambda listed: abs(listed - mean))]
 
 
 def source(path, **stubs):
@@ -214,9 +235,9 @@ def rawforge(file):
     model = torch.jit.load(str(RIVALS / "rawforge" / file), map_location="cuda").eval()
 
     def clean_up(mosaics, mean):
-        shot = shots()[mean]
-        pictures, matrix = rec2020(mosaics, shot.camera_from_xyz)
-        told = mosaics.new_tensor([[min(shot.iso, 65535) / 6400]]).half()
+        taken = shot(mean)
+        pictures, matrix = rec2020(mosaics, taken.camera_from_xyz)
+        told = mosaics.new_tensor([[min(taken.iso, 65535) / 6400]]).half()
         with torch.autocast("cuda", torch.float16):
             cleaned = torch.cat([model(part, told.expand(len(part), 1)) for part in pictures.half().split(4)])
         return torch.einsum("ij,njhw->nihw", torch.linalg.inv(matrix), cleaned.float())
@@ -229,7 +250,7 @@ def rawforge_jdd():
     model = torch.jit.load(str(RIVALS / "rawforge" / file), map_location="cuda").eval()
 
     def clean_up(mosaics, mean):
-        black = max(shots()[mean].black_over_white, 1 / 32)
+        black = max(shot(mean).black_over_white, 1 / 32)
         sites = mosaics.new_zeros(3, *mosaics.shape[1:])
         sites[0, 0::2, 0::2] = sites[1, 0::2, 1::2] = sites[1, 1::2, 0::2] = sites[2, 1::2, 1::2] = 1
         with_black = (mosaics * (1 - black) + black).clamp(0, 1)
@@ -357,30 +378,33 @@ def rows(spec):
     return {spec: first, f"{spec}-cfa": second}, clean_up
 
 
-def main(specs):
+def main(specs, only=""):
     def add(test, name, by_iso):
         table = json.loads(BOARD.read_text()) if BOARD.exists() else {}
         table.setdefault(test, {})[name] = by_iso
         BOARD.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
         BOARD.with_suffix(".tmp").rename(BOARD)
         cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
-        print(f"{test:16}{name:20}" + "".join(f"{p:8.2f} {d:.3f}" for p, d in cells), flush=True)
+        print(f"{test:24}{name:20}" + "".join(f"{row[0]:8.2f} {row[1]:.3f}" for row in cells), flush=True)
 
     for spec in specs:
         cleaners, own = rows(spec)
-        for camera in (*bench_raw.CAMERAS, *bench_raw.groups(), "exact"):
+        for camera in (*bench_raw.CAMERAS, *bench_raw.groups(), "exact") if not only else ():
             tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned")
             for name, clean_up in cleaners.items():
                 for test, by_iso in zip(tests, bench_raw.scores(clean_up, camera, with_lpips=True)):
                     add(test, name, by_iso)
-        for camera in (*bench_raw.CAMERAS, *bench_raw.groups()) if own else ():
-            add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", with_lpips=True)[0])
-        if own:
-            add("shift", spec, bench_raw.scores(own, "shift", with_lpips=True)[0])
+        for camera in (*bench_raw.CAMERAS, *bench_raw.groups()) if own and not only else ():
+            add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", True, with_detail=True)[0])
+        if own and not only:
+            add("shift", spec, bench_raw.scores(own, "shift", True, with_detail=True)[0])
+        name = f"{spec}-cfa" if spec in PICTURES else spec
+        for test, by_gain in bench_raw.night(name, own).items() if own else ():
+            add(test, name, by_gain)
 
 
 if __name__ == "__main__":
     if sys.argv[1:] in (["cameras"], ["fetch"]):
         {"cameras": cameras, "fetch": fetch}[sys.argv[1]]()
     else:
-        main(sys.argv[1:])
+        main(sys.argv[1:][sys.argv[1] == "night" :], "night" * (sys.argv[1] == "night"))

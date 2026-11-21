@@ -40,7 +40,8 @@ mosaic, with noise laid over it, and the loss on all three colours of every pixe
 loss on the picture sampled where the camera measured: binning a real noisy frame would average its
 noise away, and its clean twin is a mosaic too. A joint run saves joint.pth and logs
 bench_raw.py's full-colour scores beside the others, which are of its picture sampled back to a mosaic,
-with LPIPS for them: those two are what a joint run is picked by.
+with LPIPS for them, and with how much of the truth's fine detail the picture holds and how much it
+made up (bench_raw.detail), as "kept" and "invented": a run that trains on LPIPS is picked by those, not by LPIPS.
 
 Three settings change what the joint crops teach, each on its own so runs compare. A second number
 after --size, as in --size 448 896, takes the joint crops at that size from raw_pairs.py's bigger
@@ -87,6 +88,9 @@ windows resampled onto the noisy ones, the ones to pick by; the others are what 
 The "as shot" ones leave each noisy frame on its black offset, as a photo comes from the camera, and
 the "as shot fixed" ones take off what blacks.py knows the body's offsets to be, as raw_denoise.py does.
 run.json beside the log keeps the run's settings.
+
+--held data/bench/night/held.json leaves the scenes that file names out of training: the ones
+bench_raw.py's night test scores, which a model has to meet for the first time there.
 """
 
 import argparse
@@ -670,15 +674,17 @@ def gains(clean, lit=0.0):
     return gain.view(-1, 1, 1)
 
 
-def scenes(split, pattern, folder=PAIRS):
+def scenes(split, pattern, folder=PAIRS, left_out=()):
     """Each scene's name, and its json's list of real noisy frames, empty for a scene of clean frames only.
 
-    A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out.
+    A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out,
+    and so does one that left_out names.
     """
     found, stale = {}, 0
     for meta in sorted(folder.glob("*.json")):
         info = json.loads(meta.read_text())
-        if info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.with_suffix(".npy").exists():
+        wanted = info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.stem not in left_out
+        if wanted and meta.with_suffix(".npy").exists():
             if raw_pairs.twinned(info):
                 found[meta.stem] = info["frames"]
             else:
@@ -686,6 +692,11 @@ def scenes(split, pattern, folder=PAIRS):
     if stale:
         print(f"{stale} {split} scenes left out for want of clean twins: rerun raw_pairs.py", flush=True)
     return found
+
+
+def mean_of(by_iso, part, digits):
+    """One part of a test's rows, bench_raw.scores's {ISO: [PSNR, LPIPS, ...]}, as its mean over the ISOs."""
+    return round(float(np.mean([row[part] for row in by_iso.values()])), digits)
 
 
 @torch.no_grad()
@@ -758,9 +769,10 @@ def main(args):
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
+    left_out = frozenset(json.loads(pathlib.Path(args.held).read_text())) if args.held else ()
 
     def training(*folder):
-        found = scenes("train", args.scenes, *folder)
+        found = scenes("train", args.scenes, *folder, left_out=left_out)
         return {**found, **scenes("night", args.scenes, *folder)} if args.night else found
 
     train = training()
@@ -840,8 +852,8 @@ def main(args):
             clean_up = cleaner(average.module)
             bench, aligned, shot, fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "gr3")
             seen, seen_aligned, seen_shot, seen_fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "seen")
-            mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
-            mean_lpips = lambda by_iso: round(float(np.mean([distance for _, distance in by_iso.values()])), 4)
+            mean_psnr = lambda by_iso: mean_of(by_iso, 0, 3)
+            mean_lpips = lambda by_iso: mean_of(by_iso, 1, 4)
             line = {
                 "step": step,
                 "loss": round(running.item() / args.check, 5),
@@ -865,15 +877,19 @@ def main(args):
             line |= {"bright_flats": [round(error, 4) for error in lit["flats"]]}
             line |= {"bright_tiles": round(lit["tiles"], 4)} if "tiles" in lit else {}
             if args.joint:
-                colour = bench_raw.scores(clean_up, "colour/gr3", with_lpips=True)[0]
-                seen_colour = bench_raw.scores(clean_up, "colour/seen", with_lpips=True)[0]
+                colour = bench_raw.scores(clean_up, "colour/gr3", with_lpips=True, with_detail=True)[0]
+                seen_colour = bench_raw.scores(clean_up, "colour/seen", with_lpips=True, with_detail=True)[0]
                 line |= {
                     "gr3_colour": mean_psnr(colour),
-                    "gr3_colour_by_iso": [round(psnr, 3) for psnr, _ in colour.values()],
+                    "gr3_colour_by_iso": [round(row[0], 3) for row in colour.values()],
                     "seen_colour": mean_psnr(seen_colour),
                     "gr3_colour_lpips": mean_lpips(colour),
-                    "gr3_colour_lpips_by_iso": [round(distance, 4) for _, distance in colour.values()],
+                    "gr3_colour_lpips_by_iso": [round(row[1], 4) for row in colour.values()],
                     "seen_colour_lpips": mean_lpips(seen_colour),
+                    "gr3_colour_kept": mean_of(colour, 2, 4),
+                    "gr3_colour_invented": mean_of(colour, 3, 4),
+                    "seen_colour_kept": mean_of(seen_colour, 2, 4),
+                    "seen_colour_invented": mean_of(seen_colour, 3, 4),
                 }
             print(json.dumps(line), flush=True)
             log.write(json.dumps(line) + "\n")
@@ -944,4 +960,5 @@ if __name__ == "__main__":
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
+    parser.add_argument("--held", help="a list of scenes to leave out of training, as bench_raw.py night writes")
     main(parser.parse_args())
