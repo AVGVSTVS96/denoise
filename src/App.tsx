@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
-import { modelBytes } from "./model";
 import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
 import type { FromWorker } from "./worker";
@@ -15,7 +14,9 @@ type Job = {
   width: number;
   height: number;
   stage: "decode" | "model" | "clean" | "done";
+  raw?: boolean;
   loaded: number;
+  modelBytes: number;
   done: number;
   total: number;
   startedAt: number;
@@ -79,6 +80,7 @@ export function App() {
           height: 0,
           stage: "decode",
           loaded: 0,
+          modelBytes: 0,
           done: 0,
           total: 0,
           startedAt: performance.now(),
@@ -92,15 +94,26 @@ export function App() {
         .then((l) => (lock = l))
         .catch(() => {});
       let size = { width: 0, height: 0 };
+      let onDevice = "on-device";
       w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
         switch (data.type) {
           case "start":
             size = { width: data.width, height: data.height };
-            setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
+            onDevice = data.raw ? "on-device-raw" : "on-device";
+            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw, stage: "model" });
+
+            return;
+          case "original":
+            setJob((j) => {
+              if (!j) return j;
+              URL.revokeObjectURL(j.original);
+
+              return { ...j, original: URL.createObjectURL(data.blob) };
+            });
 
             return;
           case "model":
-            setJob((j) => j && { ...j, loaded: data.loaded });
+            setJob((j) => j && { ...j, loaded: data.loaded, modelBytes: data.total });
 
             return;
           case "progress":
@@ -127,7 +140,7 @@ export function App() {
             setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
 
             if (sharing())
-              share(file, data.blob, { model: key ? MODELS[model].id : "on-device", ...size }).catch(() => {});
+              share(file, data.blob, { model: key ? MODELS[model].id : onDevice, ...size }).catch(() => {});
 
             if (key) {
               setJob((j) => j && { ...j, saving: "saving" });
@@ -171,6 +184,7 @@ export function App() {
           height: cleaned.height,
           stage: "done",
           loaded: 0,
+          modelBytes: 0,
           done: 1,
           total: 1,
           startedAt: 0,
@@ -431,7 +445,7 @@ function Editor({
   useEffect(() => {
     const prefix = {
       decode: "",
-      model: job.loaded ? `${Math.round((job.loaded / modelBytes) * 100)}% model · ` : "",
+      model: job.loaded ? `${Math.round((job.loaded / job.modelBytes) * 100)}% model · ` : "",
       clean: `${Math.round((job.done / job.total) * 100)}% · `,
       done: "Done · ",
     }[job.stage];
@@ -441,7 +455,7 @@ function Editor({
     return () => {
       document.title = "denoise";
     };
-  }, [job.stage, job.done, job.total, job.loaded]);
+  }, [job.stage, job.done, job.total, job.loaded, job.modelBytes]);
 
   const dragOver = (e: React.PointerEvent, box: Element) => {
     if (!done || (e.type === "pointermove" && e.buttons === 0)) return;
@@ -576,7 +590,7 @@ function Progress({ job, error }: { job: Job; error?: string }) {
       : job.stage === "clean"
         ? job.done / job.total
         : job.stage === "model"
-          ? (job.loaded / modelBytes) * 0.999
+          ? (job.loaded / job.modelBytes) * 0.999
           : 0;
 
   return (
@@ -601,8 +615,8 @@ function status(job: Job) {
     case "model":
       if (job.cloud) return `Sending to ${job.cloud}…`;
 
-      return job.loaded > 0 && job.loaded < modelBytes
-        ? `Model · ${mb(job.loaded)} / ${mb(modelBytes)} MB`
+      return job.loaded > 0 && job.loaded < job.modelBytes
+        ? `Model · ${mb(job.loaded)} / ${mb(job.modelBytes)} MB`
         : "Starting the GPU…";
     case "clean": {
       const left =

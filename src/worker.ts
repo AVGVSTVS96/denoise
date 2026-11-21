@@ -1,11 +1,14 @@
 import * as ort from "onnxruntime-web/webgpu";
 import * as cloud from "./cloud";
-import { rawPreview } from "./dng";
-import { loadModel } from "./model";
+import { blackOffsets } from "./blacks";
+import { rawPhoto, rawPreview, type Raw } from "./dng";
+import { loadModel, models, type ModelKind } from "./model";
+import { clean, CORE, PIECE } from "./raw";
 
 export type FromWorker =
-  | { type: "model"; loaded: number }
-  | { type: "start"; width: number; height: number }
+  | { type: "model"; loaded: number; total: number }
+  | { type: "start"; width: number; height: number; raw: boolean }
+  | { type: "original"; blob: Blob }
   | { type: "tile"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
   | { type: "done"; blob: Blob }
@@ -15,7 +18,7 @@ const TILE = 512;
 const OVERLAP = 64;
 const MAX_PIXELS = 16_000_000;
 
-let session: Promise<ort.InferenceSession> | undefined;
+const sessions = new Map<ModelKind, Promise<ort.InferenceSession>>();
 
 const post = (msg: FromWorker, transfer: Transferable[] = []) => postMessage(msg, { transfer });
 
@@ -48,19 +51,23 @@ async function requestDevice() {
   });
 }
 
-function getSession() {
-  session ??= (async () => {
-    const device = await requestDevice();
-    const model = await loadModel((loaded) => post({ type: "model", loaded }));
+function getSession(kind: ModelKind) {
+  const made =
+    sessions.get(kind) ??
+    (async () => {
+      const device = await requestDevice();
+      const model = await loadModel(kind, (loaded) => post({ type: "model", loaded, total: models[kind].bytes }));
 
-    return ort.InferenceSession.create(model, {
-      executionProviders: [{ name: "webgpu", preferredLayout: "NCHW", device }],
-      graphOptimizationLevel: "all",
-    });
-  })();
-  session.catch(() => (session = undefined));
+      return ort.InferenceSession.create(model, {
+        executionProviders: [{ name: "webgpu", preferredLayout: "NCHW", device }],
+        graphOptimizationLevel: "all",
+      });
+    })();
 
-  return session;
+  sessions.set(kind, made);
+  made.catch(() => sessions.delete(kind));
+
+  return made;
 }
 
 async function decode(file: Blob) {
@@ -133,7 +140,7 @@ function flush(
 async function runCloud(file: Blob, key: string, model: cloud.Model) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H });
+  post({ type: "start", width: W, height: H, raw: false });
   const tile = Math.min(cloud.TILE, W, H);
   const overlap = Math.min(cloud.OVERLAP, tile >> 2);
   const xs = positions(W, tile, overlap);
@@ -184,9 +191,9 @@ const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
 async function run(file: Blob) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H });
+  post({ type: "start", width: W, height: H, raw: false });
   const src = ctx.getImageData(0, 0, W, H).data;
-  const sess = await getSession();
+  const sess = await getSession("photo");
   const xs = positions(W);
   const ys = positions(H);
   const total = xs.length * ys.length;
@@ -248,8 +255,107 @@ async function run(file: Blob) {
   post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
 }
 
+const TURNS = [
+  [1, 0, 0, 1, 0, 0],
+  [-1, 0, 0, 1, 1, 0],
+  [-1, 0, 0, -1, 1, 1],
+  [1, 0, 0, -1, 0, 1],
+  [0, 1, 1, 0, 0, 0],
+  [0, 1, -1, 0, 1, 0],
+  [0, -1, -1, 0, 1, 1],
+  [0, -1, 1, 0, 0, 1],
+];
+
+function upright(orientation: number, width: number, height: number) {
+  const [a, b, c, d, e, f] = TURNS[orientation - 1] ?? TURNS[0];
+  const turned = a === 0;
+  const canvas = new OffscreenCanvas(turned ? height : width, turned ? width : height);
+  const ctx = canvas.getContext("2d");
+
+  ctx?.fillRect(0, 0, 1, 1);
+
+  if (!ctx || ctx.getImageData(0, 0, 1, 1).data[3] !== 255) return;
+  ctx.setTransform(a, b, c, d, e * canvas.width, f * canvas.height);
+
+  return { canvas, ctx };
+}
+
+async function originalUpright(file: Blob, raw: Raw) {
+  const preview = raw.orientation > 1 && (await rawPreview(file));
+
+  if (!preview) return;
+  const bitmap = await createImageBitmap(preview);
+  const made = upright(raw.orientation, bitmap.width, bitmap.height);
+
+  if (!made) return;
+  made.ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  post({ type: "original", blob: await made.canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 }) });
+}
+
+async function runRaw(file: Blob, raw: Raw) {
+  const { crop } = raw;
+  const fitted = Math.floor(CORE * Math.sqrt(MAX_PIXELS / (crop.width * crop.height))) / CORE;
+  const full = upright(raw.orientation, crop.width, crop.height);
+  const scale = full ? 1 : fitted;
+  const fit = (side: number) => Math.floor(side * scale) - 1;
+  const made = full ?? upright(raw.orientation, fit(crop.width), fit(crop.height));
+
+  if (!made) throw new Error("This photo is too large for this browser.");
+  const { canvas, ctx } = made;
+  const { width: W, height: H } = canvas;
+  post({ type: "start", width: W, height: H, raw: true });
+  originalUpright(file, raw).catch(() => {});
+  const turn = ctx.getTransform();
+  const dx = Math.ceil(crop.x * scale);
+  const dy = Math.ceil(crop.y * scale);
+  ctx.imageSmoothingEnabled = scale < 1;
+  ctx.imageSmoothingQuality = "high";
+  const scratch = new OffscreenCanvas(PIECE, PIECE);
+  const held = scratch.getContext("2d")!;
+  const [sess, offsets] = await Promise.all([getSession("raw"), blackOffsets(raw.body, raw.iso)]);
+
+  const network = async (planes: Float32Array, height: number, width: number) => {
+    const result = await sess.run({ [sess.inputNames[0]]: new ort.Tensor("float32", planes, [1, 4, height, width]) });
+    const tensor = result[sess.outputNames[0]];
+    // SAFETY: the model's output is declared float32 in its ONNX graph.
+    const out = (await tensor.getData()) as Float32Array;
+    tensor.dispose();
+
+    return out;
+  };
+
+  post({ type: "progress", done: 0, total: 1 });
+
+  await clean(raw, offsets, models.raw.brightest, network, (piece, done, total) => {
+    held.putImageData(new ImageData(piece.pixels, piece.width, piece.height), 0, 0);
+    const x = (piece.x + crop.x) * scale - dx;
+    const y = (piece.y + crop.y) * scale - dy;
+    const w = piece.width * scale;
+    const h = piece.height * scale;
+    ctx.drawImage(scratch, 0, 0, piece.width, piece.height, x, y, w, h);
+    const from = turn.transformPoint({ x, y });
+    const to = turn.transformPoint({ x: x + w, y: y + h });
+    const left = Math.max(0, Math.round(Math.min(from.x, to.x)));
+    const top = Math.max(0, Math.round(Math.min(from.y, to.y)));
+    const right = Math.min(W, Math.round(Math.max(from.x, to.x)));
+    const bottom = Math.min(H, Math.round(Math.max(from.y, to.y)));
+    const { data } = ctx.getImageData(left, top, right - left, bottom - top);
+    post({ type: "tile", x: left, y: top, w: right - left, h: bottom - top, pixels: data }, [data.buffer]);
+    post({ type: "progress", done, total });
+  });
+
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+}
+
+async function runOnDevice(file: Blob) {
+  const raw = await rawPhoto(file).catch(() => undefined);
+
+  return raw ? runRaw(file, raw) : run(file);
+}
+
 onmessage = (e: MessageEvent<{ file: Blob; key?: string; model: cloud.Model }>) => {
-  (e.data.key ? runCloud(e.data.file, e.data.key, e.data.model) : run(e.data.file)).catch((err: Error) =>
+  (e.data.key ? runCloud(e.data.file, e.data.key, e.data.model) : runOnDevice(e.data.file)).catch((err: Error) =>
     post({ type: "error", message: err.message }),
   );
 };
