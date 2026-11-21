@@ -18,13 +18,16 @@ camera's own scenes (named <profile>-..., as ir-gr3-inbi is for gr3.json) keep t
 frames. Each crop is scaled to a set brightness first, the same way denoise() scales a photo, so dark
 night frames look like any other.
 
-Four settings bring the made-up noise closer to a real camera's, each on its own so runs compare:
+Five settings bring the made-up noise closer to a real camera's, each on its own so runs compare:
 --levels data/noise/cameras.json draws two thirds of its levels as whole rows, one camera at one ISO
 as fit_noise.py measured it, in place of levels drawn apart; --offsets leaves each colour plane on the black offset
 a real frame sits on, for the network to take off, in made-up noise and in the real noisy frames,
 which raw_pairs.py stores with theirs taken off; --tails gives the read noise a real sensor's long
 tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
-noise for windows of real dark frames (dark_bank.py).
+noise for windows of real dark frames (dark_bank.py); --mixing makes neighbouring pixels' noise move
+together as far as fit_noise.py measured it to in the row --levels drew, at the same strength, which
+is what a camera that smooths its raw files hands over: the Ricohs and Pentaxes at every ISO, Canons
+and Sonys at their highest.
 
 --joint 16 trains the joint model instead, which denoises and demosaics in one pass: packed RGGB in,
 camera RGB at the mosaic's full size out, the picture a user looks at. It is the same network with
@@ -134,6 +137,8 @@ OFFSET_SHARED, OFFSET_OWN = 0.3, 0.1
 TAILS = (0.0, 0.2)
 READ_COUNTS = (1, 300)
 MOST_BANDING = 0.3
+TAPS = 7
+NEXT_GREEN = (((0, 1, 0, -1), (0, 2, -1, 0)), ((3, 2, 0, 1), (3, 1, 1, 0)))
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -485,8 +490,50 @@ def measured(path):
     return found if isinstance(found, list) else list(found["iso"].values())
 
 
-def table(rows):
-    """Rows of noise levels on the GPU: shot, read, offset and tail per colour plane (rows, 4), the rest (rows,).
+def mixers(rows):
+    """Each row's filter (rows, 4, 4, TAPS, TAPS) that mixes white noise over the colour planes into noise
+    whose neighbours move together as far as fit_noise.py measured: red and blue with each green that
+    touches them, each plane with its next pixel across and down, and nothing else. A red or a blue
+    pixel has a green on all four sides: NEXT_GREEN lists, for red and then for blue, its plane, each
+    green plane, and how many cells down and across the green on the other side sits, the first being
+    in its own cell.
+
+    Those correlations are a covariance between the planes at each lag, and the filter is its square
+    root, taken where a root of one is plain, frequency by frequency, over TAPS pixels of a plane a
+    side. Correlations no noise could have all at once lose what is impossible there, and every
+    plane's taps are brought back to unit strength, so mixing never changes how strong the noise is.
+    A row that lacks them gets none.
+    """
+    part = lambda key, planes: np.array([row.get(key, [0.0] * planes) for row in rows])
+    beside, across, down = part("beside", 2), part("across", 4), part("down", 4)
+    wanted = np.zeros((len(rows), 4, 4, TAPS, TAPS))
+    planes = np.arange(4)
+    wanted[:, planes, planes, 0, 0] = 1
+    wanted[:, planes, planes, 0, 1] = wanted[:, planes, planes, 0, -1] = across
+    wanted[:, planes, planes, 1, 0] = wanted[:, planes, planes, -1, 0] = down
+    for sides, alike in zip(NEXT_GREEN, beside.T):
+        for colour, green, cells_down, cells_across in sides:
+            for y, x in ((0, 0), (cells_down, cells_across)):
+                wanted[:, colour, green, y, x] = wanted[:, green, colour, -y, -x] = alike
+    size, turn = np.linalg.eigh(np.fft.fft2(wanted).transpose(0, 3, 4, 1, 2))
+    root = (turn * np.sqrt(size.clip(min=0))[..., None, :]) @ turn.conj().swapaxes(-1, -2)
+    taps = np.fft.fftshift(np.fft.ifft2(root.transpose(0, 3, 4, 1, 2)).real, axes=(-2, -1))
+    return (taps / np.sqrt((taps**2).sum((2, 3, 4), keepdims=True))).astype(np.float32)
+
+
+def mixed(unit, taps):
+    """Unit-strength noise (N, H, W), each mosaic's colour planes run through its filter of mixers().
+
+    A plane's edges meet round the back, so the noise at an edge is as strong and as mixed as elsewhere.
+    """
+    n, h, w = unit.shape
+    planes = torch.nn.functional.pad(pack(unit), [TAPS // 2] * 4, "circular").flatten(0, 1)[None]
+    return unpack(torch.nn.functional.conv2d(planes, taps.flatten(0, 1), groups=n).view(n, 4, h // 2, w // 2))
+
+
+def table(rows, mixing=False):
+    """Rows of noise levels on the GPU: shot, read, offset and tail per colour plane (rows, 4), the rest (rows,),
+    and with mixing each row's filter of mixers().
 
     A row is one camera at one ISO, in normalised raw units. One that lacks a part gets none of it: no
     banding, no offset, a bell curve, no rounding. Banding is what a row's lines carry beyond its
@@ -504,7 +551,8 @@ def table(rows):
         "tail": [planes(row.get("tail", BELL)) for row in rows],
         "step": [row.get("step", 0.0) for row in rows],
     }
-    return {part: torch.tensor(values, device="cuda") for part, values in parts.items()}
+    found = {part: torch.tensor(values, device="cuda") for part, values in parts.items()}
+    return found | {"mix": torch.tensor(mixers(rows), device="cuda")} if mixing else found
 
 
 def drawn(n, device, levels, share):
@@ -515,7 +563,9 @@ def drawn(n, device, levels, share):
     3,000 electrons at LEVEL down to FLOOR, with half to eight electrons of read noise (the GR IIIx has
     about 3), an offset of a fraction of the read noise, part shared by the colour planes and part each
     plane's own, and read noise of 1 to 300 raw counts. The ladders the table is fitted on start
-    around ISO 800, so the made-up rows are what covers a nearly clean photo.
+    around ISO 800, so the made-up rows are what covers a nearly clean photo. A made-up row has no
+    mixing of its own and keeps that of the table's row it stands in for, so it draws from the table's
+    spread, where most rows have none.
     """
     shot = spread(n, device, LEVEL / 3000, LEVEL / FLOOR)
     read = shot * spread(n, device, 0.5, 8)
@@ -534,9 +584,10 @@ def drawn(n, device, levels, share):
     row = {part: values[pick] for part, values in levels.items()}
     dim = torch.minimum(spread(n, device, 1, 16), LEVEL / (FLOOR * row["shot"].mean(1))).clamp(min=1)
     each = lambda values: (n, *[1] * (values.dim() - 1))
-    row = {part: values if part == "tail" else values * dim.view(each(values)) for part, values in row.items()}
+    unscaled = lambda part, values: values if part in ("tail", "mix") else values * dim.view(each(values))
+    row = {part: unscaled(part, values) for part, values in row.items()}
     measured = torch.rand(n, device=device) < share
-    return {part: torch.where(measured.view(each(values)), values, made_up[part]) for part, values in row.items()}
+    return row | {part: torch.where(measured.view(each(values)), row[part], values) for part, values in made_up.items()}
 
 
 def long_tailed(like, tail):
@@ -557,20 +608,30 @@ def made_up_noise(clean, row, offsets, tails, darks):
 
     With tails the read noise is long-tailed and the result rounded to the raw's steps, with offsets
     each colour plane keeps its black offset, and with a dark bank some crops get a window of a real
-    dark frame, at the row's read level, in place of made-up read noise, banding and offset.
+    dark frame, at the row's read level, in place of made-up read noise, banding and offset. A row
+    with a mixing filter has its shot and read noise, a dark frame's too, run through it: each
+    pixel's is brought to unit strength first and scaled back after, so banding and offset stay as
+    they are and no pixel's noise changes strength.
     """
     n, device = clean.shape[0], clean.device
     shot, read = sites(row["shot"], clean), sites(row["read"], clean)
     unit = long_tailed(clean, row["tail"]) if tails else torch.randn_like(clean)
-    dark = unit * read + torch.randn(n, clean.shape[1], 1, device=device) * row["row"].view(n, 1, 1)
+    banding = torch.randn(n, clean.shape[1], 1, device=device) * row["row"].view(n, 1, 1)
     lift = row["offset"]
     if darks:
         fields, lifts = darks
         frame, real = windows(fields, n, clean.shape[-1])
         swapped = torch.rand(n, device=device) < DARK_SHARE
-        dark = torch.where(swapped.view(n, 1, 1), real * read, dark)
+        unit = torch.where(swapped.view(n, 1, 1), real, unit)
+        banding = banding * ~swapped.view(n, 1, 1)
         lift = torch.where(swapped.view(n, 1), lifts[frame] * row["read"], lift)
-    noisy = torch.poisson(clean.clamp(min=0) / shot) * shot + dark + sites(lift * offsets, clean)
+    light = clean.clamp(min=0)
+    counted, dark = torch.poisson(light / shot) * shot, unit * read + banding
+    if "mix" in row:
+        strength = (light * shot + read**2).sqrt().clamp(min=1e-12)
+        counted = light + mixed((counted - light + unit * read) / strength, row["mix"]) * strength
+        dark = banding
+    noisy = counted + dark + sites(lift * offsets, clean)
     step = row["step"].view(n, 1, 1) * tails
     return torch.where(step > 0, torch.round(noisy / step.clamp(min=1e-12)) * step, noisy)
 
@@ -639,7 +700,9 @@ def main(args):
     (out / "run.json").write_text(json.dumps(vars(args)))
     camera = pathlib.Path(args.profile or NOISE / "gr3.json")
     bank = noise_bank(camera) if camera.with_suffix(".npy").exists() else None
-    levels = table(measured(args.profile or args.levels)) if args.profile or args.levels else None
+    if args.mixing and not args.levels:
+        raise SystemExit("--mixing mixes as the rows of --levels' table say")
+    levels = table(measured(args.profile or args.levels), args.mixing) if args.profile or args.levels else None
     darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
     share, rows = (1, 1) if args.profile else (BANK_SHARE, TABLE_SHARE)
     model = network(args.width, bool(args.joint)).cuda().to(memory_format=torch.channels_last)
@@ -827,6 +890,9 @@ if __name__ == "__main__":
     parser.add_argument("--offsets", action="store_true", help="noisy frames keep their black offset per colour plane")
     parser.add_argument("--tails", action="store_true", help="long-tailed read noise, rounded to the raw's steps")
     parser.add_argument("--darks", help="a bank of real dark frames for part of the read noise")
+    parser.add_argument(
+        "--mixing", action="store_true", help="neighbouring pixels' noise moves together as in --levels' rows"
+    )
     parser.add_argument(
         "--joint", type=int, default=0, help="train the joint model, on this many crops of made truth a step"
     )
