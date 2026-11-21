@@ -23,6 +23,16 @@ lowest ISO against each of its high ones, on a tripod. Most of a site's cameras 
 ladder brings few crops, and Imaging Resource's still life stays out whole, as the test. They are
 review samples, for research runs only.
 
+SID's long exposures (Chen et al., 2018) are night scenes, which training has few of: a Sony A7S II
+on a tripod for 10 or 30 s, streets under lamps and dim rooms. They are SID's truth, not clean
+frames: each was shot at its dark twin's ISO, up to 25,600, where the sensor holds 600 electrons at
+white. So only those at ISO 2,000 or less are taken, 7,500 electrons at white and more, as clean
+as the other clean frames are let in. Left out as well: the scenes bench_raw.py's night test is cut
+from, and SID's own test split, whose numbers start with 1, so a score by SID's protocol stays
+honest. They are their own split, night, which trains only when asked (train_raw.py --night).
+
+    uv run raw_pairs.py 1 0 sid          from data/sid/long, which is Sony/long of SID's Sony2025.zip
+
 A frame that turns out too noisy or not Bayer leaves <scene>.skip with its ISO and camera, so no
 worker fetches it twice.
 
@@ -70,6 +80,7 @@ BIG = DATA / "rawbig"
 NIGHT = DATA / "night-raw"
 OWN = DATA / "own" / "paths.txt"
 LADDERS = DATA / "ladders"
+SID = DATA / "sid" / "long"
 SITES = {"ir": "Imaging Resource", "pb": "Photography Blog", "epz": "ePHOTOzine", "dpreview": "DPReview"}
 #: Cameras no scene of which trains, by a part of their name on any site: bench_raw.py's unseen cameras.
 HELD_OUT = ("gr-iiix", "eos-r6", "z6-ii", "a7-iv", "a6400", "e-m1-mark-iii", "pentax-k-1", "rx100-vii", "nx500")
@@ -524,17 +535,28 @@ def ladder_scenes():
         yield f"ladder-{site}-{camera}-{scene}", lambda c=clean: c, noisy, meta
 
 
+def sid_scenes():
+    for path in sorted(SID.glob("*.ARW")):
+        scene = path.name[:5]
+        if scene[0] != "1" and not (NIGHT / "pairs" / f"sid-sony-{scene}").exists():
+            meta = {"source": "SID", "license": "research", "crops": 12, "clean_iso": 2000}
+            yield f"sid-{scene}", lambda p=path: p, [], meta
+
+
 SOURCES = {
     "pairs": lambda: [*local_scenes(), *rawnind_scenes()],
     "raise": raise_scenes,
     "pixls": pixls_scenes,
     "own": own_scenes,
     "ladders": ladder_scenes,
+    "sid": sid_scenes,
 }
 
 
 def split(name):
-    """About one RawNIND scene in ten is kept out of training to watch for overfitting."""
+    """About one RawNIND scene in ten is kept out of training to watch for overfitting, and SID's are their own split."""
+    if name.startswith("sid-"):
+        return "night"
     return "val" if name.startswith("rawnind-") and hashlib.sha1(name.encode()).digest()[0] % 10 == 0 else "train"
 
 

@@ -55,7 +55,8 @@ look closer to the truth where L1 settles for a blur, and the truth is all it ca
 colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
 mosaic. It is used as it is, at the joint truth's size: nothing is binned, so it is as sharp as the
 lens made it, which is what the network meets in a photo and binned truth, twice as sharp, is not.
-It is one camera's 104 scenes, so a quarter and no more.
+It is one camera's 104 scenes, so a quarter and no more. --night lets SID's long exposures train too
+(raw_pairs.py sid), which are kept as a split of their own so that runs without it stay as they were.
 
 --teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
 trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
@@ -757,11 +758,16 @@ def main(args):
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
-    train = scenes("train", args.scenes)
+
+    def training(*folder):
+        found = scenes("train", args.scenes, *folder)
+        return {**found, **scenes("night", args.scenes, *folder)} if args.night else found
+
+    train = training()
     crops = Crops(train, args.size[0], args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
     big = None
     if args.size[1:]:
-        wide = scenes("train", args.scenes, raw_pairs.BIG)
+        wide = training(raw_pairs.BIG)
         if not wide:
             raise SystemExit(f"no crops in {raw_pairs.BIG}: uv run raw_pairs.py 1 0 raise big")
         big = BigCrops(wide, args.size[1], args.seed + step, "*", False)
@@ -886,10 +892,10 @@ def main(args):
                 torch.save(average.module.state_dict(), out / f"step{step}.pth")
         if step % args.rescan == 0:
             # Crops raw_pairs.py finished meanwhile join in.
-            train = scenes("train", args.scenes)
+            train = training()
             crops.use(train)
             if big:
-                big.use(scenes("train", args.scenes, raw_pairs.BIG))
+                big.use(training(raw_pairs.BIG))
     torch.save(average.module.state_dict(), out / ("joint.pth" if args.joint else "faithful.pth"))
 
 
@@ -935,6 +941,7 @@ if __name__ == "__main__":
         metavar=("FOLDER", "SHARE"),
         help="a folder of truth measured in full colour, and the share of the joint crops taken from it unbinned",
     )
+    parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
     main(parser.parse_args())
