@@ -45,6 +45,14 @@ classical one (demosaic.py), white-balanced first. Its "unseen" cameras are the 
 no real noise either: a real noisy frame has no full-colour truth at its own size.
 
     uv run bench_raw.py colour                                         cut only those, into data/bench/colour
+
+"shift" is a full-colour test that was not built our way: PixelShift200's five test scenes, a Sony
+A7R III's, with every colour measured at every pixel by four shots a pixel apart (pixel_shift.py).
+Its truth is at the sharpness the lens gave, where full_colour's is binned and twice as sharp, and
+neither we nor a rival made it. The noise is made up as the "<test>-colour" tests make theirs, at
+the levels measured on the same camera's still life, and it is scored as they are.
+
+    uv run bench_raw.py shift                                          cut only those
 """
 
 import functools
@@ -57,6 +65,7 @@ import rawpy
 import torch
 
 import blacks
+import pixel_shift
 import raw_pairs
 
 BENCH = raw_pairs.DATA / "bench"
@@ -64,6 +73,7 @@ CAMERAS = {"gr3": "ricoh-gr-iii--GR3hSLI{:06d}NR0.DNG", "gr3x": "ricoh-gr-iiix--
 ISOS = (3200, 6400, 12800, 25600, 51200, 102400)
 WINDOWS = 32
 STILL_LIFES = raw_pairs.LADDERS / "ir"
+SHIFT_LADDER = STILL_LIFES / "sony-alpha-ilce-a7r-iii" / "sli"
 XYZ_FROM_SRGB = np.array(
     [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]],
     np.float32,
@@ -323,6 +333,33 @@ def build_colours():
         build_colour(f"unseen--{folder.parent.name}-{folder.name}", *ladder(folder), WINDOWS // 4)
 
 
+def build_shifts():
+    """The shift test's windows: each of pixel_shift.TEST's scenes as measured, and its mosaic under the camera's noise.
+
+    A window where something moved between the four shots is left out (pixel_shift.still).
+    """
+    path, base, isos = ladder(SHIFT_LADDER)
+    full = raw_pairs.mosaic(path(base))
+    for scene in pixel_shift.TEST:
+        picture, apart = pixel_shift.measured(scene)
+        ratios = pixel_shift.moved(picture, apart, raw_pairs.tags(pixel_shift.shot(scene))["iso"])
+        clean = mosaiced(torch.from_numpy(picture)[None])[0].numpy()
+        found = raw_pairs.corners(clean, np.random.default_rng(0), WINDOWS // 2)
+        picks = [(y, x) for y, x in found if pixel_shift.still(ratios, y, x)]
+        cut = lambda frame: pixel_shift.cut(frame, picks)
+        frames, means = under_noise(f"shift {scene}", clean, full, path, isos, cut)
+        wb, matrix = colour(pixel_shift.shot(scene))
+        save(
+            f"shift--{SHIFT_LADDER.parent.name}-{scene}",
+            truth=cut(picture).astype(np.float16),
+            frames=np.stack(frames).astype(np.float16),
+            means=means,
+            wb=wb,
+            matrix=matrix,
+            isos=isos,
+        )
+
+
 def bilinear(mosaic):
     """RGGB mosaics (N, H, W) as camera RGB (N, 3, H, W) by the plainest demosaic."""
     sites = mosaic.new_zeros(3, *mosaic.shape[1:])
@@ -458,13 +495,14 @@ def main(specs):
             for test, by_iso in zip(tests, scores(as_mosaic(clean_up), camera, with_lpips=True)):
                 table.setdefault(test, {})[name] = by_iso
         show(tests)
-    for camera in (*CAMERAS, *groups()):
-        rows = table.setdefault(f"{camera}-colour", {})
+    colours = {f"{camera}-colour": f"colour/{camera}" for camera in (*CAMERAS, *groups())}
+    for test, cut in (colours | {"shift": "shift"}).items():
+        rows = table.setdefault(test, {})
         for name, clean_up in cleaners.items():
-            rows[name] = scores(clean_up, f"colour/{camera}", with_lpips=True)[0]
+            rows[name] = scores(clean_up, cut, with_lpips=True)[0]
             if name in faithful:
-                rows[f"{name}-menon"] = scores(clean_up, f"colour/{camera}", True, demosaic.menon)[0]
-        show([f"{camera}-colour"])
+                rows[f"{name}-menon"] = scores(clean_up, cut, True, demosaic.menon)[0]
+        show([test])
     board.write_text(json.dumps(table, indent=1))
 
 
@@ -479,7 +517,10 @@ if __name__ == "__main__":
         for folder in held_out():
             build_exact(f"{folder.parent.name}-{folder.name}", *ladder(folder))
         build_colours()
+        build_shifts()
     elif sys.argv[1:] == ["colour"]:
         build_colours()
+    elif sys.argv[1:] == ["shift"]:
+        build_shifts()
     else:
         main(sys.argv[1:])

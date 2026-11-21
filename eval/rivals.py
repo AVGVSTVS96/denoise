@@ -33,8 +33,8 @@ balance and matrix, so its own demosaic is scored against the clean frame's bili
 "<name>-cfa" takes the picture's pixels back to a mosaic first, which is what RawForge's --cfa saves,
 so it goes through the same bilinear demosaic as the clean frame and as ours: the like-for-like row.
 
-On bench_raw.py's full-colour tests, "<camera>-colour", a rival gets one row: its own picture
-against truth no demosaic made, or its mosaic through the bilinear demosaic.
+On bench_raw.py's full-colour tests, "<camera>-colour" and "shift", a rival gets one row: its own
+picture against truth no demosaic made, or its mosaic through the bilinear demosaic.
 
 A model of ours gets "<name>-x8", the mean over the mosaic's eight flips and turns.
 """
@@ -87,10 +87,9 @@ def cameras():
     paths = {
         name: raw_pairs.NIGHT / "imaging-resource" / pattern.format(100) for name, pattern in bench_raw.CAMERAS.items()
     }
-    for folders in bench_raw.groups().values():
-        for folder in folders:
-            steps = {int(file.stem): file for file in folder.iterdir() if file.stem.isdigit()}
-            paths[folder.parent.name] = steps[min(steps)]
+    for folder in (*(folder for folders in bench_raw.groups().values() for folder in folders), bench_raw.SHIFT_LADDER):
+        steps = {int(file.stem): file for file in folder.iterdir() if file.stem.isdigit()}
+        paths[folder.parent.name] = steps[min(steps)]
     table = {}
     for name, path in paths.items():
         with rawpy.imread(str(path)) as raw:
@@ -376,6 +375,8 @@ def main(specs):
                     add(test, name, by_iso)
         for camera in (*bench_raw.CAMERAS, *bench_raw.groups()) if own else ():
             add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", with_lpips=True)[0])
+        if own:
+            add("shift", spec, bench_raw.scores(own, "shift", with_lpips=True)[0])
 
 
 if __name__ == "__main__":

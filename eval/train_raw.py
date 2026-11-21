@@ -51,6 +51,12 @@ that truth is 224 px, as without either. --perceptual 0.05 adds LPIPS, at that w
 picture and its truth, both developed as bench_raw.py looks at them: it is there to make the picture
 look closer to the truth where L1 settles for a blur, and the truth is all it can pull towards.
 
+--truth data/rawshift 0.25 takes that share of the joint crops from truth a sensor measured in full
+colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
+mosaic. It is used as it is, at the joint truth's size: nothing is binned, so it is as sharp as the
+lens made it, which is what the network meets in a photo and binned truth, twice as sharp, is not.
+It is one camera's 104 scenes, so a quarter and no more.
+
 --teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
 trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
 against its picture, times --distil. Its picture is steadier than the truth, which keeps most of its
@@ -361,7 +367,7 @@ class Crops:
     before it leaves, each time under another window, flip and noise.
     """
 
-    folder, room, reads, frames = PAIRS, POOL, READS, [0, -1]
+    folder, room, reads, frames, whole = PAIRS, POOL, READS, [0, -1], None
 
     def __init__(self, scenes, size, seed, real, as_shot):
         self.size, self.real, self.as_shot, self.rng, self.pool = size, real, as_shot, random.Random(seed), []
@@ -386,7 +392,7 @@ class Crops:
             noisy = frames // 2
             synthetic = not noisy or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
             frame = 0 if synthetic else rng.randrange(1, noisy + 1)
-            picks = [0] if synthetic else [frame + noisy, frame]
+            picks = self.whole or ([0] if synthetic else [frame + noisy, frame])
             # Read by offset: through the memory map the kernel fetches about three times what a crop holds.
             starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in picks]
             planes = [np.fromfile(path, stack.dtype, side * side, offset=start) for start in starts]
@@ -428,6 +434,17 @@ class BigCrops(Crops):
     """The same from raw_pairs.py's bigger crops: clean frames alone, four times the crop, so a quarter as many kept and read."""
 
     folder, room, reads, frames = raw_pairs.BIG, POOL // 4, READS / 4, [0]
+
+
+class TruthCrops(Crops):
+    """The same from a folder of truth measured in full colour (pixel_shift.py): a crop's red, green and
+    blue where a scene's frames are, all three read, and an eighth as many kept."""
+
+    room, reads, frames, whole = POOL // 8, READS / 8, [0, 1, 2], [0, 1, 2]
+
+    def __init__(self, folder, *settings):
+        self.folder = folder
+        super().__init__(*settings)
 
 
 def spread(n, device, low, high):
@@ -733,6 +750,9 @@ def main(args):
     teacher = trained(args.teacher).to(memory_format=torch.channels_last) if args.teacher else None
     if teacher and not (args.joint and joint(teacher)):
         raise SystemExit("--teacher is a joint model's weights, for a --joint run")
+    unbinned = float(args.truth[1]) if args.truth else 0
+    if not 0 <= args.joint * unbinned <= max(args.joint - 1, 0):
+        raise SystemExit("--truth's share has to leave one of --joint's crops to the binned truth")
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
@@ -745,6 +765,13 @@ def main(args):
         if not wide:
             raise SystemExit(f"no crops in {raw_pairs.BIG}: uv run raw_pairs.py 1 0 raise big")
         big = BigCrops(wide, args.size[1], args.seed + step, "*", False)
+    truths, lot = None, random.Random(args.seed + step)
+    if unbinned:
+        folder = pathlib.Path(args.truth[0])
+        sharp = scenes("train", args.scenes, folder)
+        if not sharp:
+            raise SystemExit(f"no crops in {folder}: uv run pixel_shift.py")
+        truths = TruthCrops(folder, sharp, args.size[-1] // args.bin, args.seed + step, "*", False)
 
     def under_noise(clean):
         row = drawn(len(clean), clean.device, levels, rows)
@@ -767,8 +794,9 @@ def main(args):
             return made(teacher, teacher(fed(teacher, noisy).contiguous(memory_format=torch.channels_last)).float())
 
     while step < args.steps:
-        pair, synthetic = crops.batch(args.batch if big else args.batch + args.joint)
-        alone = big.batch(args.joint)[0][:, 0] if big else pair[args.batch :, 0]
+        taken = int(args.joint * unbinned + lot.random()) if truths else 0
+        pair, synthetic = crops.batch(args.batch if big else args.batch + args.joint - taken)
+        alone = big.batch(args.joint - taken)[0][:, 0] if big else pair[args.batch :, 0]
         clean, noisy = pair[: args.batch, 0], pair[: args.batch, 1]
         synthetic = synthetic[: args.batch].view(-1, 1, 1)
         g = gains(clean, args.bright)
@@ -782,6 +810,8 @@ def main(args):
             loss = loss + args.distil * picture_loss(picture, taught(noisy))
         if args.joint:
             truth = bench_raw.full_colour(alone, args.bin)
+            if taken:
+                truth = torch.cat([truth, truths.batch(taken)[0]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
             noisy = at_white(under_noise(bench_raw.mosaiced(truth)), g)
@@ -899,6 +929,12 @@ if __name__ == "__main__":
     parser.add_argument("--bin", type=int, default=2, choices=(2, 4), help="sensor pixels a side to one of the truth")
     parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
     parser.add_argument("--bright", type=float, default=0, help="share of crops shown as a lit part of a dark photo")
+    parser.add_argument(
+        "--truth",
+        nargs=2,
+        metavar=("FOLDER", "SHARE"),
+        help="a folder of truth measured in full colour, and the share of the joint crops taken from it unbinned",
+    )
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
     main(parser.parse_args())
