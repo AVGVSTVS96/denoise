@@ -13,7 +13,7 @@ export const CORE = TILE - 2 * OVERLAP;
 export const PIECE = CORE + 2 * BLEND;
 const LEVEL = 0.1;
 const MAX_GAIN = 64;
-const EXPOSURE = 2;
+const EXPOSURE = 1.4;
 const STEPS = 65535;
 
 const mirrored = (size: number, padded: number) =>

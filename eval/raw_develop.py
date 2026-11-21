@@ -12,8 +12,8 @@ into it over the middle of their overlap.
 
 What is shared with the app is the recipe after the model: white balance with highlights clipped
 where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone
-curve (Narkowicz's ACES fit, twice the exposure, scaled so the sensor's clip lands on white) and the
-sRGB curve. raw_check.ts makes APP.ppm, in the sensor's orientation, so the comparison is for photos
+curve (Narkowicz's ACES fit at 1.4 times the exposure, scaled so the sensor's clip lands on white) and
+the sRGB curve. raw_check.ts makes APP.ppm, in the sensor's orientation, so the comparison is for photos
 held level.
 """
 
@@ -32,7 +32,7 @@ import raw_pairs
 import ship_raw
 import train_raw
 
-EXPOSURE = 2
+EXPOSURE = 1.4
 STEPS = 65535
 TILE, OVERLAP = 1024, 64
 BLEND = OVERLAP // 2
