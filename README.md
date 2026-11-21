@@ -13,7 +13,15 @@ bun dev
 2. It runs through NAFNet in 512 px tiles, one at a time on the GPU, with 64 px feathered overlaps so tile edges don't show.
 3. The result is shown against the original and saved as a JPEG.
 
-Raw files (DNG) are read through the camera's full-size JPEG preview, not the tiny thumbnail browsers decode.
+## Raw files
+
+A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG preview:
+
+1. The worker reads the mosaic itself (uncompressed or lossless JPEG, strips or tiles, 8 to 16 bits), the black and white levels, and the camera's colour from the DNG's tags.
+2. The mosaic is scaled the way `eval/train_raw.py`'s `denoise()` scales it and runs through the joint model in 1024 px tiles (64 px of mirrored border, each tile keeps its middle). The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
+3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
+
+Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`). Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.
 
 ## Cloud
 
@@ -29,7 +37,15 @@ NAFNet width 32 ([megvii-research/NAFNet](https://github.com/megvii-research/NAF
 | Camera, ISO ≤6,400 (PolyU, 100)       | 37.39        | 37.69      |
 | Phone (SIDD, 320 crops)               | 40.43        | 40.32      |
 
-`eval/ship.py` exports it with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
+The raw model is the same network with twelve planes in and out (packed RGGB in, each colour at each of a 2x2 cell's four places out), trained by `eval/train_raw.py --joint`. `eval/ship_raw.py` exports any joint checkpoint to `public/model/` and `public/model/raw.json`, after checking that no fp16 step comes near fp16's range and that the fp16 file matches PyTorch on test windows:
+
+```sh
+cd eval && uv run ship_raw.py data/models/raw/joint-v1/joint.pth
+```
+
+`eval/raw_check.ts` runs the app's raw path outside a browser and `eval/raw_develop.py` compares its picture with the Python pipeline's.
+
+`eval/ship.py` exports the sRGB model with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
 
 ## License
 
