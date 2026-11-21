@@ -36,7 +36,17 @@ mosaic, with noise laid over it, and the loss on all three colours of every pixe
 --batch go through as before, real noisy frames among them, at their own size and with the faithful
 loss on the picture sampled where the camera measured: binning a real noisy frame would average its
 noise away, and its clean twin is a mosaic too. A joint run saves joint.pth and logs
-bench_raw.py's full-colour scores beside the others, which are of its picture sampled back to a mosaic.
+bench_raw.py's full-colour scores beside the others, which are of its picture sampled back to a mosaic,
+with LPIPS for them: those two are what a joint run is picked by.
+
+Three settings change what the joint crops teach, each on its own so runs compare. A second number
+after --size, as in --size 448 896, takes the joint crops at that size from raw_pairs.py's bigger
+crops (data/rawbig, clean frames alone) and leaves --batch's crops as they are: 896 px makes a truth
+of 448 px, four times a joint crop's picture, so --joint goes down by four for the same work.
+--bin 4 bins the truth four to one, which halves the noise its frame left in it; with --size 448 896
+that truth is 224 px, as without either. --perceptual 0.05 adds LPIPS, at that weight, between the
+picture and its truth, both developed as bench_raw.py looks at them: it is there to make the picture
+look closer to the truth where L1 settles for a blur, and the truth is all it can pull towards.
 
 A step hands the GPU its work without stopping for it: the crops of both kinds go up in one piece,
 which is the one place the CPU waits, and the small tables the loss and the joint network need stay
@@ -214,6 +224,19 @@ def picture_loss(result, truth):
     return (l1(tone(a), tone(b)) + l1(tone(srgb(a)), tone(srgb(b)))) / 2
 
 
+def perceptual_loss(result, truth):
+    """LPIPS between camera RGB (N, 3, H, W) and its truth, each as the picture bench_raw.score_one looks at:
+    a white balance, the colour matrix, the truth's median brought to mid-grey, the tone curve."""
+    n = truth.shape[0]
+    draw = lambda low, high: torch.empty(n, device=truth.device).uniform_(low, high)
+    balance = torch.stack([draw(*RED), torch.ones(n, device=truth.device), draw(*BLUE)], 1).view(n, 3, 1, 1)
+    srgb = lambda p: torch.einsum("ij,njhw->nihw", held(TO_SRGB, p.device), p * balance)
+    a, b = srgb(result), srgb(truth)
+    exposure = 0.108 / b.flatten(1).median(1).values.clamp(min=1e-6).view(n, 1, 1, 1)
+    look = lambda p: tone(p * exposure).clamp(0, 1) * 2 - 1
+    return bench_raw.perceptual()(look(a), look(b)).mean()
+
+
 def cleaner(model):
     """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled as denoise() does, and out
     cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model."""
@@ -255,6 +278,8 @@ class Crops:
     before it leaves, each time under another window, flip and noise.
     """
 
+    folder, room, reads, frames = PAIRS, POOL, READS, [0, -1]
+
     def __init__(self, scenes, size, seed, real, as_shot):
         self.size, self.real, self.as_shot, self.rng, self.pool = size, real, as_shot, random.Random(seed), []
         self.use(scenes)
@@ -271,7 +296,7 @@ class Crops:
         rng = random.Random(self.rng.random())
         while True:
             scene = rng.choices(*self.draw)[0]
-            path = PAIRS / f"{scene}.npy"
+            path = self.folder / f"{scene}.npy"
             stack = np.load(path, mmap_mode="r")
             frames, crops, side, _ = stack.shape
             crop = rng.randrange(crops)
@@ -287,14 +312,14 @@ class Crops:
                 black = self.scenes[scene][frame - 1].get("offset", [0.0] * 4)
                 pair[1] += np.tile(np.asarray(black, pair.dtype).reshape(2, 2), (side // 2, side // 2))
             fresh = pair, synthetic
-            if len(self.pool) < POOL:
+            if len(self.pool) < self.room:
                 self.pool.append(fresh)
             else:
-                self.pool[rng.randrange(POOL)] = fresh
-            time.sleep(1 / READS if len(self.pool) == POOL else 0.05)
+                self.pool[rng.randrange(self.room)] = fresh
+            time.sleep(1 / self.reads if len(self.pool) == self.room else 0.05)
 
     def batch(self, n):
-        while len(self.pool) < POOL // 4:
+        while len(self.pool) < self.room // 4:
             time.sleep(1)
         pairs, kinds = [], []
         for _ in range(n):
@@ -311,9 +336,15 @@ class Crops:
             pair = pair[:, y : y + self.size, x : x + self.size]
             if turn:
                 pair = pair.transpose(0, 2, 1)
-            pairs.append(np.ascontiguousarray(pair[[0, -1]]))
+            pairs.append(np.ascontiguousarray(pair[self.frames]))
             kinds.append(synthetic)
         return torch.from_numpy(np.stack(pairs)).cuda().float(), torch.tensor(kinds, device="cuda")
+
+
+class BigCrops(Crops):
+    """The same from raw_pairs.py's bigger crops: clean frames alone, four times the crop, so a quarter as many kept and read."""
+
+    folder, room, reads, frames = raw_pairs.BIG, POOL // 4, READS / 4, [0]
 
 
 def spread(n, device, low, high):
@@ -475,13 +506,13 @@ def gains(clean):
     return (LEVEL / mean * spread(len(mean), mean.device, 1 / 6, 2)).clamp(1 / 4, MAX_GAIN).view(-1, 1, 1)
 
 
-def scenes(split, pattern):
+def scenes(split, pattern, folder=PAIRS):
     """Each scene's name, and its json's list of real noisy frames, empty for a scene of clean frames only.
 
     A scene whose noisy frames have no clean twins yet, built by an older raw_pairs.py, stays out.
     """
     found, stale = {}, 0
-    for meta in sorted(PAIRS.glob("*.json")):
+    for meta in sorted(folder.glob("*.json")):
         info = json.loads(meta.read_text())
         if info["split"] == split and fnmatch.fnmatch(meta.stem, pattern) and meta.with_suffix(".npy").exists():
             if raw_pairs.twinned(info):
@@ -514,6 +545,8 @@ def validate(model, val):
 
 
 def main(args):
+    if args.joint and args.size[-1] % (32 * args.bin):
+        raise SystemExit("the joint crops' size has to be a multiple of 32 times --bin")
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
     out = MODELS / args.out
@@ -554,7 +587,13 @@ def main(args):
     log = (out / "log.jsonl").open("a")
     running = torch.zeros((), device="cuda")
     train = scenes("train", args.scenes)
-    crops = Crops(train, args.size, args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
+    crops = Crops(train, args.size[0], args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
+    big = None
+    if args.size[1:]:
+        wide = scenes("train", args.scenes, raw_pairs.BIG)
+        if not wide:
+            raise SystemExit(f"no crops in {raw_pairs.BIG}: uv run raw_pairs.py 1 0 raise big")
+        big = BigCrops(wide, args.size[1], args.seed + step, "*", False)
 
     def under_noise(clean):
         row = drawn(len(clean), clean.device, levels, rows)
@@ -569,7 +608,8 @@ def main(args):
             return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
 
     while step < args.steps:
-        pair, synthetic = crops.batch(args.batch + args.joint)
+        pair, synthetic = crops.batch(args.batch if big else args.batch + args.joint)
+        alone = big.batch(args.joint)[0][:, 0] if big else pair[args.batch :, 0]
         clean, noisy = pair[: args.batch, 0], pair[: args.batch, 1]
         synthetic = synthetic[: args.batch].view(-1, 1, 1)
         g = gains(clean)
@@ -578,9 +618,12 @@ def main(args):
             noisy = torch.where(synthetic, under_noise(clean), noisy)
         loss = loss_of(bench_raw.mosaiced(cleaned(noisy)), clean)
         if args.joint:
-            truth = bench_raw.full_colour(pair[args.batch :, 0])
+            truth = bench_raw.full_colour(alone, args.bin)
             truth = truth * gains(bench_raw.mosaiced(truth))[:, None]
-            loss = loss + picture_loss(cleaned(under_noise(bench_raw.mosaiced(truth))), truth)
+            picture = cleaned(under_noise(bench_raw.mosaiced(truth)))
+            loss = loss + picture_loss(picture, truth)
+            if args.perceptual:
+                loss = loss + args.perceptual * perceptual_loss(picture, truth)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -595,6 +638,7 @@ def main(args):
             bench, aligned, shot, fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "gr3")
             seen, seen_aligned, seen_shot, seen_fixed = bench_raw.scores(bench_raw.as_mosaic(clean_up), "seen")
             mean_psnr = lambda by_iso: round(float(np.mean([psnr for psnr, _ in by_iso.values()])), 3)
+            mean_lpips = lambda by_iso: round(float(np.mean([distance for _, distance in by_iso.values()])), 4)
             line = {
                 "step": step,
                 "loss": round(running.item() / args.check, 5),
@@ -615,11 +659,15 @@ def main(args):
                 "time": round(time.time()),
             }
             if args.joint:
-                colour = bench_raw.scores(clean_up, "colour/gr3")[0]
+                colour = bench_raw.scores(clean_up, "colour/gr3", with_lpips=True)[0]
+                seen_colour = bench_raw.scores(clean_up, "colour/seen", with_lpips=True)[0]
                 line |= {
                     "gr3_colour": mean_psnr(colour),
                     "gr3_colour_by_iso": [round(psnr, 3) for psnr, _ in colour.values()],
-                    "seen_colour": mean_psnr(bench_raw.scores(clean_up, "colour/seen")[0]),
+                    "seen_colour": mean_psnr(seen_colour),
+                    "gr3_colour_lpips": mean_lpips(colour),
+                    "gr3_colour_lpips_by_iso": [round(distance, 4) for _, distance in colour.values()],
+                    "seen_colour_lpips": mean_lpips(seen_colour),
                 }
             print(json.dumps(line), flush=True)
             log.write(json.dumps(line) + "\n")
@@ -640,6 +688,8 @@ def main(args):
             # Crops raw_pairs.py finished meanwhile join in.
             train = scenes("train", args.scenes)
             crops.use(train)
+            if big:
+                big.use(scenes("train", args.scenes, raw_pairs.BIG))
     torch.save(average.module.state_dict(), out / ("joint.pth" if args.joint else "faithful.pth"))
 
 
@@ -648,7 +698,13 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="faithful")
     parser.add_argument("--steps", type=int, default=120000)
     parser.add_argument("--batch", type=int, default=8)
-    parser.add_argument("--size", type=int, default=384, help="sensor pixels per side")
+    parser.add_argument(
+        "--size",
+        type=int,
+        nargs="+",
+        default=[384],
+        help="sensor pixels per side; a second number is the joint crops' own, taken from the bigger crops",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--check", type=int, default=2000)
     parser.add_argument("--keep", type=int, default=20000, help="steps between saved snapshots")
@@ -667,4 +723,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--joint", type=int, default=0, help="train the joint model, on this many crops of made truth a step"
     )
+    parser.add_argument("--bin", type=int, default=2, choices=(2, 4), help="sensor pixels a side to one of the truth")
+    parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
     main(parser.parse_args())

@@ -247,13 +247,17 @@ def under_noise(camera, clean, full, path, isos, cut):
     return frames, means
 
 
-def full_colour(mosaics):
+def full_colour(mosaics, bin=2):
     """RGGB mosaics (N, H, W) as camera RGB at half the size (N, 3, H/2, W/2), every colour measured, none guessed.
 
     Each 2x2 cell becomes one pixel at the cell's middle. Its four samples sit half a sensor pixel off
     that middle, each its own way, so each colour plane is first read a quarter of its own pixel
     along (Lanczos) and the two greens are averaged. Taken as they are the colours would sit apart
     by that much, a fringe on every edge that a model would learn to draw.
+
+    A cell holds one red and one blue sample, so that picture keeps most of its frame's noise. With
+    bin 4 each pixel is the mean of four such cells, a quarter of the size: half the noise again in
+    every colour, and less of the colour moire a lens draws finer than one colour's samples sit.
     """
     taps = torch.arange(-4, 5, dtype=mosaics.dtype, device=mosaics.device)
     lanczos = lambda at: torch.sinc(at) * torch.sinc(at / 4) * (at.abs() < 4)
@@ -262,7 +266,8 @@ def full_colour(mosaics):
     planes = torch.stack([mosaics[:, i::2, j::2] for i in (0, 1) for j in (0, 1)], 1)
     planes = torch.nn.functional.pad(planes, (4, 4, 4, 4), mode="reflect")
     red, green, also_green, blue = torch.nn.functional.conv2d(planes, kernels[:, None], groups=4).unbind(1)
-    return torch.stack([red, (green + also_green) / 2, blue], 1)
+    picture = torch.stack([red, (green + also_green) / 2, blue], 1)
+    return picture if bin == 2 else torch.nn.functional.avg_pool2d(picture, bin // 2)
 
 
 def mosaiced(picture):
@@ -372,7 +377,7 @@ kept = functools.cache(windows)
 def perceptual():
     import lpips
 
-    return lpips.LPIPS(net="alex", verbose=False).cuda()
+    return lpips.LPIPS(net="alex", verbose=False).cuda().requires_grad_(False)
 
 
 @torch.no_grad()
