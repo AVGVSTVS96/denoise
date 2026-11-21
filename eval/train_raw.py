@@ -40,7 +40,9 @@ bench_raw.py's full-colour scores beside the others, which are of its picture sa
 
 A step hands the GPU its work without stopping for it: the crops of both kinds go up in one piece,
 which is the one place the CPU waits, and the small tables the loss and the joint network need stay
-on the GPU.
+on the GPU. Each pass through the network, forward or backward, is recorded once as a CUDA graph and
+replayed, because handed over kernel by kernel a pass costs the CPU more time than the GPU takes to
+run it, and a joint step makes two of each.
 
 The weights that get scored and saved are a running average of the trained ones, taken every fourth
 step, which is steadier than any single step. Every check logs the held-out RawNIND score and
@@ -546,7 +548,7 @@ def main(args):
         optimizer.load_state_dict(state["optimizer"])
         schedule.load_state_dict(state["schedule"])
         step = state["step"]
-    compiled = torch.compile(model)
+    compiled = torch.compile(model, mode="reduce-overhead", dynamic=False)
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
