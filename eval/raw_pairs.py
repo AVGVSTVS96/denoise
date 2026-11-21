@@ -38,6 +38,15 @@ noisy frame shot darker and brought up holds highlights the clean one clipped, a
 the GR IIIx's still life, and the other way round a target would ask for what its frame never held.
 Mosaics are black-subtracted, divided by the white level and cut to start on red, so every camera
 reads as RGGB.
+
+    uv run raw_pairs.py 1 0 raise big    a source's built scenes again, their clean frames in bigger crops
+
+A crop of 512 px holds a truth of only 128 px once binned four to one, which is what a joint model's
+truth needs to lose its frame's noise (train_raw.py --bin), and a last stage of training wants crops
+past 512 px (--big). So data/rawbig/<scene>.npy holds a built scene's clean frame alone, float16
+(1, crops, 1024, 1024), half as many crops as the scene has of 512 px and so twice the picture. A
+scene with real noisy frames gives its clean frame too, which keeps the review sites' hundreds of
+cameras among them.
 """
 
 import hashlib
@@ -57,6 +66,7 @@ import rawpy
 
 DATA = pathlib.Path(__file__).parent / "data"
 OUT = DATA / "rawpairs"
+BIG = DATA / "rawbig"
 NIGHT = DATA / "night-raw"
 OWN = DATA / "own" / "paths.txt"
 LADDERS = DATA / "ladders"
@@ -67,6 +77,7 @@ PIXLS = "https://raw.pixls.us/json/getrepository.php?set=all"
 HOST = "https://dataverse.uclouvain.be/api"
 DOI = "doi:10.14428/DVN/DEQCIM"
 CROP = 512
+WIDE = 1024
 CROPS = 24
 MAX_SHIFT = 16
 TILE, ROUNDS, MARGIN = 64, 3, 8
@@ -212,17 +223,17 @@ def resampled(clean, y, x, dx, dy):
     return out[MARGIN:-MARGIN, MARGIN:-MARGIN]
 
 
-def corners(clean, rng, count):
-    """Even top-left corners on a 512 px grid: the most detailed crops, and a third at random."""
+def corners(clean, rng, count, side=CROP):
+    """Even top-left corners on a grid of crops side px wide: the most detailed crops, and a third at random."""
     h, w = clean.shape
     grid = [
         (y, x)
-        for y in range(MAX_SHIFT, h - CROP - MAX_SHIFT, CROP)
-        for x in range(MAX_SHIFT, w - CROP - MAX_SHIFT, CROP)
+        for y in range(MAX_SHIFT, h - side - MAX_SHIFT, side)
+        for x in range(MAX_SHIFT, w - side - MAX_SHIFT, side)
     ]
     g = green(clean)
     detail = [
-        float(np.abs(cv2.Laplacian(g[y // 2 : (y + CROP) // 2, x // 2 : (x + CROP) // 2], cv2.CV_32F)).mean())
+        float(np.abs(cv2.Laplacian(g[y // 2 : (y + side) // 2, x // 2 : (x + side) // 2], cv2.CV_32F)).mean())
         for y, x in grid
     ]
     ranked = [grid[i] for i in np.argsort(detail)[::-1]]
@@ -344,6 +355,22 @@ def build(name, clean_path, noisy_paths, meta):
     (OUT / f"{name}.tmp").write_text(json.dumps({**meta, "frames": kept, "twins": True}))
     (OUT / f"{name}.tmp").rename(OUT / f"{name}.json")
     print(name, kept, flush=True)
+
+
+def bigger(name, clean_path):
+    """A built scene's clean frame again, as BIG's crops of WIDE px: half as many as it has of CROP px."""
+    built, out = OUT / f"{name}.json", BIG / f"{name}.npy"
+    if not built.exists() or out.with_suffix(".json").exists():
+        return
+    clean = mosaic(clean_path())
+    rng = np.random.default_rng(int(hashlib.sha1(name.encode()).hexdigest()[:8], 16))
+    picks = corners(clean, rng, np.load(OUT / f"{name}.npy", mmap_mode="r").shape[1] // 2, WIDE)
+    crops = np.stack([clean[y : y + WIDE, x : x + WIDE] for y, x in picks])
+    np.save(BIG / f"{name}.tmp.npy", crops[None].astype(np.float16))
+    (BIG / f"{name}.tmp.npy").rename(out)
+    (BIG / f"{name}.tmp").write_text(json.dumps({**json.loads(built.read_text()), "frames": []}))
+    (BIG / f"{name}.tmp").rename(out.with_suffix(".json"))
+    print(name, len(picks), flush=True)
 
 
 def fetched(url, suffix=".arw"):
@@ -511,13 +538,16 @@ def split(name):
     return "val" if name.startswith("rawnind-") and hashlib.sha1(name.encode()).digest()[0] % 10 == 0 else "train"
 
 
-def main(workers, worker, source="pairs"):
+def main(workers, worker, source="pairs", size="crops"):
     OUT.mkdir(parents=True, exist_ok=True)
     socket.setdefaulttimeout(300)
     scenes = list(SOURCES[source]())
     for name, clean, noisy, meta in scenes[worker::workers]:
         try:
-            build(name, clean, noisy, {**meta, "scene": name, "split": split(name)})
+            if size == "big":
+                bigger(name, clean)
+            else:
+                build(name, clean, noisy, {**meta, "scene": name, "split": split(name)})
         # One bad download or file shouldn't stop the rest.
         except (OSError, ValueError, rawpy.LibRawError, subprocess.SubprocessError) as error:
             print(name, "failed", repr(error), flush=True)
