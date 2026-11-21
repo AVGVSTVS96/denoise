@@ -756,10 +756,10 @@ def main(specs, only=""):
 
     def show(rows, title, cell=lambda row: f"{row[0]:8.2f} {row[1]:.3f}", mean=True):
         heads = [*rows["noisy"], *["mean"] * mean]
-        print(f"\n{title}\n{'':24}" + "".join(f"{head:>16}" for head in heads))
+        print(f"\n{title}\n{'':24}" + "".join(f"{head:>20}" for head in heads))
         for name, by_iso in rows.items():
             cells = [*by_iso.values(), *[np.mean(list(by_iso.values()), axis=0)] * mean]
-            print(f"{name:24}" + "".join(f"{cell(row):>16}" for row in cells))
+            print(f"{name:24}" + "".join(f"{cell(row):>20}" for row in cells))
 
     for camera in (*CAMERAS, *groups(), "exact") if not only else ():
         kinds = () if camera == "exact" else ("aligned", "as-shot", "as-shot-fixed")
