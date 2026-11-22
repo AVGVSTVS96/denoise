@@ -88,6 +88,24 @@ own frame's noise, and on --batch's crops it is the one target for the two colou
 did not measure. It is not compiled: without gradients it costs the CPU little to hand over, and a
 recorded graph would keep its memory beside the trained network's. A run without --teacher is what it was.
 
+--twins WEIGHTS 1 teaches the picture on real pairs in full colour, which no camera measured for them,
+and against the clean frame as it was cut, where the loss they had was against the clean twin: that
+frame resampled onto the noisy one as a mosaic, each colour plane on its own, which costs it 15 to
+70% of its finest detail. A mosaic cannot be moved without that and a picture can, so the network's
+picture of the noisy crop is moved onto the clean crop instead (moved()), by the fraction of a pixel
+the two sit apart, read back from the clean crop and its stored twin (raw_pairs.apart), the one thing
+the twin is still read for. On the moved picture the colour each pixel measured is held to the clean
+crop itself (loss_of), and the two it did not to a frozen joint model's picture of the clean crop,
+WEIGHTS, at that weight (picture_loss, the measured colour left out of it). The clean crop stops at
+the brightest value its noisy crop holds, which is the white the noisy frame clipped at. Crops under
+laid-over noise are as they were. Made-up noise never shows the network what a camera that smooths
+its raw files does to a scene; its own frames do.
+
+--pairs 0.5 sends that share of --batch's draws to the scenes whose real noisy frames train, in place
+of PAIR_SHARE, and with --levels half of those (SMOOTH_SHARE) to the frames of cameras that smooth
+their raw (smoothed()): the ones whose row of the table has a pixel's noise moving with a
+neighbour's by more than TIED, a twelfth of the real noisy frames. A run without either is what it was.
+
 denoise() scales a whole photo by one gain, so a lamp-lit part of a dark photo reaches the network
 tens of times brighter than any crop in training, which a model answers with garbage. Two cures, to
 compare: denoise() now holds each tile's gain down until no block of BLOCK px in it is brighter than
@@ -183,6 +201,8 @@ MOST_BANDING = 0.3
 TAPS = 7
 NEXT_GREEN = (((0, 1, 0, -1), (0, 2, -1, 0)), ((3, 2, 0, 1), (3, 1, 1, 0)))
 STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
+EDGE = 16
+SMOOTH_SHARE, TIED = 0.5, 0.1
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -291,6 +311,29 @@ def picture_loss(result, truth):
     srgb = lambda p: torch.einsum("ij,njhw->nihw", held(TO_SRGB, p.device), p)
     l1 = torch.nn.functional.l1_loss
     return (l1(tone(a), tone(b)) + l1(tone(srgb(a)), tone(srgb(b)))) / 2
+
+
+def moved(picture, move):
+    """Camera RGB (N, 3, H, W), each picture moved by its own (dx, dy) px of move (N, 2), so that what
+    was at (x, y) is at (x + dx, y + dy), and EDGE px cut from every side.
+
+    The move turns each frequency's phase and leaves its strength alone, so nothing is softened, where
+    resampling between pixels takes most from the finest detail. A spectrum takes a picture's edges to
+    meet round the back, and what one side rings into the other is in what is cut.
+    """
+    n, _, h, w = picture.shape
+    down = torch.fft.fftfreq(h, device=picture.device).view(1, 1, h, 1)
+    across = torch.fft.rfftfreq(w, device=picture.device).view(1, 1, 1, -1)
+    turn = torch.exp(-2j * math.pi * (across * move[:, 0].view(n, 1, 1, 1) + down * move[:, 1].view(n, 1, 1, 1)))
+    return torch.fft.irfft2(torch.fft.rfft2(picture) * turn, s=(h, w))[..., EDGE:-EDGE, EDGE:-EDGE]
+
+
+@functools.cache
+def sampled(h, w, device):
+    """Where an RGGB mosaic (H, W) measured each colour of camera RGB (3, H, W)."""
+    at = torch.zeros(3, h, w, dtype=torch.bool, device=device)
+    at[0, 0::2, 0::2] = at[1, 0::2, 1::2] = at[1, 1::2, 0::2] = at[2, 1::2, 1::2] = True
+    return at
 
 
 def developed(result, truth):
@@ -431,12 +474,19 @@ class Crops:
 
     One thread reads: it fills the pool, then swaps READS crops a second. A crop is drawn many times
     before it leaves, each time under another window, flip and noise.
+
+    With twins the clean mosaic of a real noisy crop is its clean frame as it was cut, stopped at the
+    brightest value the noisy crop holds, in place of the clean twin, and the crop brings how far it
+    sits off that frame as (dx, dy) sensor pixels, flipped and turned with it. With pairs that share
+    of the draws goes to the scenes whose real noisy frames train, SMOOTH_SHARE of it to their frames
+    in smooth, a set of (scene, ISO), when there are some.
     """
 
     folder, room, reads, frames, whole = PAIRS, POOL, READS, [0, -1], None
 
-    def __init__(self, scenes, size, seed, real, as_shot):
+    def __init__(self, scenes, size, seed, real, as_shot, twins=False, pairs=0, smooth=frozenset()):
         self.size, self.real, self.as_shot, self.rng, self.pool = size, real, as_shot, random.Random(seed), []
+        self.twins, self.pairs, self.smooth = twins, pairs, smooth
         self.use(scenes)
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -445,28 +495,64 @@ class Crops:
         paired = [bool(frames) for frames in scenes.values()]
         total = {kind: sum(w for w, p in zip(weights, paired) if p == kind) for kind in (True, False)}
         weights = [w * (PAIR_SHARE if p else 1 - PAIR_SHARE) / total[p] for w, p in zip(weights, paired)]
-        self.scenes, self.draw = scenes, (list(scenes), weights)
+        draws = [(scene, weight, None) for scene, weight in zip(scenes, weights)]
+        self.scenes, self.draw = scenes, tuple(zip(*(self.apportioned(scenes, draws) if self.pairs else draws)))
+
+    def apportioned(self, scenes, draws):
+        """The draws with self.pairs of them sent to the scenes whose real noisy frames train: such a
+        scene once for its frames in self.smooth, which get SMOOTH_SHARE of that between them, and once
+        for its other frames, each kind shared out among its own as the scenes were."""
+        kinds = {"clean": [], "smooth": [], "plain": []}
+        for scene, weight, _ in draws:
+            frames = scenes[scene] if fnmatch.fnmatch(scene, self.real) else []
+            smooth = [k for k, frame in enumerate(frames, 1) if (scene, frame["iso"]) in self.smooth]
+            plain = [k for k in range(1, len(frames) + 1) if k not in smooth]
+            if not frames:
+                kinds["clean"].append((scene, weight, None))
+            if smooth:
+                kinds["smooth"].append((scene, weight, smooth))
+            if plain:
+                kinds["plain"].append((scene, weight, plain))
+        some = SMOOTH_SHARE if kinds["smooth"] and kinds["plain"] else float(bool(kinds["smooth"]))
+        shares = {"clean": 1 - self.pairs, "smooth": self.pairs * some, "plain": self.pairs * (1 - some)}
+        totals = {kind: sum(weight for _, weight, _ in found) for kind, found in kinds.items()}
+        return [
+            (scene, weight * shares[kind] / totals[kind], among)
+            for kind, found in kinds.items()
+            for scene, weight, among in found
+        ]
 
     def read(self):
         rng = random.Random(self.rng.random())
         while True:
-            scene = rng.choices(*self.draw)[0]
+            names, weights, among = self.draw
+            at = rng.choices(range(len(names)), weights)[0]
+            scene, among = names[at], among[at]
             path = self.folder / f"{scene}.npy"
             stack = np.load(path, mmap_mode="r")
             frames, crops, side, _ = stack.shape
             crop = rng.randrange(crops)
             noisy = frames // 2
             synthetic = not noisy or not fnmatch.fnmatch(scene, self.real) or rng.random() < SYNTHETIC_SHARE
-            frame = 0 if synthetic else rng.randrange(1, noisy + 1)
-            picks = self.whole or ([0] if synthetic else [frame + noisy, frame])
+            frame = 0 if synthetic else rng.choice(among) if among else rng.randrange(1, noisy + 1)
+            twinned = self.twins and not synthetic
+            picks = self.whole or (
+                [0] if synthetic else [frame + noisy, 0, frame] if twinned else [frame + noisy, frame]
+            )
             # Read by offset: through the memory map the kernel fetches about three times what a crop holds.
             starts = [stack.offset + (i * crops + crop) * side * side * stack.itemsize for i in picks]
             planes = [np.fromfile(path, stack.dtype, side * side, offset=start) for start in starts]
             pair = np.stack(planes).reshape(-1, side, side)
+            move = (0.0, 0.0)
+            if twinned:
+                twin, clean, shot = pair
+                whites = [shot[i::2, j::2].max() for i in range(2) for j in range(2)]
+                clean = raw_pairs.capped(clean[None], whites)[0]
+                pair, move = np.stack([clean, shot]), raw_pairs.apart(clean, twin)
             if self.as_shot and not synthetic:
                 black = self.scenes[scene][frame - 1].get("offset", [0.0] * 4)
                 pair[1] += np.tile(np.asarray(black, pair.dtype).reshape(2, 2), (side // 2, side // 2))
-            fresh = pair, synthetic
+            fresh = pair, synthetic, move
             if len(self.pool) < self.room:
                 self.pool.append(fresh)
             else:
@@ -476,24 +562,26 @@ class Crops:
     def batch(self, n):
         while len(self.pool) < self.room // 4:
             time.sleep(1)
-        pairs, kinds = [], []
+        pairs, kinds, moves = [], [], []
         for _ in range(n):
-            pair, synthetic = self.rng.choice(self.pool)
+            pair, synthetic, (dx, dy) = self.rng.choice(self.pool)
             side = pair.shape[-1]
             flip_y, flip_x, turn = (self.rng.random() < 0.5 for _ in range(3))
             # A flipped mosaic starts on red again one pixel in, so the window's corner takes that parity.
             y = self.rng.randrange((side - self.size) // 2) * 2 + flip_y
             x = self.rng.randrange((side - self.size) // 2) * 2 + flip_x
             if flip_y:
-                pair = pair[:, ::-1]
+                pair, dy = pair[:, ::-1], -dy
             if flip_x:
-                pair = pair[:, :, ::-1]
+                pair, dx = pair[:, :, ::-1], -dx
             pair = pair[:, y : y + self.size, x : x + self.size]
             if turn:
-                pair = pair.transpose(0, 2, 1)
+                pair, dx, dy = pair.transpose(0, 2, 1), dy, dx
             pairs.append(np.ascontiguousarray(pair[self.frames]))
             kinds.append(synthetic)
-        return torch.from_numpy(np.stack(pairs)).cuda().float(), torch.tensor(kinds, device="cuda")
+            moves.append((dx, dy))
+        crops = torch.from_numpy(np.stack(pairs)).cuda().float()
+        return crops, torch.tensor(kinds, device="cuda"), torch.tensor(moves, device="cuda")
 
 
 class BigCrops(Crops):
@@ -571,6 +659,19 @@ def measured(path):
     """A file's rows of noise levels: fit_noise.py's table of cameras, or one camera's profile by ISO."""
     found = json.loads(pathlib.Path(path).read_text())
     return found if isinstance(found, list) else list(found["iso"].values())
+
+
+def smoothed(rows):
+    """The real noisy frames of cameras that smooth their raw, as (scene, ISO): the rows of fit_noise.py's
+    table in which a pixel's noise moves with a neighbour's, the green beside it or its own colour's
+    next pixel across or down, by more than TIED. A row is one scene's frame, named as raw_pairs.py
+    names a review site's ladder."""
+    tie = lambda row: max(max(row.get(part, [0.0])) for part in ("beside", "across", "down"))
+    return frozenset(
+        (f"ladder-{row['site']}-{row['camera']}-{row['scene']}", row["iso"])
+        for row in rows
+        if "site" in row and tie(row) > TIED
+    )
 
 
 def mixers(rows):
@@ -891,6 +992,9 @@ def main(args):
     if args.soften and not args.joint:
         raise SystemExit("--soften blurs the joint crops' truth, for a --joint run")
     pages = torch.from_numpy(np.load(text_bank.OUT)).cuda() if args.text else None
+    twin = trained(args.twins[0]).to(memory_format=torch.channels_last) if args.twins else None
+    if twin and not (args.joint and joint(twin)):
+        raise SystemExit("--twins is a joint model's weights, for a --joint run")
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
@@ -902,7 +1006,9 @@ def main(args):
         return {**found, **scenes("night", args.scenes, *folder)} if args.night else found
 
     train = training()
-    crops = Crops(train, args.size[0], args.seed + step, f"*{camera.stem}-*" if args.profile else "*", args.offsets)
+    own = f"*{camera.stem}-*" if args.profile else "*"
+    smooth = smoothed(measured(args.levels)) if args.pairs and args.levels else frozenset()
+    crops = Crops(train, args.size[0], args.seed + step, own, args.offsets, bool(twin), args.pairs, smooth)
     big = None
     if args.size[1:]:
         wide = training(raw_pairs.BIG)
@@ -933,13 +1039,24 @@ def main(args):
             return made(model, compiled(fed(model, noisy).contiguous(memory_format=torch.channels_last)).float())
 
     @torch.no_grad()
-    def taught(noisy):
+    def taught(by, noisy):
         with torch.autocast("cuda", torch.bfloat16):
-            return made(teacher, teacher(fed(teacher, noisy).contiguous(memory_format=torch.channels_last)).float())
+            return made(by, by(fed(by, noisy).contiguous(memory_format=torch.channels_last)).float())
+
+    def twinned(picture, clean, real, moves):
+        onto = moved(picture[real], -moves[real])
+        inner = clean[real][..., EDGE:-EDGE, EDGE:-EDGE]
+        wanted = taught(twin, clean[real])[..., EDGE:-EDGE, EDGE:-EDGE]
+        unmeasured = torch.where(sampled(*inner.shape[-2:], inner.device), wanted, onto)
+        found = loss_of(bench_raw.mosaiced(onto), inner) + float(args.twins[1]) * picture_loss(unmeasured, wanted)
+        if real.all():
+            return found
+        share = real.float().mean()
+        return share * found + (1 - share) * loss_of(bench_raw.mosaiced(picture[~real]), clean[~real])
 
     while step < args.steps:
         taken = int(args.joint * unbinned + lot.random()) if truths else 0
-        pair, synthetic = crops.batch(args.batch if big else args.batch + args.joint - taken)
+        pair, synthetic, moves = crops.batch(args.batch if big else args.batch + args.joint - taken)
         alone = big.batch(args.joint - taken)[0][:, 0] if big else pair[args.batch :, 0]
         clean, noisy = pair[: args.batch, 0], pair[: args.batch, 1]
         synthetic = synthetic[: args.batch].view(-1, 1, 1)
@@ -949,9 +1066,12 @@ def main(args):
             noisy = torch.where(synthetic, under_noise(clean), noisy)
         noisy = at_white(noisy, g)
         picture = cleaned(noisy)
-        loss = loss_of(bench_raw.mosaiced(picture), clean)
+        if twin and not synthetic.all():
+            loss = twinned(picture, clean, ~synthetic.view(-1), moves[: args.batch])
+        else:
+            loss = loss_of(bench_raw.mosaiced(picture), clean)
         if teacher:
-            loss = loss + args.distil * picture_loss(picture, taught(noisy))
+            loss = loss + args.distil * picture_loss(picture, taught(teacher, noisy))
         if args.joint:
             truth = bench_raw.full_colour(alone, args.bin)
             if taken:
@@ -966,7 +1086,7 @@ def main(args):
             picture = cleaned(noisy)
             loss = loss + picture_loss(picture, truth)
             if teacher:
-                loss = loss + args.distil * picture_loss(picture, taught(noisy))
+                loss = loss + args.distil * picture_loss(picture, taught(teacher, noisy))
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
             if critic:
@@ -1127,6 +1247,15 @@ if __name__ == "__main__":
         help="the joint crops' truth is blurred by between these px before it is sampled to a mosaic",
     )
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
+    parser.add_argument(
+        "--twins",
+        nargs=2,
+        metavar=("WEIGHTS", "WEIGHT"),
+        help="real pairs teach the picture against the clean frame as cut, and against these weights' picture of it",
+    )
+    parser.add_argument(
+        "--pairs", type=float, default=0, help="share of --batch's draws from the scenes whose real noisy frames train"
+    )
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
     parser.add_argument("--held", help="a list of scenes to leave out of training, as bench_raw.py night writes")

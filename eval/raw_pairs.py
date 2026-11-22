@@ -234,6 +234,33 @@ def resampled(clean, y, x, dx, dy, height=CROP, width=CROP):
     return out[MARGIN:-MARGIN, MARGIN:-MARGIN]
 
 
+def apart(clean, twin):
+    """The (dx, dy) sensor pixels resampled() moved a clean crop by to make its twin, read back from the two.
+
+    A moved plane's spectrum is the still one's with every frequency's phase turned in step with the
+    move, so the move is the slope of the phase between them: fitted over the lower half of the
+    frequencies, where no move of a pixel or less turns it all the way round, each frequency weighed
+    by how much of it both hold, and the four colour planes together. Each plane loses its mean and
+    fades out towards its edges first, which do not meet round the back as a spectrum takes them to.
+    A crop with nothing in it, blown to white all over, says no move.
+    """
+    side = clean.shape[0] // 2
+    fade = np.outer(np.hanning(side), np.hanning(side))
+    spectrum = lambda plane: np.fft.fft2((plane - plane.mean()) * fade)
+    planes = [(slice(i, None, 2), slice(j, None, 2)) for i in range(2) for j in range(2)]
+    both = sum(
+        spectrum(twin[plane].astype(np.float64)) * spectrum(clean[plane].astype(np.float64)).conj() for plane in planes
+    )
+    along = np.fft.fftfreq(side)
+    low = np.abs(along) < 0.25
+    weight = np.abs(both) * np.outer(low, low)
+    across, down = np.meshgrid(along, along)
+    waves = np.stack([across, down]) * weight
+    firm = waves.reshape(2, -1) @ np.stack([across, down]).reshape(2, -1).T
+    slope = np.linalg.lstsq(firm, (waves * np.angle(both)).sum((1, 2)), rcond=None)[0]
+    return tuple((-slope / np.pi).tolist())
+
+
 def corners(clean, rng, count, side=CROP):
     """Even top-left corners on a grid of crops side px wide: the most detailed crops, and a third at random."""
     h, w = clean.shape
