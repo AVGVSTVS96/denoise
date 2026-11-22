@@ -140,7 +140,7 @@ def stroke(font, sample):
 
 
 def page(faces, language, rng):
-    """One page of a typeface: its family, and the page (SIDE, SIDE) uint8, or None from a face too thin for two lines."""
+    """One page of a typeface: its family, and the page (SIDE, SIDE) uint8, or None from a face too thin for two lines or with no ink."""
     family, file, index, charset = rng.choice(faces)
     spans = [[int(end, 16) for end in span.split("-")] for span in charset.split()]
     has = {chr(code) for span in spans for code in range(span[0], span[-1] + 1)}
@@ -148,7 +148,10 @@ def page(faces, language, rng):
     capitals = rng.random() < CAPITALS
     drawn = (word.upper() if capitals else word for word in words(language)[start : start + WORDS])
     text = " ".join(word for word in drawn if has.issuperset(word))
-    font = face(file, index, TRIAL * STROKE / stroke(face(file, index, TRIAL), text[:SAMPLE]))
+    width = stroke(face(file, index, TRIAL), text[:SAMPLE])
+    if not width > 0:
+        return family, None
+    font = face(file, index, TRIAL * STROKE / width)
     tall = sum(font.getmetrics())
     if tall > SIDE / 2:
         return family, None
