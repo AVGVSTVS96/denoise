@@ -1,12 +1,12 @@
 """The app's Detail step (src/raw.ts) in numpy, and how far the app's own picture is from it.
 
-    uv run detail.py RESULT.ppm INPUT.ppm DETAIL.ppm      raw_check.ts's three pictures of one photo
+    uv run detail.py RESULT.ppm DETAIL.ppm      raw_check.ts's result and Detail pictures of one photo
 
-The step gives a photo back its camera's own finest detail where the picture is busy and nowhere else:
-the finest band of the developed input's brightness (what a 3 px blur takes away) is added to the
-result where the result's own brightness moves by more than QUIET levels within 17 px, in full from
-BUSY levels up. It makes nothing up and touches no colour, and what it adds is the input's noise in
-that band as much as its detail. The app's Detail slider fades from the result to this picture.
+The step sharpens a result's own finest detail where the picture is busy and nowhere else: the finest
+band of the result's brightness (what a 3 px blur takes away) is added to it SHARPEST times over where
+its brightness moves by more than QUIET levels within 17 px, in full from BUSY levels up. Nothing of
+the noisy input comes back, so no grain does, and no colour is touched. The app's Detail slider fades
+from the result to this picture: at 50 the band is added once over.
 """
 
 import sys
@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 LUMA = np.array([0.299, 0.587, 0.114])
-REACH, QUIET, BUSY = 8, 4.0, 8.0
+REACH, QUIET, BUSY, SHARPEST = 8, 4.0, 8.0, 2.0
 SOFT = np.array([0.25, 0.5, 0.25])
 
 
@@ -31,17 +31,17 @@ def busy(result):
     return np.sqrt(box((bright - box(bright)) ** 2).clip(0))
 
 
-def detailed(result, shot):
-    """A result (H, W, 3, 8 bits) with its developed input's finest band of brightness back where it is busy."""
-    noisy = shot @ LUMA
-    fine = np.pad((noisy - cv2.sepFilter2D(noisy, -1, SOFT, SOFT))[1:-1, 1:-1], 1)
-    back = np.clip((busy(result) - QUIET) / (BUSY - QUIET), 0, 1) * fine
+def detailed(result):
+    """A result (H, W, 3, 8 bits) with its own finest band of brightness added SHARPEST times where it is busy."""
+    bright = result @ LUMA
+    fine = np.pad((bright - cv2.sepFilter2D(bright, -1, SOFT, SOFT))[1:-1, 1:-1], 1)
+    back = SHARPEST * np.clip((busy(result) - QUIET) / (BUSY - QUIET), 0, 1) * fine
     return np.clip(np.rint(result + back[..., None]), 0, 255).astype(np.uint8)
 
 
-def main(result, shot, detail):
-    result, shot, theirs = (cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) for path in (result, shot, detail))
-    ours = detailed(result, shot)
+def main(result, detail):
+    result, theirs = (cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) for path in (result, detail))
+    ours = detailed(result)
     apart = np.abs(theirs.astype(np.int32) - ours)
     lively = busy(result) > QUIET
     print(

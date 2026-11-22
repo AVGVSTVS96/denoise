@@ -70,7 +70,7 @@ await writeFile(out, Buffer.concat([head, picture]));
 if (input) await writeFile(input, Buffer.concat([head, shot]));
 
 if (detail) {
-  const fine = detailed(opaque(picture), opaque(shot), width);
+  const fine = detailed(opaque(picture), width);
 
   await writeFile(detail, Buffer.concat([head, Buffer.from(fine.filter((_, i) => i % 4 < 3))]));
 }

@@ -436,7 +436,7 @@ function Editor({
 }) {
   const [split, setSplit] = useState(50);
   const [strength, setStrength] = useState(() => Number(localStorage.getItem("strength") ?? 100));
-  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 0));
+  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 25));
   const [actual, setActual] = useState(false);
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
@@ -448,8 +448,8 @@ function Editor({
   }, [job.cleaned, canvas]);
 
   useEffect(() => {
-    if (done && job.raw && fine > 0) withDetail(input.current!, canvas.current!, detail.current!).catch(() => {});
-  }, [done, job.raw, fine, input, canvas, detail]);
+    if (done && job.raw && fine > 0) withDetail(canvas.current!, detail.current!).catch(() => {});
+  }, [done, job.raw, fine, canvas, detail]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -725,22 +725,21 @@ function eta(ms: number) {
 const STRIP = 256;
 const finer = new WeakMap<HTMLCanvasElement, Promise<void>>();
 
-async function fill(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement) {
+async function fill(over: HTMLCanvasElement, onto: HTMLCanvasElement) {
   const { width, height } = over;
-  const [shot, made, drawn] = [under, over, onto].map((canvas) => canvas.getContext("2d")!);
+  const [made, drawn] = [over, onto].map((canvas) => canvas.getContext("2d")!);
 
   for (let y = 0; y < height && onto.isConnected; y += STRIP) {
     const top = Math.max(0, y - MARGIN);
     const rows = Math.min(height, y + STRIP + MARGIN) - top;
-    const result = made.getImageData(0, top, width, rows).data;
-    const pixels = detailed(result, shot.getImageData(0, top, width, rows).data, width);
+    const pixels = detailed(made.getImageData(0, top, width, rows).data, width);
     drawn.putImageData(new ImageData(pixels, width, rows), 0, top, 0, y - top, width, STRIP);
     await new Promise((next) => setTimeout(next));
   }
 }
 
-function withDetail(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement) {
-  const filled = finer.get(onto) ?? fill(under, over, onto);
+function withDetail(over: HTMLCanvasElement, onto: HTMLCanvasElement) {
+  const filled = finer.get(onto) ?? fill(over, onto);
   finer.set(onto, filled);
 
   return filled;
@@ -758,7 +757,7 @@ async function blended(
   ctx.drawImage(over, 0, 0);
 
   if (fine > 0) {
-    await withDetail(under, over, onto);
+    await withDetail(over, onto);
     ctx.globalAlpha = fine / 100;
     ctx.drawImage(onto, 0, 0);
   }
