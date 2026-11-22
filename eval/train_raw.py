@@ -75,6 +75,12 @@ turned, in one colour darker or lighter than what is under it, and blurred as a 
 print is the finest detail anyone reads in a photo and the scenes hold little of it, so this is
 there to show the network what a stroke looks like. A run without it is what it was.
 
+--soften 0.3 0.9 blurs each joint crop's truth as a lens blurs, by a width drawn per crop between
+those two, in px of the truth, before it is sampled to a mosaic (softened()); the loss stays against
+the truth as it was. The truth and the mosaic made of it are otherwise equally sharp, so the network
+hands back a picture as soft as the lens drew it: this shows it a photo softer than its answer, for
+it to give back the band the lens took. A run without it is what it was.
+
 --teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
 trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
 against its picture, times --distil. Its picture is steadier than the truth, which keeps most of its
@@ -745,6 +751,23 @@ def lettered(truth, pages):
     return torch.lerp(truth, torch.where(dark, under / contrast, (under * contrast).clamp(max=1)), cover)
 
 
+def softened(truth, low, high):
+    """Camera RGB (N, 3, H, W), each blurred as a lens blurs it: a Gaussian between low and high px wide, drawn per crop.
+
+    A tap is the Gaussian's share of one pixel, so an edge between two pixels comes out as that lens
+    draws it; taps read off the curve at each pixel's middle would hardly blur under half a pixel.
+    The picture is mirrored past its edges.
+    """
+    n, reach = len(truth), math.ceil(3 * high)
+    width = torch.empty(n, 1, device=truth.device).uniform_(low, high)
+    sides = torch.arange(-reach, reach + 2, device=truth.device) - 0.5
+    taps = torch.erf(sides / (width * math.sqrt(2))).diff(dim=1)
+    taps = (taps / taps.sum(1, keepdim=True)).repeat_interleave(3, 0)
+    mirrored = torch.nn.functional.pad(truth, (reach,) * 4, mode="reflect").flatten(0, 1)[None]
+    across = torch.nn.functional.conv2d(mirrored, taps.view(-1, 1, 1, 2 * reach + 1), groups=3 * n)
+    return torch.nn.functional.conv2d(across, taps.view(-1, 1, 2 * reach + 1, 1), groups=3 * n).view_as(truth)
+
+
 def gains(clean, lit=0.0):
     """Scale each crop to LEVEL, from six times darker to twice brighter.
 
@@ -865,6 +888,8 @@ def main(args):
         raise SystemExit("--truth's share has to leave one of --joint's crops to the binned truth")
     if args.text and not args.joint:
         raise SystemExit("--text lays print into the joint crops' truth, for a --joint run")
+    if args.soften and not args.joint:
+        raise SystemExit("--soften blurs the joint crops' truth, for a --joint run")
     pages = torch.from_numpy(np.load(text_bank.OUT)).cuda() if args.text else None
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
@@ -936,7 +961,8 @@ def main(args):
                 truth = torch.cat([lettered(truth[:printed], pages), truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
-            noisy = at_white(under_noise(bench_raw.mosaiced(truth)), g)
+            soft = softened(truth, *args.soften) if args.soften else truth
+            noisy = at_white(under_noise(bench_raw.mosaiced(soft)), g)
             picture = cleaned(noisy)
             loss = loss + picture_loss(picture, truth)
             if teacher:
@@ -1093,6 +1119,13 @@ if __name__ == "__main__":
         help="a folder of truth measured in full colour, and the share of the joint crops taken from it unbinned",
     )
     parser.add_argument("--text", type=float, default=0, help="share of the joint crops with print laid into the truth")
+    parser.add_argument(
+        "--soften",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="the joint crops' truth is blurred by between these px before it is sampled to a mosaic",
+    )
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
