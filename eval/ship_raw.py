@@ -2,6 +2,7 @@
 
     uv run ship_raw.py data/models/raw/joint-v1/joint.pth      a finished run's weights
     uv run ship_raw.py data/models/raw/joint-v1/last.pth       a run still training: its averaged weights
+    uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright      a model trained with --bright
 
 The app packs a mosaic tile into four planes (R, G, G, B) and gets camera RGB at the mosaic's size
 back, so the file holds train_raw's fed() and made() around the network: the fixed mix to twelve
@@ -9,17 +10,19 @@ planes, NAFNet, the pixel shuffle. Half precision, with the layer norms and pool
 ship.py leaves them (Hush's export), because WebGPU computes fp16 for real and those overflow it.
 
 The app scales and tiles a photo as train_raw.denoise() does, tile_gain() and the fade between tiles
-with it, and reads tile_gain()'s two numbers from the manifest this writes. One thing differs, for
-light far brighter than the photo's mean:
+with it, and reads tile_gain()'s two numbers from the manifest this writes. A model trained with
+--bright has seen lit parts of dark photos at the whole photo's gain, so for one shipped as bright the
+manifest carries no numbers and every tile gets the photo's gain, as denoise() gives it with held off.
+One thing differs, for light far brighter than the photo's mean:
 
 CEILING: the network sees its input held under it, and what is held back is added to its picture as
 it is. NAFNet adds its input to its output, so below the ceiling nothing changes. Above it the
 network's values grow with the input: a lamp at the top gain drives them past 100,000, where fp16
 ends at 65,504 and WebGPU would hand back a tile of NaN. After tile_gain() only lights smaller than
-its block still pass the ceiling.
+its block still pass the ceiling; without it every light a dark photo's gain lifts past it does.
 
 Three checks before anything is written into the app:
-  the largest value any fp16 step holds, on real photos' tiles at the gain denoise() gives them and
+  the largest value any fp16 step holds, on real photos' tiles at the gain the app gives them and
   on made-up ones past any photo (a frame at the highest gain that is all highlight, one colour
   blown, a hot pixel in the dark), which stops the export at half of fp16's range;
   the fp16 file against PyTorch on bench_raw.py's full-colour windows, every ISO of the GR III;
@@ -113,7 +116,7 @@ def packed(mosaic):
     return train_raw.pack(torch.from_numpy(np.ascontiguousarray(mosaic))[None]).numpy()
 
 
-def photo_tiles(path, count=3):
+def photo_tiles(path, held, count=3):
     """Tiles of a photo as the app feeds them: its darkest, its brightest, and the rest spread between."""
     mosaic = raw_pairs.mosaic(path)
     gain = float(np.clip(train_raw.LEVEL / max(float(mosaic.mean()), 1e-6), 1, train_raw.MAX_GAIN))
@@ -121,7 +124,7 @@ def photo_tiles(path, count=3):
     corners.sort(key=lambda corner: mosaic[corner[0] : corner[0] + TILE, corner[1] : corner[1] + TILE].mean())
     picks = [corners[round(i * (len(corners) - 1) / (count - 1))] for i in range(count)]
     cut = lambda y, x: mosaic[y : y + TILE, x : x + TILE]
-    scaled = lambda tile: tile * train_raw.tile_gain(tile, gain)
+    scaled = lambda tile: tile * (train_raw.tile_gain(tile, gain) if held else gain)
     return {f"{path.parent.name}/{path.name} {y},{x}": packed(scaled(cut(y, x))) for y, x in picks}
 
 
@@ -164,12 +167,12 @@ def peaks(fp32, fp16):
     return ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]), names
 
 
-def audit(fp32, fp16):
+def audit(fp32, fp16, held):
     """Stops the export if an fp16 step comes within half of fp16's largest number."""
     session, names = peaks(fp32, fp16)
     tiles = made_up_tiles()
     for path in PHOTOS:
-        tiles |= photo_tiles(path)
+        tiles |= photo_tiles(path, held)
     worst = (0.0, "", "")
     for tile, planes in tiles.items():
         top, step = max(zip(map(float, session.run(names, {"input": planes})), names))
@@ -210,7 +213,7 @@ def parity(model, fp32, fp16, camera="colour/gr3"):
     return {f"fp16 against {name}": summed(rows) for name, rows in against.items()}
 
 
-def shipped(fp16, name):
+def shipped(fp16, name, held):
     """The file cut into the app's parts, under its hash, and the last shipped raw model's parts gone."""
     manifest = PUBLIC / "raw.json"
     if manifest.exists():
@@ -222,7 +225,7 @@ def shipped(fp16, name):
     for i, start in enumerate(range(0, len(blob), PART)):
         (folder / f"raw-joint-fp16.part{i}").write_bytes(blob[start : start + PART])
         parts.append(f"{digest[:8]}/raw-joint-fp16.part{i}")
-    brightest = {"block": train_raw.BLOCK, "level": train_raw.BRIGHTEST}
+    brightest = {"block": train_raw.BLOCK, "level": train_raw.BRIGHTEST} if held else None
     found = {"name": name, "bytes": len(blob), "sha256": digest, "parts": parts, "brightest": brightest}
     manifest.write_text(json.dumps(found, indent=2) + "\n")
     named = lambda body: hashlib.sha256(body.encode()).hexdigest()[:16]
@@ -231,15 +234,16 @@ def shipped(fp16, name):
     return manifest
 
 
-def main(checkpoint):
+def main(checkpoint, bright=""):
+    held = bright != "bright"
     model, name = loaded(pathlib.Path(checkpoint))
     fp32, fp16 = pathlib.Path(f"{OUT}-fp32.onnx"), pathlib.Path(f"{OUT}-fp16.onnx")
     exported(model, fp32)
     export.convert_fp16(fp32, fp16)
-    report = {"model": name, "fp16 range": audit(fp32, fp16), "parity": parity(model, fp32, fp16)}
+    report = {"model": name, "fp16 range": audit(fp32, fp16, held), "parity": parity(model, fp32, fp16)}
     print(json.dumps(report, indent=1))
-    print(shipped(fp16, f"{name}, fp16"), fp16.stat().st_size, export.sha256_file(fp16))
+    print(shipped(fp16, f"{name}, fp16", held), fp16.stat().st_size, export.sha256_file(fp16))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:])

@@ -22,6 +22,7 @@ const LEVEL = 0.1;
 const MAX_GAIN = 64;
 const EXPOSURE = 1.4;
 const STEPS = 65535;
+const UNHELD: Brightest = { block: TILE, level: Infinity };
 
 const mirrored = (size: number, padded: number) =>
   Int32Array.from({ length: padded }, (_, p) => {
@@ -118,11 +119,11 @@ function bilinear(planes: Float32Array, across: number, y: number, x: number, in
 export async function clean(
   raw: Raw,
   offsets: number[],
-  brightest: Brightest,
+  brightest: Brightest | null,
   network: Network,
   onPiece: (piece: Piece, done: number, total: number) => void,
 ) {
-  const { block, level } = brightest;
+  const { block, level } = brightest ?? UNHELD;
   const gain = photoGain(raw, offsets);
   const lowest = Math.min(...raw.balance);
   const m = raw.toSrgb;

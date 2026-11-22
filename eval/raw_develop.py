@@ -6,7 +6,8 @@
 The reference for the app's raw path (src/dng.ts, src/raw.ts), built from other parts: rawpy reads the
 mosaic and the camera's colour, exiv2 the DNG's crop and exposure, blacks.py's offsets come off where
 the raw names its body by a serial number (the app's setting as it ships), and the model runs in full
-precision through train_raw.denoise() itself, whose tiles, tile gains and fades the app follows.
+precision through train_raw.denoise() itself, whose tiles, tile gains and fades the app follows: held
+down for a tile with a light in it only if the shipped model's manifest says so.
 
 What is shared with the app is the recipe after the model: white balance with highlights clipped
 where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone
@@ -15,6 +16,7 @@ the sRGB curve. raw_check.ts makes APP.ppm, in the sensor's orientation, so the 
 held level.
 """
 
+import json
 import pathlib
 import subprocess
 import sys
@@ -73,7 +75,8 @@ def main(weights, photo, out, app=None):
     mosaic = raw_pairs.mosaic(photo)
     offsets = blacks.of(photo, borrowed=False).reshape(2, 2)
     mosaic = mosaic - np.tile(offsets, (mosaic.shape[0] // 2, mosaic.shape[1] // 2))
-    whole = developed(train_raw.denoise(model, mosaic), *look(photo))
+    held = json.loads((ship_raw.PUBLIC / "raw.json").read_text())["brightest"] is not None
+    whole = developed(train_raw.denoise(model, mosaic, held=held), *look(photo))
     x, y = (max(0, round(at) - shift) for at, shift in zip(tag(photo, "DefaultCropOrigin", [0, 0]), red[::-1]))
     width, height = (round(side) for side in tag(photo, "DefaultCropSize", mosaic.shape[::-1]))
     level = whole[y : y + height, x : x + width]

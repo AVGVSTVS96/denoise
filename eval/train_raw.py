@@ -317,12 +317,13 @@ def bright(clean_up):
 
 
 @torch.no_grad()
-def denoise(model, mosaic, tile=1024, overlap=64, window=None):
+def denoise(model, mosaic, tile=1024, overlap=64, window=None, held=True):
     """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
     The photo's mean sets the gain, as a crop's does in training, and tile_gain() holds it down for a
     tile with a light in it. Tiles then differ in gain, so they fade into each other over
     the middle half of what they share; the last row and column of tiles sit flush with the far edge.
+    With held off every tile gets the photo's gain, which a model trained with --bright can take.
     Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model. With window (y, x, height,
     width) only the tiles that reach it run and only it comes back, the same pixels the whole photo gives.
     """
@@ -339,7 +340,7 @@ def denoise(model, mosaic, tile=1024, overlap=64, window=None):
     for y in starts(padded.shape[0], top, height):
         for x in starts(padded.shape[1], left, width):
             piece = padded[y : y + tile, x : x + tile]
-            own = tile_gain(piece, gain)
+            own = tile_gain(piece, gain) if held else gain
             shown = torch.from_numpy(np.ascontiguousarray(piece * own)).cuda()[None]
             with torch.autocast("cuda", torch.bfloat16):
                 result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()

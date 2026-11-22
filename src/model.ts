@@ -4,7 +4,7 @@ import type { Brightest } from "./raw";
 
 type Manifest = { name: string; bytes: number; sha256: string; parts: string[] };
 
-type Models = { photo: Manifest; raw: Manifest & { brightest: Brightest } };
+type Models = { photo: Manifest; raw: Manifest & { brightest: Brightest | null } };
 
 export const models: Models = { photo, raw };
 
