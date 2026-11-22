@@ -1,8 +1,19 @@
+import type { Raw } from "./dng";
+
 type Table = Partial<Record<string, Record<string, number[]>>>;
 
-export async function blackOffsets(body: string, iso: number) {
+const BORROWED = "borrowed-offsets";
+
+export const borrowing = () => localStorage.getItem(BORROWED) !== null;
+
+export const setBorrowing = (on: boolean) =>
+  on ? localStorage.setItem(BORROWED, "1") : localStorage.removeItem(BORROWED);
+
+export async function blackOffsets({ camera, serial, iso }: Pick<Raw, "camera" | "serial" | "iso">, borrowed: boolean) {
+  if (!serial && !borrowed) return [0, 0, 0, 0];
   const { default: table }: { default: Table } = await import("./blacks.json");
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body)));
+  const body = new TextEncoder().encode(`${camera} ${serial}`.trim());
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", body));
   const rows = table[Array.from(digest.subarray(0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("")];
 
   const isos = Object.keys(rows ?? {})

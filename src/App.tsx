@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { borrowing, setBorrowing } from "./blacks";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
@@ -166,7 +167,7 @@ export function App() {
         }
       });
 
-      w.postMessage({ file, key, model });
+      w.postMessage({ file, key, model, borrowed: borrowing() });
     },
     [key, model],
   );
@@ -299,6 +300,7 @@ function Pick({
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [train, setTrain] = useState(sharing);
+  const [borrowed, setBorrowed] = useState(borrowing);
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -396,6 +398,19 @@ function Pick({
             ? "Photos you clean help train denoise · Turn off"
             : "Photos you clean stay private · Share for training"}
         </button>
+        {!cloud && (
+          <button
+            onClick={() => {
+              setBorrowing(!borrowed);
+              setBorrowed(!borrowed);
+            }}
+            className="block w-full underline-offset-2 hover:text-fg hover:underline"
+          >
+            {borrowed
+              ? "Black offsets from another body of your camera: on · Turn off"
+              : "Black offsets from another body of your camera: off · Turn on"}
+          </button>
+        )}
         {!cloud && !hasWebGPU && <p>This browser has no WebGPU. Use Safari 26+ or Chrome.</p>}
       </div>
     </div>

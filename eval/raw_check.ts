@@ -17,13 +17,14 @@ const raw = await rawPhoto(new Blob([await readFile(photo)]));
 
 if (!raw) throw new Error(`${photo} is not a Bayer DNG`);
 
-const offsets = await blackOffsets(raw.body, raw.iso);
+const offsets = await blackOffsets(raw, false);
 const { width, height } = raw.crop;
 const picture = new Uint8Array(width * height * 3);
 const shot = new Uint8Array(input ? picture.length : 0);
 const started = performance.now();
+const { camera, serial, iso } = raw;
 
-console.log(JSON.stringify({ body: raw.body, iso: raw.iso, offsets, gain: photoGain(raw, offsets), width, height }));
+console.log(JSON.stringify({ camera, serial, iso, offsets, gain: photoGain(raw, offsets), width, height }));
 
 await clean(
   raw,

@@ -20,7 +20,8 @@ export type Raw = {
   balance: number[];
   toSrgb: number[];
   exposure: number;
-  body: string;
+  camera: string;
+  serial: string;
   iso: number;
 };
 
@@ -295,7 +296,8 @@ export async function rawPhoto(file: Blob): Promise<Raw | undefined> {
     orientation: numbers(tiff, main, 274)[0] ?? 1,
     ...colour(tiff, main),
     exposure: numbers(tiff, main, 50730)[0] ?? 0,
-    body: `${text(tiff, main, 272)} ${text(tiff, serial, 42033)}`.trim(),
+    camera: text(tiff, main, 272),
+    serial: text(tiff, serial, 42033),
     iso: speeds.find((speed) => !UNKNOWN_ISO.includes(speed)) ?? 0,
   };
 }

@@ -293,7 +293,7 @@ async function originalUpright(file: Blob, raw: Raw) {
   post({ type: "original", blob: await made.canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 }) });
 }
 
-async function runRaw(file: Blob, raw: Raw) {
+async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
   const { crop } = raw;
   const fitted = Math.floor(CORE * Math.sqrt(MAX_PIXELS / (crop.width * crop.height))) / CORE;
   const full = upright(raw.orientation, crop.width, crop.height);
@@ -316,7 +316,7 @@ async function runRaw(file: Blob, raw: Raw) {
   const turned = new OffscreenCanvas(PIECE, PIECE).getContext("2d")!;
   turned.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
   turned.imageSmoothingQuality = ctx.imageSmoothingQuality;
-  const [sess, offsets] = await Promise.all([getSession("raw"), blackOffsets(raw.body, raw.iso)]);
+  const [sess, offsets] = await Promise.all([getSession("raw"), blackOffsets(raw, borrowed)]);
 
   const network = async (planes: Float32Array, height: number, width: number) => {
     const result = await sess.run({ [sess.inputNames[0]]: new ort.Tensor("float32", planes, [1, 4, height, width]) });
@@ -365,14 +365,14 @@ async function runRaw(file: Blob, raw: Raw) {
   canvas.width = 0;
 }
 
-async function runOnDevice(file: Blob) {
+async function runOnDevice(file: Blob, borrowed: boolean) {
   const raw = await rawPhoto(file).catch(() => undefined);
 
-  return raw ? runRaw(file, raw) : run(file);
+  return raw ? runRaw(file, raw, borrowed) : run(file);
 }
 
-onmessage = (e: MessageEvent<{ file: Blob; key?: string; model: cloud.Model }>) => {
-  (e.data.key ? runCloud(e.data.file, e.data.key, e.data.model) : runOnDevice(e.data.file)).catch((err: Error) =>
+onmessage = ({ data }: MessageEvent<{ file: Blob; key?: string; model: cloud.Model; borrowed: boolean }>) => {
+  (data.key ? runCloud(data.file, data.key, data.model) : runOnDevice(data.file, data.borrowed)).catch((err: Error) =>
     post({ type: "error", message: err.message }),
   );
 };

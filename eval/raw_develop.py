@@ -4,9 +4,9 @@
     uv run raw_develop.py MODEL.pth PHOTO.dng OUT.png APP.ppm     and how far the app's picture is from it
 
 The reference for the app's raw path (src/dng.ts, src/raw.ts), built from other parts: rawpy reads the
-mosaic and the camera's colour, exiv2 the DNG's crop and exposure, blacks.py's offsets come off as in
-raw_denoise.py, and the model runs in full precision through train_raw.denoise() itself, whose tiles,
-tile gains and fades the app follows.
+mosaic and the camera's colour, exiv2 the DNG's crop and exposure, blacks.py's offsets come off where
+the raw names its body by a serial number (the app's setting as it ships), and the model runs in full
+precision through train_raw.denoise() itself, whose tiles, tile gains and fades the app follows.
 
 What is shared with the app is the recipe after the model: white balance with highlights clipped
 where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone
@@ -71,7 +71,8 @@ def main(weights, photo, out, app=None):
         colours, pattern, flip = raw.color_desc.decode(), raw.raw_pattern, raw.sizes.flip
     red = next((i, j) for i in range(2) for j in range(2) if colours[pattern[i, j]] == "R")
     mosaic = raw_pairs.mosaic(photo)
-    mosaic = mosaic - np.tile(blacks.of(photo).reshape(2, 2), (mosaic.shape[0] // 2, mosaic.shape[1] // 2))
+    offsets = blacks.of(photo, borrowed=False).reshape(2, 2)
+    mosaic = mosaic - np.tile(offsets, (mosaic.shape[0] // 2, mosaic.shape[1] // 2))
     whole = developed(train_raw.denoise(model, mosaic), *look(photo))
     x, y = (max(0, round(at) - shift) for at, shift in zip(tag(photo, "DefaultCropOrigin", [0, 0]), red[::-1]))
     width, height = (round(side) for side in tag(photo, "DefaultCropSize", mosaic.shape[::-1]))

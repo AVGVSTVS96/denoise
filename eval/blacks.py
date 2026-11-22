@@ -31,8 +31,8 @@ UNKNOWN_ISO = (0, 65535)
 UNNAMED = ("", "MODEL-NAME")
 
 
-def body(path):
-    """The body that took a raw, as its camera name and serial number, and the ISO it was taken at (0 when unnamed).
+def named(path):
+    """A raw's camera name, its serial number ("" when it carries none) and the ISO it was taken at (0 when unnamed).
 
     EXIF's ISO field stops at 65,535, so a higher ISO is read from the fields that took over from it.
     """
@@ -45,7 +45,13 @@ def body(path):
     serial = next((found[tag] for tag in SERIAL_TAGS if found.get(tag)), "")
     number = lambda tag: int(found[tag].split()[0]) if found.get(tag, "")[:1].isdigit() else 0
     iso = next((number(tag) for tag in ISO_TAGS if number(tag) not in UNKNOWN_ISO), 0)
-    return f"{found.get('Model', '')} {serial}".strip(), iso
+    return found.get("Model", ""), serial, iso
+
+
+def body(path):
+    """The body that took a raw, as its camera name and serial number, and the ISO it was taken at."""
+    camera, serial, iso = named(path)
+    return f"{camera} {serial}".strip(), iso
 
 
 @functools.cache
@@ -53,11 +59,14 @@ def table():
     return json.loads(TABLE.read_text()) if TABLE.exists() else {}
 
 
-def of(path):
-    """A raw's four black offsets (R, G, G, B) in its own normalised units, between the ISOs its body was measured at."""
-    name, iso = body(path)
-    rows = table().get(name)
-    if not rows or not iso:
+def of(path, borrowed=True):
+    """A raw's four black offsets (R, G, G, B) in its own normalised units, between the ISOs its body was measured at.
+
+    A raw without a serial number takes its camera's row, measured on another body, unless borrowed is off,
+    which is how the app leaves it until its user turns that on."""
+    camera, serial, iso = named(path)
+    rows = table().get(f"{camera} {serial}".strip())
+    if not rows or not iso or not (serial or borrowed):
         return np.zeros(4, np.float32)
     isos = sorted(rows, key=int)
     steps, offsets = np.log([int(step) for step in isos]), np.array([rows[step] for step in isos])

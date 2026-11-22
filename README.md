@@ -22,7 +22,7 @@ A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG
 3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
 4. The noisy mosaic is developed the same way beside it, filled in by a plain bilinear demosaic. The Strength slider blends the result with that picture, from 0% (the photo as shot) to 100% (the model's result), and Save keeps the blend.
 
-Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`). Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.
+Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`), for a raw that names its body by a serial number. A raw without one (Ricoh, Sony, Samsung) can only take the offsets of another body of its camera, which don't carry over, so it gets none unless that is turned on under the photo picker. Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.
 
 ## Cloud
 
