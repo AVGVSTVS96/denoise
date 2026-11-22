@@ -18,7 +18,7 @@ bun dev
 A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG preview:
 
 1. The worker reads the mosaic itself (uncompressed or lossless JPEG, strips or tiles, 8 to 16 bits), the black and white levels, and the camera's colour from the DNG's tags.
-2. The mosaic is scaled and tiled the way `eval/train_raw.py`'s `denoise()` does it and runs through the joint model in 1024 px tiles (64 px of mirrored border, tiles fade into each other over the middle of what they share). A tile with a light in it gets a lower gain of its own, by `train_raw.tile_gain`'s rule: no 128 px block brighter than a blown block in a photo that needs no gain. The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
+2. The mosaic is scaled and tiled the way `eval/train_raw.py`'s `denoise()` does it and runs through the joint model in 1024 px tiles (64 px of mirrored border, tiles fade into each other over the middle of what they share). A model that was not trained on lit parts of dark photos needs a tile with a light in it held to a lower gain of its own, by `train_raw.tile_gain`'s rule: no 128 px block brighter than a blown block in a photo that needs no gain. The model's manifest (`public/model/raw.json`) says whether it does; the one shipped, trained with `--bright`, does not, so every tile gets the photo's gain. The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
 3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
 4. The noisy mosaic is developed the same way beside it, filled in by a plain bilinear demosaic. The Strength slider blends the result with that picture, from 0% (the photo as shot) to 100% (the model's result), and Save keeps the blend.
 
@@ -42,7 +42,10 @@ The raw model is the same network with twelve planes in and out (packed RGGB in,
 
 ```sh
 cd eval && uv run ship_raw.py data/models/raw/joint-v1/joint.pth
+cd eval && uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright
 ```
+
+The second form is for a model trained with `--bright`: it ships without the hold-down for tiles with a light in them.
 
 `eval/raw_check.ts` runs the app's raw path outside a browser and `eval/raw_develop.py` compares its picture with the Python pipeline's.
 

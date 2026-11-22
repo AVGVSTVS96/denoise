@@ -7,8 +7,5 @@
     "0a73052d/raw-joint-fp16.part1",
     "0a73052d/raw-joint-fp16.part2"
   ],
-  "brightest": {
-    "block": 128,
-    "level": 1.0
-  }
+  "brightest": null
 }
