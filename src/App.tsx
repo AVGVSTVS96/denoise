@@ -41,6 +41,7 @@ export function App() {
   const [model, setModel] = useState<Model>(() => (localStorage.getItem("cloud-model") === "pro" ? "pro" : "flash"));
   const [photos, setPhotos] = useState<Photo[]>();
   const canvas = useRef<HTMLCanvasElement>(null);
+  const input = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
   useEffect(() => {
@@ -132,7 +133,10 @@ export function App() {
 
             return;
           case "tile":
-            canvas.current?.getContext("2d")?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
+          case "input":
+            (data.type === "tile" ? canvas : input).current
+              ?.getContext("2d")
+              ?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
 
             return;
           case "done":
@@ -248,7 +252,7 @@ export function App() {
       </header>
       <main className="flex min-h-0 flex-1 flex-col">
         {job ? (
-          <Editor job={job} error={error} canvas={canvas} onNew={reset} />
+          <Editor job={job} error={error} canvas={canvas} input={input} onNew={reset} />
         ) : (
           <Pick
             onFile={open}
@@ -402,14 +406,17 @@ function Editor({
   job,
   error,
   canvas,
+  input,
   onNew,
 }: {
   job: Job;
   error?: string;
   canvas: React.RefObject<HTMLCanvasElement | null>;
+  input: React.RefObject<HTMLCanvasElement | null>;
   onNew: () => void;
 }) {
   const [split, setSplit] = useState(50);
+  const [strength, setStrength] = useState(() => Number(localStorage.getItem("strength") ?? 100));
   const [actual, setActual] = useState(false);
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
@@ -489,13 +496,21 @@ function Editor({
             className={`relative m-auto shrink-0 overflow-hidden bg-line select-none ${actual ? "" : "rounded-lg"} ${done && !actual ? "cursor-ew-resize touch-none" : ""}`}
           >
             <img src={job.original} alt="" draggable={false} className="absolute inset-0 size-full" />
-            <canvas
-              ref={canvas}
-              width={job.width}
-              height={job.height}
-              className="absolute inset-0 size-full"
+            <div
+              className="absolute inset-0"
               style={done ? { clipPath: `inset(0 0 0 ${Math.min(100, Math.max(0, clip))}%)` } : undefined}
-            />
+            >
+              {job.raw && (
+                <canvas ref={input} width={job.width} height={job.height} className="absolute inset-0 size-full" />
+              )}
+              <canvas
+                ref={canvas}
+                width={job.width}
+                height={job.height}
+                className="absolute inset-0 size-full"
+                style={job.raw ? { opacity: strength / 100 } : undefined}
+              />
+            </div>
             {done && !actual && <Divider split={split} />}
           </div>
         </div>
@@ -511,16 +526,39 @@ function Editor({
       </div>
       <footer className="relative shrink-0 px-5 py-3">
         <Progress job={job} error={error} />
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-3">
           <p className="min-w-0 flex-1 truncate text-[13px] text-muted tabular-nums">
             {error ? <span className="text-red-500">{error}</span> : status(job)}
           </p>
+          {done && job.raw && (
+            <label className="order-first flex basis-full items-center gap-3 text-[13px] text-muted tabular-nums sm:order-none sm:mr-2 sm:basis-auto">
+              Strength
+              <input
+                type="range"
+                value={strength}
+                onChange={(e) => {
+                  localStorage.setItem("strength", e.target.value);
+                  setStrength(e.target.valueAsNumber);
+                }}
+                className="strength min-w-0 flex-1 sm:w-36 sm:flex-none"
+              />
+              <span className="w-[4ch] text-right">{strength}%</span>
+            </label>
+          )}
           <Button onClick={() => setActual((a) => !a)} disabled={!job.width}>
             {actual ? "Fit" : "1:1"}
           </Button>
           <Button onClick={onNew}>New</Button>
           {done && job.result && (
-            <Button primary onClick={() => save(job.result!, `${job.name}-denoised.jpg`)}>
+            <Button
+              primary
+              onClick={async () =>
+                save(
+                  job.raw && strength < 100 ? await blended(input.current!, canvas.current!, strength) : job.result!,
+                  `${job.name}-denoised.jpg`,
+                )
+              }
+            >
               Save
             </Button>
           )}
@@ -642,6 +680,16 @@ function eta(ms: number) {
   const s = Math.max(1, Math.round(ms / 1000));
 
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+}
+
+function blended(under: HTMLCanvasElement, over: HTMLCanvasElement, strength: number) {
+  const mixed = new OffscreenCanvas(over.width, over.height);
+  const ctx = mixed.getContext("2d")!;
+  ctx.drawImage(under, 0, 0);
+  ctx.globalAlpha = strength / 100;
+  ctx.drawImage(over, 0, 0);
+
+  return mixed.convertToBlob({ type: "image/jpeg", quality: 0.95 });
 }
 
 async function save(blob: Blob, filename: string) {

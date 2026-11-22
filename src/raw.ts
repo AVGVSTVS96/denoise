@@ -2,7 +2,14 @@ import type { Raw } from "./dng";
 
 export type Network = (planes: Float32Array, height: number, width: number) => Promise<Float32Array>;
 
-export type Piece = { x: number; y: number; width: number; height: number; pixels: Uint8ClampedArray<ArrayBuffer> };
+export type Piece = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pixels: Uint8ClampedArray<ArrayBuffer>;
+  input: Uint8ClampedArray<ArrayBuffer>;
+};
 
 export type Brightest = { block: number; level: number };
 
@@ -91,6 +98,23 @@ const faded = (size: number, tile: number, begins: number[]) => {
   return { tiles, all: before };
 };
 
+function bilinear(planes: Float32Array, across: number, y: number, x: number, into: Float32Array) {
+  const plane = planes.length / 4;
+
+  const at = (row: number, column: number) =>
+    planes[(((row & 1) << 1) | (column & 1)) * plane + (row >> 1) * across + (column >> 1)];
+
+  const here = at(y, x);
+  const beside = (at(y, x - 1) + at(y, x + 1)) / 2;
+  const above = (at(y - 1, x) + at(y + 1, x)) / 2;
+  const corners = (at(y - 1, x - 1) + at(y - 1, x + 1) + at(y + 1, x - 1) + at(y + 1, x + 1)) / 4;
+  const green = (y ^ x) & 1;
+  const onRed = (y & 1) === 0;
+  into[0] = green ? (onRed ? beside : above) : onRed ? here : corners;
+  into[1] = green ? here : (beside + above) / 2;
+  into[2] = green ? (onRed ? above : beside) : onRed ? corners : here;
+}
+
 export async function clean(
   raw: Raw,
   offsets: number[],
@@ -154,7 +178,18 @@ export async function clean(
       const out = await network(planes, down.tile >> 1, across.tile >> 1);
       const picture = down.tile * across.tile;
       const pixels = new Uint8ClampedArray(Math.max(0, x1 - x0) * Math.max(0, y1 - y0) * 4);
+      const input = new Uint8ClampedArray(pixels.length);
+      const shot = new Float32Array(3);
       let p = 0;
+
+      const paint = (onto: Uint8ClampedArray, ofRed: number, ofGreen: number, ofBlue: number) => {
+        const rr = Math.min(1, ofRed * red);
+        const gg = Math.min(1, ofGreen * green);
+        const bb = Math.min(1, ofBlue * blue);
+        onto[p] = step(m[0] * rr + m[1] * gg + m[2] * bb);
+        onto[p + 1] = step(m[3] * rr + m[4] * gg + m[5] * bb);
+        onto[p + 2] = step(m[6] * rr + m[7] * gg + m[8] * bb);
+      };
 
       for (let y = y0; y < y1; y++) {
         const above = rows.earlier[y];
@@ -162,14 +197,12 @@ export async function clean(
 
         for (let x = x0; x < x1; x++) {
           const i = (y - top + OVERLAP) * across.tile + x - left + OVERLAP;
-          const rr = Math.min(1, out[i] * red);
-          const gg = Math.min(1, out[picture + i] * green);
-          const bb = Math.min(1, out[2 * picture + i] * blue);
           const weight = here * cols.own[x];
-          pixels[p] = step(m[0] * rr + m[1] * gg + m[2] * bb);
-          pixels[p + 1] = step(m[3] * rr + m[4] * gg + m[5] * bb);
-          pixels[p + 2] = step(m[6] * rr + m[7] * gg + m[8] * bb);
+          paint(pixels, out[i], out[picture + i], out[2 * picture + i]);
           pixels[p + 3] = Math.round((255 * weight) / (above * fadeAcross.all[x] + here * cols.earlier[x] + weight));
+          bilinear(planes, across.tile >> 1, y - top + OVERLAP, x - left + OVERLAP, shot);
+          paint(input, shot[0], shot[1], shot[2]);
+          input[p + 3] = 255;
           p += 4;
         }
       }
@@ -177,7 +210,7 @@ export async function clean(
       done++;
 
       if (pixels.length)
-        onPiece({ x: x0 - crop.x, y: y0 - crop.y, width: x1 - x0, height: y1 - y0, pixels }, done, total);
+        onPiece({ x: x0 - crop.x, y: y0 - crop.y, width: x1 - x0, height: y1 - y0, pixels, input }, done, total);
     }
   }
 }

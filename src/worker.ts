@@ -9,7 +9,7 @@ export type FromWorker =
   | { type: "model"; loaded: number; total: number }
   | { type: "start"; width: number; height: number; raw: boolean }
   | { type: "original"; blob: Blob }
-  | { type: "tile"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
+  | { type: "tile" | "input"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
   | { type: "done"; blob: Blob }
   | { type: "error"; message: string };
@@ -313,6 +313,9 @@ async function runRaw(file: Blob, raw: Raw) {
   ctx.imageSmoothingQuality = "high";
   const scratch = new OffscreenCanvas(PIECE, PIECE);
   const held = scratch.getContext("2d")!;
+  const turned = new OffscreenCanvas(PIECE, PIECE).getContext("2d")!;
+  turned.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
+  turned.imageSmoothingQuality = ctx.imageSmoothingQuality;
   const [sess, offsets] = await Promise.all([getSession("raw"), blackOffsets(raw.body, raw.iso)]);
 
   const network = async (planes: Float32Array, height: number, width: number) => {
@@ -328,24 +331,38 @@ async function runRaw(file: Blob, raw: Raw) {
   post({ type: "progress", done: 0, total: 1 });
 
   await clean(raw, offsets, models.raw.brightest, network, (piece, done, total) => {
-    held.putImageData(new ImageData(piece.pixels, piece.width, piece.height), 0, 0);
     const x = (piece.x + crop.x) * scale - dx;
     const y = (piece.y + crop.y) * scale - dy;
     const w = piece.width * scale;
     const h = piece.height * scale;
-    ctx.drawImage(scratch, 0, 0, piece.width, piece.height, x, y, w, h);
     const from = turn.transformPoint({ x, y });
     const to = turn.transformPoint({ x: x + w, y: y + h });
-    const left = Math.max(0, Math.round(Math.min(from.x, to.x)));
-    const top = Math.max(0, Math.round(Math.min(from.y, to.y)));
-    const right = Math.min(W, Math.round(Math.max(from.x, to.x)));
-    const bottom = Math.min(H, Math.round(Math.max(from.y, to.y)));
-    const { data } = ctx.getImageData(left, top, right - left, bottom - top);
-    post({ type: "tile", x: left, y: top, w: right - left, h: bottom - top, pixels: data }, [data.buffer]);
+    const left = Math.max(0, Math.ceil(Math.min(from.x, to.x)));
+    const top = Math.max(0, Math.ceil(Math.min(from.y, to.y)));
+    const right = Math.min(W, Math.floor(Math.max(from.x, to.x)));
+    const bottom = Math.min(H, Math.floor(Math.max(from.y, to.y)));
+
+    const shown = (
+      type: "tile" | "input",
+      pixels: Uint8ClampedArray<ArrayBuffer>,
+      onto: OffscreenCanvasRenderingContext2D,
+      atX: number,
+      atY: number,
+    ) => {
+      held.putImageData(new ImageData(pixels, piece.width, piece.height), 0, 0);
+      onto.drawImage(scratch, 0, 0, piece.width, piece.height, x, y, w, h);
+      const { data } = onto.getImageData(atX, atY, right - left, bottom - top);
+      post({ type, x: left, y: top, w: right - left, h: bottom - top, pixels: data }, [data.buffer]);
+    };
+
+    turned.setTransform(turn.a, turn.b, turn.c, turn.d, turn.e - left, turn.f - top);
+    shown("input", piece.input, turned, 0, 0);
+    shown("tile", piece.pixels, ctx, left, top);
     post({ type: "progress", done, total });
   });
 
   post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  canvas.width = 0;
 }
 
 async function runOnDevice(file: Blob) {

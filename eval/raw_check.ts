@@ -6,7 +6,7 @@ import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
 import { clean, photoGain } from "../src/raw";
 
-const [photo, out] = process.argv.slice(2);
+const [photo, out, input] = process.argv.slice(2);
 const model = join(import.meta.dirname, "../public/model");
 const parts = await Promise.all(manifest.parts.map((part) => readFile(join(model, part))));
 
@@ -20,6 +20,7 @@ if (!raw) throw new Error(`${photo} is not a Bayer DNG`);
 const offsets = await blackOffsets(raw.body, raw.iso);
 const { width, height } = raw.crop;
 const picture = new Uint8Array(width * height * 3);
+const shot = new Uint8Array(input ? picture.length : 0);
 const started = performance.now();
 
 console.log(JSON.stringify({ body: raw.body, iso: raw.iso, offsets, gain: photoGain(raw, offsets), width, height }));
@@ -41,8 +42,11 @@ await clean(
         const to = ((piece.y + y) * width + piece.x + x) * 3;
         const shown = piece.pixels[from + 3] / 255;
 
-        for (let k = 0; k < 3; k++)
+        for (let k = 0; k < 3; k++) {
           picture[to + k] = Math.round(piece.pixels[from + k] * shown + picture[to + k] * (1 - shown));
+
+          if (input) shot[to + k] = piece.input[from + k];
+        }
       }
     }
 
@@ -50,4 +54,8 @@ await clean(
   },
 );
 
-await writeFile(out, Buffer.concat([Buffer.from(`P6\n${width} ${height}\n255\n`), picture]));
+const head = Buffer.from(`P6\n${width} ${height}\n255\n`);
+
+await writeFile(out, Buffer.concat([head, picture]));
+
+if (input) await writeFile(input, Buffer.concat([head, shot]));
