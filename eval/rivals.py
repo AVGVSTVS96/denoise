@@ -42,6 +42,11 @@ picture, and is fed each frame as shot, with no gain: none of these apps brighte
     uv run rivals.py night rawforge-jdd darktable             the night test alone
     uv run rivals.py shift rawforge-jdd darktable             the shift test alone
 
+A rival also gets bench_raw.dials' rows in data/out/quality.json, under its own name: noise left,
+stops cleaner, detail kept and invented, of the picture it makes itself.
+
+    uv run rivals.py quality rawforge-jdd darktable           those numbers alone
+
 A model of ours gets "<name>-x8", the mean over the mosaic's eight flips and turns.
 """
 
@@ -64,6 +69,7 @@ import train_raw
 
 RIVALS = raw_pairs.DATA / "rivals"
 BOARD = raw_pairs.DATA / "out" / "bench.json"
+QUALITY = raw_pairs.DATA / "out" / "quality.json"
 RELEASES = {
     "darktable/rawdenoise-nind.dtmodel": "darktable-org/darktable-ai/releases/download/release-5.6.0",
     "rawforge/ShadowWeightedL1.pt": "rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
@@ -391,11 +397,11 @@ def rows(spec):
 
 
 def main(specs, only=""):
-    def add(test, name, by_iso):
-        table = json.loads(BOARD.read_text()) if BOARD.exists() else {}
+    def add(test, name, by_iso, board=BOARD):
+        table = json.loads(board.read_text()) if board.exists() else {}
         table.setdefault(test, {})[name] = by_iso
-        BOARD.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
-        BOARD.with_suffix(".tmp").rename(BOARD)
+        board.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
+        board.with_suffix(".tmp").rename(board)
         cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
         print(f"{test:24}{name:20}" + "".join(f"{row[0]:8.2f} {row[1]:.3f}" for row in cells), flush=True)
 
@@ -410,6 +416,8 @@ def main(specs, only=""):
             add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", True, with_detail=True)[0])
         if own and only in ("", "shift"):
             add("shift", spec, bench_raw.scores(own, "shift", True, with_detail=True)[0])
+        for test, cut in bench_raw.looked_at().items() if own and only in ("", "quality") else ():
+            add(test, spec, bench_raw.dials(own, cut), QUALITY)
         name = f"{spec}-cfa" if spec in PICTURES else spec
         for test, by_gain in bench_raw.night(name, own).items() if own and only in ("", "night") else ():
             add(test, name, by_gain)
@@ -419,5 +427,5 @@ if __name__ == "__main__":
     if sys.argv[1:] in (["cameras"], ["fetch"]):
         {"cameras": cameras, "fetch": fetch}[sys.argv[1]]()
     else:
-        only = sys.argv[1] if sys.argv[1] in ("night", "shift") else ""
+        only = sys.argv[1] if sys.argv[1] in ("night", "shift", "quality") else ""
         main(sys.argv[1 + bool(only) :], only)

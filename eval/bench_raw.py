@@ -61,6 +61,20 @@ and the truth's own, both in 8-bit levels, and the error spectrum's peak and its
 two-pixel limit, each over its median: the two are the same number when a two-pixel pattern is the
 largest thing wrong.
 
+PSNR folds noise and detail into one number that hardly moves, so every model scored also gets
+quality.py's numbers, which a person can picture, in data/out/quality.json: its rows are
+[noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented] by ISO, under
+the board's test names. Noise left is what is left where the truth is flat, as the eye weighs it at
+2x, in 8-bit levels, and stops cleaner is the same against the noisy frame's. Detail kept is the
+share of the truth's detail the result holds where the truth is busy, and invented what else it
+holds there; the finest is the band 2 to 3 px across, where small print lives. All of it is of the
+picture a model makes itself, a mosaic through the bilinear demosaic. "gr3", "gr3x", "unseen" and
+"seen" are the real noisy frames against their clean twins: read noise there, on real noise, and not
+detail, since a twin is no sharper than the result. "<test>-colour" and "shift" are the full-colour
+tests: read detail there, under made-up noise.
+
+    uv run bench_raw.py quality joint-v2=data/models/raw/joint-v2/joint.pth      those numbers alone
+
 "night" is the test of what the model is for: data/night-raw's dark scenes, ELD's, SID's Sony ones
 and RawNIND's, each a real noisy frame against a long exposure, 8 windows a pair. Its windows are in
 the noisy frame's own units, the ones denoise() meets, with the clean frame brought to them by the
@@ -87,13 +101,14 @@ the check costs four passes over its windows, so it runs when asked for by name.
     uv run bench_raw.py tiles                                          cut those windows, into data/bench/wide
     uv run bench_raw.py tiles joint-v2=data/models/raw/joint-v2/joint.pth
 
-"colour", "shift" or "night" before the models scores that test alone:
+"colour", "shift", "night" or "quality" before the models scores that alone:
 
     uv run bench_raw.py night joint-v2=data/models/raw/joint-v2/joint.pth
 """
 
 import functools
 import json
+import math
 import sys
 
 import cv2
@@ -103,6 +118,7 @@ import torch
 
 import blacks
 import pixel_shift
+import quality
 import raw_pairs
 
 BENCH = raw_pairs.DATA / "bench"
@@ -666,6 +682,41 @@ def score_one(clean_up, cut, with_lpips, demosaic=None, with_detail=False, white
     return as_cut, aligned, as_shot, fixed
 
 
+def looked_at():
+    """The tests dials() is kept for, each with its windows' name: the real noisy frames and the full-colour tests."""
+    real = {camera: camera for camera in (*CAMERAS, *groups())}
+    return real | {f"{camera}-colour": f"colour/{camera}" for camera in real} | {"shift": "shift"}
+
+
+@torch.no_grad()
+def dials(clean_up, camera, demosaic=None):
+    """{ISO: [noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented]}
+    of the picture clean_up makes of a test's windows, as quality.py measures it and the eye weighs
+    it at 2x. The truth is each noisy frame's clean twin, or a full-colour test's truth. demosaic is
+    what a cleaned mosaic goes through in place of the bilinear one (see develop)."""
+    return over_cameras([dials_one(clean_up, windows(name), demosaic) for name in cuts(camera)])
+
+
+@torch.no_grad()
+def dials_one(clean_up, cut, demosaic=None):
+    """dials() for one file's windows. Flat and busy are picked over all of a truth's windows together."""
+    frames, isos, means, wb, matrix, twins, *_ = cut
+    exposure = 0.108 / develop(frames[0], wb, matrix).median()
+    picture = lambda result, way=None: ((develop(result, wb, matrix, way) * exposure).clamp(0, 1) ** (1 / 2.2))[
+        ..., EDGE:-EDGE, EDGE:-EDGE
+    ]
+    found = {}
+    for k, (iso, noisy, mean) in enumerate(zip(isos, frames[1:], means)):
+        truth = picture(frames[0] if twins is None else twins[k])
+        flat, busy = quality.regions(truth)
+        untouched, *_ = quality.dials(quality.measure(picture(noisy), truth, flat, busy))
+        bands = quality.measure(picture(clean_up(noisy, mean), demosaic), truth, flat, busy)
+        left, held, made_up = quality.dials(bands)
+        stops = 2 * math.log2(untouched / left)
+        found[iso] = [left, stops, held, bands["kept"][0], made_up, bands["invented"][0]]
+    return found
+
+
 def at_gain(clean_up, times):
     """clean_up as it runs at times its gain: the same windows, shown to it that much brighter."""
     return lambda mosaics, mean: clean_up(mosaics * times, mean) / times
@@ -749,8 +800,10 @@ def main(specs, only=""):
     import demosaic
     import train_raw
 
-    board, wide = (raw_pairs.DATA / "out" / file for file in ("bench.json", "tiles.json"))
-    table, tile_table = (json.loads(file.read_text()) if file.exists() else {} for file in (board, wide))
+    board, wide, looks = (raw_pairs.DATA / "out" / file for file in ("bench.json", "tiles.json", "quality.json"))
+    table, tile_table, look_table = (
+        json.loads(file.read_text()) if file.exists() else {} for file in (board, wide, looks)
+    )
     models = {name: train_raw.trained(weights) for name, weights in (spec.split("=") for spec in specs)}
     cleaners = {"noisy": lambda noisy, mean: noisy}
     cleaners |= {name: train_raw.cleaner(model) for name, model in models.items()}
@@ -806,6 +859,21 @@ def main(specs, only=""):
         for test in sorted(test for test in table if test.startswith("night")):
             show(table[test], f"{test}  PSNR / LPIPS by the least gain a photo needs", mean=False)
     board.write_text(json.dumps(table, indent=1))
+    real = (*CAMERAS, *groups())
+    for test, cut in looked_at().items():
+        if only not in ("", "quality", "" if test in real else "shift" if test == "shift" else "colour"):
+            continue
+        rows = look_table.setdefault(test, {})
+        for name, clean_up in cleaners.items():
+            rows[name] = dials(clean_up, cut)
+            if name in faithful and test not in real:
+                rows[f"{name}-menon"] = dials(clean_up, cut, demosaic.menon)
+        show(
+            rows,
+            f"{test}  stops cleaner / detail kept / finest detail kept",
+            lambda row: f"{row[1]:.2f} {row[2]:.3f} {row[3]:.3f}",
+        )
+        looks.write_text(json.dumps(look_table, indent=1))
 
 
 def build_all():
@@ -832,8 +900,8 @@ BUILDS = {
 }
 
 if __name__ == "__main__":
-    only, specs = (sys.argv[1], sys.argv[2:]) if sys.argv[1] in BUILDS else ("", sys.argv[1:])
-    if specs:
+    only, specs = (sys.argv[1], sys.argv[2:]) if sys.argv[1] in (*BUILDS, "quality") else ("", sys.argv[1:])
+    if specs or only not in BUILDS:
         main(specs, only)
     else:
         BUILDS[only]()
