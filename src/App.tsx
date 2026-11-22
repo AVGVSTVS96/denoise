@@ -3,6 +3,7 @@ import { borrowing, setBorrowing } from "./blacks";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
+import { detailed, MARGIN } from "./raw";
 import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
 import type { FromWorker } from "./worker";
@@ -43,6 +44,7 @@ export function App() {
   const [photos, setPhotos] = useState<Photo[]>();
   const canvas = useRef<HTMLCanvasElement>(null);
   const input = useRef<HTMLCanvasElement>(null);
+  const detail = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
   useEffect(() => {
@@ -253,7 +255,7 @@ export function App() {
       </header>
       <main className="flex min-h-0 flex-1 flex-col">
         {job ? (
-          <Editor job={job} error={error} canvas={canvas} input={input} onNew={reset} />
+          <Editor job={job} error={error} canvas={canvas} input={input} detail={detail} onNew={reset} />
         ) : (
           <Pick
             onFile={open}
@@ -422,16 +424,19 @@ function Editor({
   error,
   canvas,
   input,
+  detail,
   onNew,
 }: {
   job: Job;
   error?: string;
   canvas: React.RefObject<HTMLCanvasElement | null>;
   input: React.RefObject<HTMLCanvasElement | null>;
+  detail: React.RefObject<HTMLCanvasElement | null>;
   onNew: () => void;
 }) {
   const [split, setSplit] = useState(50);
   const [strength, setStrength] = useState(() => Number(localStorage.getItem("strength") ?? 100));
+  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 0));
   const [actual, setActual] = useState(false);
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
@@ -441,6 +446,10 @@ function Editor({
   useEffect(() => {
     if (job.cleaned) canvas.current?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
   }, [job.cleaned, canvas]);
+
+  useEffect(() => {
+    if (done && job.raw && fine > 0) withDetail(input.current!, canvas.current!, detail.current!).catch(() => {});
+  }, [done, job.raw, fine, input, canvas, detail]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -518,13 +527,18 @@ function Editor({
               {job.raw && (
                 <canvas ref={input} width={job.width} height={job.height} className="absolute inset-0 size-full" />
               )}
-              <canvas
-                ref={canvas}
-                width={job.width}
-                height={job.height}
-                className="absolute inset-0 size-full"
-                style={job.raw ? { opacity: strength / 100 } : undefined}
-              />
+              <div className="absolute inset-0" style={job.raw ? { opacity: strength / 100 } : undefined}>
+                <canvas ref={canvas} width={job.width} height={job.height} className="absolute inset-0 size-full" />
+                {job.raw && (
+                  <canvas
+                    ref={detail}
+                    width={job.width}
+                    height={job.height}
+                    className="absolute inset-0 size-full"
+                    style={{ opacity: fine / 100 }}
+                  />
+                )}
+              </div>
             </div>
             {done && !actual && <Divider split={split} />}
           </div>
@@ -546,19 +560,10 @@ function Editor({
             {error ? <span className="text-red-500">{error}</span> : status(job)}
           </p>
           {done && job.raw && (
-            <label className="order-first flex basis-full items-center gap-3 text-[13px] text-muted tabular-nums sm:order-none sm:mr-2 sm:basis-auto">
-              Strength
-              <input
-                type="range"
-                value={strength}
-                onChange={(e) => {
-                  localStorage.setItem("strength", e.target.value);
-                  setStrength(e.target.valueAsNumber);
-                }}
-                className="strength min-w-0 flex-1 sm:w-36 sm:flex-none"
-              />
-              <span className="w-[4ch] text-right">{strength}%</span>
-            </label>
+            <>
+              <Dial name="Strength" value={strength} onChange={setStrength} />
+              <Dial name="Detail" value={fine} onChange={setFine} />
+            </>
           )}
           <Button onClick={() => setActual((a) => !a)} disabled={!job.width}>
             {actual ? "Fit" : "1:1"}
@@ -569,7 +574,9 @@ function Editor({
               primary
               onClick={async () =>
                 save(
-                  job.raw && strength < 100 ? await blended(input.current!, canvas.current!, strength) : job.result!,
+                  job.raw && (strength < 100 || fine > 0)
+                    ? await blended(input.current!, canvas.current!, detail.current!, strength, fine)
+                    : job.result!,
                   `${job.name}-denoised.jpg`,
                 )
               }
@@ -580,6 +587,24 @@ function Editor({
         </div>
       </footer>
     </>
+  );
+}
+
+function Dial({ name, value, onChange }: { name: string; value: number; onChange: (value: number) => void }) {
+  return (
+    <label className="order-first flex basis-full items-center gap-3 text-[13px] text-muted tabular-nums sm:order-none sm:mr-2 sm:basis-auto">
+      <span className="w-[8ch] sm:w-auto">{name}</span>
+      <input
+        type="range"
+        value={value}
+        onChange={(e) => {
+          localStorage.setItem(name.toLowerCase(), e.target.value);
+          onChange(e.target.valueAsNumber);
+        }}
+        className="strength min-w-0 flex-1 sm:w-28 sm:flex-none"
+      />
+      <span className="w-[4ch] text-right">{value}%</span>
+    </label>
   );
 }
 
@@ -697,12 +722,49 @@ function eta(ms: number) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
 }
 
-function blended(under: HTMLCanvasElement, over: HTMLCanvasElement, strength: number) {
+const STRIP = 256;
+const finer = new WeakMap<HTMLCanvasElement, Promise<void>>();
+
+async function fill(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement) {
+  const { width, height } = over;
+  const [shot, made, drawn] = [under, over, onto].map((canvas) => canvas.getContext("2d")!);
+
+  for (let y = 0; y < height && onto.isConnected; y += STRIP) {
+    const top = Math.max(0, y - MARGIN);
+    const rows = Math.min(height, y + STRIP + MARGIN) - top;
+    const result = made.getImageData(0, top, width, rows).data;
+    const pixels = detailed(result, shot.getImageData(0, top, width, rows).data, width);
+    drawn.putImageData(new ImageData(pixels, width, rows), 0, top, 0, y - top, width, STRIP);
+    await new Promise((next) => setTimeout(next));
+  }
+}
+
+function withDetail(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement) {
+  const filled = finer.get(onto) ?? fill(under, over, onto);
+  finer.set(onto, filled);
+
+  return filled;
+}
+
+async function blended(
+  under: HTMLCanvasElement,
+  over: HTMLCanvasElement,
+  onto: HTMLCanvasElement,
+  strength: number,
+  fine: number,
+) {
   const mixed = new OffscreenCanvas(over.width, over.height);
   const ctx = mixed.getContext("2d")!;
-  ctx.drawImage(under, 0, 0);
-  ctx.globalAlpha = strength / 100;
   ctx.drawImage(over, 0, 0);
+
+  if (fine > 0) {
+    await withDetail(under, over, onto);
+    ctx.globalAlpha = fine / 100;
+    ctx.drawImage(onto, 0, 0);
+  }
+
+  ctx.globalAlpha = 1 - strength / 100;
+  ctx.drawImage(under, 0, 0);
 
   return mixed.convertToBlob({ type: "image/jpeg", quality: 0.95 });
 }

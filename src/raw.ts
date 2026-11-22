@@ -23,6 +23,10 @@ const MAX_GAIN = 64;
 const EXPOSURE = 1.4;
 const STEPS = 65535;
 const UNHELD: Brightest = { block: TILE, level: Infinity };
+const REACH = 8;
+export const MARGIN = 2 * REACH;
+const QUIET = 4;
+const BUSY = 8;
 
 const mirrored = (size: number, padded: number) =>
   Int32Array.from({ length: padded }, (_, p) => {
@@ -214,4 +218,70 @@ export async function clean(
         onPiece({ x: x0 - crop.x, y: y0 - crop.y, width: x1 - x0, height: y1 - y0, pixels, input }, done, total);
     }
   }
+}
+
+function brightness(rgba: Uint8ClampedArray) {
+  const bright = new Float32Array(rgba.length / 4);
+
+  for (let i = 0; i < bright.length; i++)
+    bright[i] = 0.299 * rgba[4 * i] + 0.587 * rgba[4 * i + 1] + 0.114 * rgba[4 * i + 2];
+
+  return bright;
+}
+
+function boxed(plane: Float32Array, width: number) {
+  const height = plane.length / width;
+  const across = width + 1;
+  const sums = new Float64Array(across * (height + 1));
+
+  for (let y = 0; y < height; y++) {
+    let row = 0;
+
+    for (let x = 0; x < width; x++) {
+      row += plane[y * width + x];
+      sums[(y + 1) * across + x + 1] = sums[y * across + x + 1] + row;
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    const top = Math.max(0, y - REACH);
+    const bottom = Math.min(height, y + REACH + 1);
+
+    for (let x = 0; x < width; x++) {
+      const left = Math.max(0, x - REACH);
+      const right = Math.min(width, x + REACH + 1);
+      const sum = sums[bottom * across + right] - sums[bottom * across + left] - sums[top * across + right];
+      plane[y * width + x] = (sum + sums[top * across + left]) / ((bottom - top) * (right - left));
+    }
+  }
+
+  return plane;
+}
+
+export function detailed(result: Uint8ClampedArray, input: Uint8ClampedArray, width: number) {
+  const bright = brightness(result);
+  const busy = boxed(bright.slice(), width);
+
+  for (let i = 0; i < busy.length; i++) busy[i] = (bright[i] - busy[i]) ** 2;
+
+  boxed(busy, width);
+  const noisy = brightness(input);
+  const detail = new Uint8ClampedArray(result);
+  const height = noisy.length / width;
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const q = y * width + x;
+      const share = (Math.sqrt(Math.max(0, busy[q])) - QUIET) / (BUSY - QUIET);
+
+      if (share <= 0) continue;
+      const beside = noisy[q - 1] + noisy[q + 1] + noisy[q - width] + noisy[q + width];
+      const corners = noisy[q - width - 1] + noisy[q - width + 1] + noisy[q + width - 1] + noisy[q + width + 1];
+      const back = Math.min(1, share) * (noisy[q] - (4 * noisy[q] + 2 * beside + corners) / 16);
+
+      for (let k = 0; k < 3; k++) detail[4 * q + k] = result[4 * q + k] + back;
+    }
+  }
+
+  return detail;
 }

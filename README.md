@@ -21,6 +21,7 @@ A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG
 2. The mosaic is scaled and tiled the way `eval/train_raw.py`'s `denoise()` does it and runs through the joint model in 1024 px tiles (64 px of mirrored border, tiles fade into each other over the middle of what they share). A model that was not trained on lit parts of dark photos needs a tile with a light in it held to a lower gain of its own, by `train_raw.tile_gain`'s rule: no 128 px block brighter than a blown block in a photo that needs no gain. The model's manifest (`public/model/raw.json`) says whether it does; the one shipped, trained with `--bright`, does not, so every tile gets the photo's gain. The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
 3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
 4. The noisy mosaic is developed the same way beside it, filled in by a plain bilinear demosaic. The Strength slider blends the result with that picture, from 0% (the photo as shot) to 100% (the model's result), and Save keeps the blend.
+5. The Detail slider gives the result back the camera's own finest detail where the picture is busy: the finest band of that developed input's brightness (what a 3 px blur takes away) is added to the result wherever the result's own brightness moves by more than 4 of 255 within 17 px, in full from 8 up, and nowhere in a flat area. Nothing is made up and no colour is touched, but that band's noise comes back with its detail. The picture it fades to is worked out in the page the first time the slider is moved, so a photo cleaned without it takes no longer.
 
 Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`), for a raw that names its body by a serial number. A raw without one (Ricoh, Sony, Samsung) can only take the offsets of another body of its camera, which don't carry over, so it gets none unless that is turned on under the photo picker. Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.
 
@@ -47,7 +48,7 @@ cd eval && uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright
 
 The second form is for a model trained with `--bright`: it ships without the hold-down for tiles with a light in them.
 
-`eval/raw_check.ts` runs the app's raw path outside a browser and `eval/raw_develop.py` compares its picture with the Python pipeline's.
+`eval/raw_check.ts` runs the app's raw path outside a browser and `eval/raw_develop.py` compares its picture with the Python pipeline's. `eval/detail.py` is the Detail slider's step in numpy and compares the app's picture with it.
 
 `eval/ship.py` exports the sRGB model with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
 
