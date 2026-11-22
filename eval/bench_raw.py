@@ -636,7 +636,11 @@ def score_one(clean_up, cut, with_lpips, demosaic=None, with_detail=False, white
 
     def against(result, truth):
         psnr = -10 * torch.log10(((result - truth) ** 2).mean(dim=(1, 2, 3)))
-        distance = perceptual()(result * 2 - 1, truth * 2 - 1) if with_lpips else torch.full((1,), float("nan"))
+        distance = (
+            torch.cat([perceptual()(a * 2 - 1, b * 2 - 1).flatten() for a, b in zip(result.split(4), truth.split(4))])
+            if with_lpips
+            else torch.full((1,), float("nan"))
+        )
         return [psnr.mean().item(), distance.mean().item(), *(detail(result, truth) if with_detail else ())]
 
     def shown(result, k):
