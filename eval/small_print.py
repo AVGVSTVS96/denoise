@@ -43,6 +43,18 @@ pixel along is each colour plane moved half a pixel, which softens print enough 
 its letters, and the GR IIIx's noisy frames sit that far off its clean one. Nothing a model is given
 is resampled.
 
+Two more kinds of row say what a camera's own noise costs beyond its strength. "noisy-menon" is the
+noisy frame through demosaic.menon and no denoiser: "noisy" goes through the test's bilinear demosaic,
+which alone loses print, so this is the row a model has to beat. And every name has a second row,
+"<name>-made": the same cleaner on the camera's clean window under made-up noise, shot and read noise
+at the levels build measured on that ISO's whole noisy frame (bench_raw.noise_levels, kept with the
+windows as levels), read where the clean frame's lines are, its kept and invented against the clean
+frame as cut. The noise is drawn on the CPU from one seed a camera, so every model and both machines
+meet the same frame. Where "noisy-made" reads as "noisy" does, the made-up noise is as strong as the
+real; a camera that smooths its raw measures low, and its made-up noise is then a little weak. A
+model's made row less its real row, camera by camera, is printed under each test: next to nothing
+where the raw is the scene plus noise, many points where the camera has smoothed its raw.
+
 It runs on the GPU when there is one and on the CPU when not, there in float32 where the GPU runs
 bfloat16, so compare rows made on the same machine.
 """
@@ -166,7 +178,8 @@ def lit(path):
 
 def build(name, path, base, isos, reference):
     """A camera's windows, one printed thing each: frames (1 + ISOs, H, W) with the clean one first,
-    twins (ISOs, H, W), and lines (1 + ISOs, lines, 4, 2), each line's corners in every frame's window."""
+    twins (ISOs, H, W), and lines (1 + ISOs, lines, 4, 2), each line's corners in every frame's window.
+    With them levels (ISOs, 2), each whole noisy frame's shot and read noise as bench_raw.noise_levels has them."""
     clean, wb, matrix, exposure = lit(path(base))
     if clean is None or not isos:
         return
@@ -177,13 +190,14 @@ def build(name, path, base, isos, reference):
     boxes = {thing: around(corners.reshape(-1, 2), ROOM, clean.shape, 32) for thing, corners in places.items()}
     cut = lambda mosaic, box, dx=0, dy=0: mosaic[box[1] + dy : box[3] + dy, box[0] + dx : box[2] + dx]
     kept = {thing: ([cut(clean, box)], [], [places[thing] - box[:2]]) for thing, box in boxes.items()}
-    means = []
+    means, levels = [], []
     for iso in isos:
         noisy = raw_pairs.mosaic(path(iso))
         dx, dy = raw_pairs.shift_between(clean, noisy)
         noisy, *_ = raw_pairs.match(clean, noisy)
         at = raw_pairs.offsets(clean, noisy)
         means.append(float(noisy.mean()))
+        levels.append(bench_raw.noise_levels(clean, noisy))
         for thing, (x0, y0, x1, y1) in boxes.items():
             middle = lambda low, high, side: int(
                 np.clip((low + high - raw_pairs.CROP) // 4 * 2, 0, side - raw_pairs.CROP)
@@ -203,7 +217,9 @@ def build(name, path, base, isos, reference):
             f"{thing}/twins": np.stack(twins).astype(np.float16),
             f"{thing}/lines": np.stack(lines).astype(np.float32),
         }
-    bench_raw.save(f"print/{name}", means=means, wb=wb, matrix=matrix, isos=isos, exposure=exposure, **arrays)
+    bench_raw.save(
+        f"print/{name}", means=means, levels=levels, wb=wb, matrix=matrix, isos=isos, exposure=exposure, **arrays
+    )
     weed(name)
 
 
@@ -350,11 +366,13 @@ def trained(weights):
 
 
 def entrants(specs):
-    """{name: (cleaner, demosaic)}: the noisy frame, each model, a mosaic-out one a second time
-    through demosaic.menon, and rivals by rivals.PICTURES' names."""
+    """{name: (cleaner, demosaic)}: the noisy frame, once through the test's demosaic and once through
+    demosaic.menon, each model, a mosaic-out one a second time through demosaic.menon, and rivals by
+    rivals.PICTURES' names."""
     import train_raw
 
-    found = {"noisy": (lambda mosaics, mean: mosaics, None)}
+    untouched = lambda mosaics, mean: mosaics
+    found = {"noisy": (untouched, None), "noisy-menon": (untouched, demosaic.menon)}
     for spec in specs:
         name, _, weights = spec.partition("=")
         if not weights:
@@ -369,23 +387,53 @@ def entrants(specs):
     return found
 
 
+def made_up(clean, shot, read, rng):
+    """A clean mosaic under shot and read noise, variance = shot * brightness + read, drawn on the CPU."""
+    still = clean.cpu().clamp(min=0)
+    noisy = torch.poisson(still / shot, generator=rng) * shot + torch.randn(still.shape, generator=rng) * read**0.5
+    return noisy.to(clean.device)
+
+
 @torch.no_grad()
 def scores(cleaners, file):
-    """{name: {ISO: [read, kept, invented]}} for one camera's windows, and "clean", its clean frame as cut."""
+    """{name: {ISO: [read, kept, invented]}} for one camera's windows: each cleaner on the real noisy
+    frame and, as "<name>-made", on the clean frame under made-up noise at that frame's levels; and
+    "clean", its clean frame as cut."""
     things, isos, means, picture = opened(file)
     hit, size = np.sum(list(as_cut(things, picture).values()), 0)
     rows = {"clean": {iso: [hit / size, 1.0, 0.0] for iso in isos}}
-    for k, (iso, mean) in enumerate(zip(isos, means)):
-        truths = {thing: picture(twins[k : k + 1], demosaic.menon) for thing, (_, twins, _) in things.items()}
+    sharp = {thing: picture(frames[:1], demosaic.menon) for thing, (frames, _, _) in things.items()}
+    rng = torch.Generator().manual_seed(0)
+    for k, (iso, mean, (shot, read)) in enumerate(zip(isos, means, np.load(file)["levels"].tolist())):
+        real = {
+            thing: (frames[k + 1 : k + 2], picture(twins[k : k + 1], demosaic.menon), lines[k + 1])
+            for thing, (frames, twins, lines) in things.items()
+        }
+        made = {
+            thing: (made_up(frames[:1], shot, read, rng), sharp[thing], lines[0])
+            for thing, (frames, _, lines) in things.items()
+        }
         for name, (clean_up, way) in cleaners.items():
-            hits, together = [], []
-            for thing, (frames, _, lines) in things.items():
-                shown = picture(clean_up(frames[k + 1 : k + 2], mean), way)
-                hits.append(lettered(as_bytes(shown), thing, lines[k + 1]))
-                together.append(strokes(shown, truths[thing], lines[k + 1]))
-            (hit, size), (_, _, _, xx, xy, yy) = np.sum(hits, 0), torch.stack(together).sum(0).tolist()
-            rows.setdefault(name, {})[iso] = [hit / size, xy / yy, (max(xx - xy**2 / yy, 0) / yy) ** 0.5]
+            for ending, given in (("", real), ("-made", made)):
+                hits, together = [], []
+                for thing, (frame, truth, corners) in given.items():
+                    shown = picture(clean_up(frame, mean), way)
+                    hits.append(lettered(as_bytes(shown), thing, corners))
+                    together.append(strokes(shown, truth, corners))
+                (hit, size), (_, _, _, xx, xy, yy) = np.sum(hits, 0), torch.stack(together).sum(0).tolist()
+                rows.setdefault(name + ending, {})[iso] = [
+                    hit / size,
+                    xy / yy,
+                    (max(xx - xy**2 / yy, 0) / yy) ** 0.5,
+                ]
     return rows
+
+
+def apart(rows, model, isos):
+    """A model's made row less its real row, in points of read: a cell for each of isos, and their mean."""
+    gaps = {iso: 100 * (rows[f"{model}-made"][iso][0] - row[0]) for iso, row in rows[model].items()}
+    cells = [f"{gaps[iso]:.1f}" if iso in gaps else "" for iso in isos] + [f"{np.mean(list(gaps.values())):.1f}"]
+    return "".join(f"{cell:>9}" for cell in cells)
 
 
 def main(specs):
@@ -414,6 +462,14 @@ def main(specs):
             for model, by_iso in rows.items():
                 shown = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
                 print(f"{model:24}" + "".join(f"{f'{row[0]:.3f} {row[1]:.3f}':>14}" for row in shown), flush=True)
+            print(
+                f"\n{test}  made less real, points of small print read\n{'':40}"
+                + "".join(f"{head:>9}" for head in heads)
+            )
+            for model in [model for model in next(iter(each.values())) if f"{model}-made" in rows]:
+                print(f"{model:40}{apart(rows, model, heads[:-1])}", flush=True)
+                for name, found in each.items() if len(each) > 1 else ():
+                    print(f"   {name.split('--')[-1]:37}{apart(found, model, heads[:-1])}", flush=True)
 
 
 if __name__ == "__main__":
