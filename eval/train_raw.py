@@ -52,6 +52,16 @@ that truth is 224 px, as without either. --perceptual 0.05 adds LPIPS, at that w
 picture and its truth, both developed as bench_raw.py looks at them: it is there to make the picture
 look closer to the truth where L1 settles for a blur, and the truth is all it can pull towards.
 
+--adversarial 0.01 trains a second, small network beside the first, a patch discriminator (discriminator()),
+on those same developed pictures: it learns to tell the truth's 70 px patches from the network's, and
+the loss adds, at that weight, how well the network's picture passes for the truth with it. Where
+L1 and LPIPS pull towards one truth, this pulls towards anything that looks like a truth, so it can
+make detail up: such a model is for a second choice in the app, picked by eye, kept and invented.
+The discriminator has its own optimizer, at --lr throughout, and works in float32, since the
+differences it lives on are a few thousandths of white. It is in last.pth for a rerun to carry on
+with, and nowhere else: joint.pth is the network alone, as without it. "critic" in the log is its
+loss, 2 when it cannot tell the two apart and 0 when it always can.
+
 --truth data/rawshift 0.25 takes that share of the joint crops from truth a sensor measured in full
 colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
 mosaic. It is used as it is, at the joint truth's size: nothing is binned, so it is as sharp as the
@@ -260,8 +270,8 @@ def picture_loss(result, truth):
     return (l1(tone(a), tone(b)) + l1(tone(srgb(a)), tone(srgb(b)))) / 2
 
 
-def perceptual_loss(result, truth):
-    """LPIPS between camera RGB (N, 3, H, W) and its truth, each as the picture bench_raw.score_one looks at:
+def developed(result, truth):
+    """Camera RGB (N, 3, H, W) and its truth, each as the picture bench_raw.score_one looks at, from -1 to 1:
     a white balance, the colour matrix, the truth's median brought to mid-grey, the tone curve."""
     n = truth.shape[0]
     draw = lambda low, high: torch.empty(n, device=truth.device).uniform_(low, high)
@@ -270,7 +280,35 @@ def perceptual_loss(result, truth):
     a, b = srgb(result), srgb(truth)
     exposure = 0.108 / b.flatten(1).median(1).values.clamp(min=1e-6).view(n, 1, 1, 1)
     look = lambda p: tone(p * exposure).clamp(0, 1) * 2 - 1
-    return bench_raw.perceptual()(look(a), look(b)).mean()
+    return look(a), look(b)
+
+
+def perceptual_loss(result, truth):
+    """LPIPS between camera RGB (N, 3, H, W) and its truth, each developed()."""
+    shown, wanted = developed(result, truth)
+    return bench_raw.perceptual()(shown, wanted).mean()
+
+
+def discriminator():
+    """The network --adversarial trains against: pix2pix's patch discriminator, which gives every 70 px
+    patch of a developed picture a score, high for the truth's and low for the network's. Each layer is
+    held to a spectral norm of 1 in place of batch normalisation, which four pictures a step cannot feed."""
+    conv = lambda a, b, stride: torch.nn.utils.parametrizations.spectral_norm(torch.nn.Conv2d(a, b, 4, stride, 1))
+    layers = [conv(3, 64, 2), conv(64, 128, 2), conv(128, 256, 2), conv(256, 512, 1)]
+    return torch.nn.Sequential(
+        *[part for layer in layers for part in (layer, torch.nn.LeakyReLU(0.2, True))], conv(512, 1, 1)
+    )
+
+
+def critic_loss(critic, shown, wanted):
+    """The hinge loss a critic learns by: the truth's patches scored over 1, the network's under -1."""
+    real, made_up = critic(torch.cat([wanted, shown.detach()])).chunk(2)
+    return torch.nn.functional.relu(1 - real).mean() + torch.nn.functional.relu(1 + made_up).mean()
+
+
+def adversarial_loss(critic, shown):
+    """What the network is after in front of a critic: its picture's patches scored as the truth's are."""
+    return -critic(shown).mean()
 
 
 def tile_gain(tile, gain):
@@ -750,6 +788,14 @@ def main(args):
             min(1, (s + 1) / warmup) * (0.01 + 0.99 * (1 + math.cos(math.pi * min(s, args.steps) / args.steps)) / 2)
         ),
     )
+    if args.adversarial and not args.joint:
+        raise SystemExit("--adversarial judges the joint crops' picture, for a --joint run")
+    critic = discriminator().cuda() if args.adversarial else None
+    critic_optimizer = (
+        torch.optim.AdamW(critic.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=0, fused=True)
+        if critic
+        else None
+    )
     step = 0
     if (out / "last.pth").exists():
         state = torch.load(out / "last.pth", map_location="cpu")
@@ -758,6 +804,9 @@ def main(args):
         optimizer.load_state_dict(state["optimizer"])
         schedule.load_state_dict(state["schedule"])
         step = state["step"]
+        if critic:
+            critic.load_state_dict(state["critic"])
+            critic_optimizer.load_state_dict(state["critic_optimizer"])
     compiled = torch.compile(model, mode="reduce-overhead", dynamic=False)
     teacher = trained(args.teacher).to(memory_format=torch.channels_last) if args.teacher else None
     if teacher and not (args.joint and joint(teacher)):
@@ -768,7 +817,7 @@ def main(args):
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
-    running = torch.zeros((), device="cuda")
+    running, judging = torch.zeros((), device="cuda"), torch.zeros((), device="cuda")
     left_out = frozenset(json.loads(pathlib.Path(args.held).read_text())) if args.held else ()
 
     def training(*folder):
@@ -839,10 +888,21 @@ def main(args):
                 loss = loss + args.distil * picture_loss(picture, taught(noisy))
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
+            if critic:
+                shown, wanted = developed(picture, truth)
+                critic.requires_grad_(False)
+                loss = loss + args.adversarial * adversarial_loss(critic, shown)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
+        if critic:
+            critic.requires_grad_(True)
+            doubt = critic_loss(critic, shown, wanted)
+            critic_optimizer.zero_grad(set_to_none=True)
+            doubt.backward()
+            critic_optimizer.step()
+            judging += doubt.detach()
         schedule.step()
         step += 1
         if step % 4 == 0:
@@ -891,10 +951,13 @@ def main(args):
                     "seen_colour_kept": mean_of(seen_colour, 2, 4),
                     "seen_colour_invented": mean_of(seen_colour, 3, 4),
                 }
+            if critic:
+                line |= {"critic": round(judging.item() / args.check, 5)}
             print(json.dumps(line), flush=True)
             log.write(json.dumps(line) + "\n")
             log.flush()
             running.zero_()
+            judging.zero_()
             state = {
                 "model": model.state_dict(),
                 "average": average.state_dict(),
@@ -902,6 +965,8 @@ def main(args):
                 "schedule": schedule.state_dict(),
                 "step": step,
             }
+            if critic:
+                state |= {"critic": critic.state_dict(), "critic_optimizer": critic_optimizer.state_dict()}
             torch.save(state, out / "last.tmp")
             (out / "last.tmp").rename(out / "last.pth")
             if step % args.keep == 0:
@@ -950,6 +1015,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--bin", type=int, default=2, choices=(2, 4), help="sensor pixels a side to one of the truth")
     parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
+    parser.add_argument(
+        "--adversarial", type=float, default=0, help="weight of a patch discriminator's verdict on that picture"
+    )
     parser.add_argument("--bright", type=float, default=0, help="share of crops shown as a lit part of a dark photo")
     parser.add_argument(
         "--truth",
