@@ -217,12 +217,12 @@ def offsets(clean, noisy):
     return at
 
 
-def resampled(clean, y, x, dx, dy):
+def resampled(clean, y, x, dx, dy, height=CROP, width=CROP):
     """The clean crop at (y, x) as a frame (dx, dy) sensor pixels off shows it, each colour plane on its own.
 
     Lanczos reads MARGIN pixels past the crop's edge.
     """
-    region = clean[y - MARGIN : y + CROP + MARGIN, x - MARGIN : x + CROP + MARGIN]
+    region = clean[y - MARGIN : y + height + MARGIN, x - MARGIN : x + width + MARGIN]
     out = np.empty_like(region)
     move = np.float32([[1, 0, dx / 2], [0, 1, dy / 2]])
     for i in range(2):

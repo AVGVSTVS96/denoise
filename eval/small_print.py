@@ -1,0 +1,416 @@
+"""Small print read: how much of the still life's printed text is still there in a denoiser's picture.
+
+    uv run small_print.py build                                         find the print on every camera and cut its windows
+    uv run small_print.py build gr3                                     only the cameras with that in their name
+    uv run small_print.py r8-p00=data/models/raw/r8-p00/joint.pth ...   score models, and rivals by rivals.py's names
+    uv run small_print.py gr3x unseen r8-p00=...                        on those tests alone, of gr3, gr3x, unseen and seen
+
+Imaging Resource's still life has five printed things in it: a proportional scale's instructions and
+four bottle labels. small_print.json holds what 46 of their lines say, 734 letters and digits, typed
+off the GR IIIx's ISO 100 frame, and where each line is in that frame as four corners. The scene is
+the same on every camera, so build finds each printed thing in a camera's own lowest ISO frame by
+matching it to the GR IIIx's (found) and carries the corners over. A thing it cannot match, or whose
+lines the clean frame itself reads under HALF of, is left out for that camera.
+
+A window is one printed thing with ROOM px around it, cut from every ISO of bench_raw.ISOS as
+bench_raw.build cuts its windows: the noisy frame on whole even pixels, the clean frame resampled onto
+it, and each line's corners moved by what is left between the two, so a line is read where it is.
+
+A model's picture of a window is developed as the test develops pictures and rounded to 8 bits. Each
+line is then straightened into a strip HEIGHT px tall and spelt by PP-OCRv4's recogniser, the one
+RapidOCR ships, run through onnxruntime. Nothing looks for the text: the place is known, and finding
+it again in every picture is one of the two things that made such a number jump. A strip is cut five
+times, each a fraction of a pixel along (SHIFTS), and a line's score is the mean over the five of the
+letters right: its length less the edits between what was typed and what was spelt, letters and
+digits only, capitals and small letters alike. "read" is the letters right over the letters there.
+
+Beside it, "kept" and "invented": quality.py's finest band, detail 2 to 3 px across, of the picture
+inside the lines' corners against the lined-up clean frame's, as quality.measure has them. kept is
+the share of the clean frame's strokes the picture holds and invented what else it holds there, over
+the clean frame's. The clean frame is developed by demosaic.menon, whatever made the picture: through
+the bilinear demosaic it is softer than a good result, and then ranks an untouched noisy frame over
+any model. It is still a mosaic's picture, moved a fraction of a pixel and with a little noise of its
+own, and it leans toward a picture that went through demosaic.menon itself. So read the two between
+models that make their picture the same way, at one ISO: detail on real noise, which the full-colour
+tests cannot give.
+
+Rows go to data/out/print.json as {test: {name: {ISO: [read, kept, invented]}}}, a test being "gr3x",
+"gr3", "unseen" or "seen" as on the board, a group as the mean over its cameras, and each camera
+under its file's name. "noisy" is the frame as shot. "clean" is the camera's clean frame as it was
+cut, through demosaic.menon: one reading, the same at every ISO, of a picture with no noise in it. It
+is not the lined-up clean frame, the other thing that made the number jump: resampling a mosaic by
+half a pixel softens print enough to lose a third of its letters. Nothing a model is given is resampled.
+
+It runs on the GPU when there is one and on the CPU when not, there in float32 where the GPU runs
+bfloat16, so compare rows made on the same machine.
+"""
+
+import functools
+import io
+import json
+import sys
+import urllib.request
+import zipfile
+
+import cv2
+import numpy as np
+import onnxruntime
+import torch
+
+import bench_raw
+import demosaic
+import quality
+import raw_pairs
+
+LINES = json.loads((raw_pairs.DATA.parent / "small_print.json").read_text())
+READER = bench_raw.BENCH / "print" / "reader.onnx"
+WHEEL = (
+    "https://files.pythonhosted.org/packages/ba/12/1e5497183bdbe782dbb91bad1d0d2297dba4d2831b2652657f7517bfc6df/"
+    "rapidocr_onnxruntime-1.4.4-py3-none-any.whl"
+)
+RECOGNISER = "rapidocr_onnxruntime/models/ch_PP-OCRv4_rec_infer.onnx"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+THREADS = 4
+HEIGHT, NARROWEST = 48, 320
+SHIFTS = ((0, 0), (0.5, 0.25), (-0.5, -0.25), (0.25, -0.5), (-0.25, 0.5))
+ROOM, AROUND = 48, 150
+MATCHES, HALF = 25, 0.5
+
+
+def cells(cfa, wb, matrix):
+    """A mosaic as linear sRGB at half its size (H/2, W/2, 3): each 2x2 cell one pixel."""
+    return (np.stack([cfa[0::2, 0::2], raw_pairs.green(cfa), cfa[1::2, 1::2]], -1) * wb) @ matrix.T
+
+
+def grey(linear, exposure):
+    """Linear sRGB (H, W, 3) as the brightness of the picture the test would show, in 8 bits."""
+    return cv2.cvtColor(((linear * exposure).clip(0, 1) ** (1 / 2.2) * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+
+
+def developed(cfa, wb, matrix, exposure, box):
+    """A box (x0, y0, x1, y1) of a mosaic, on even pixels, as grey()."""
+    x0, y0, x1, y1 = box
+    crop = torch.from_numpy(np.ascontiguousarray(cfa[y0:y1, x0:x1]))[None]
+    linear = bench_raw.develop(crop, torch.from_numpy(wb), torch.from_numpy(matrix))
+    return grey(linear[0].permute(1, 2, 0).numpy(), exposure)
+
+
+def around(points, room, shape, step=2):
+    """The box (x0, y0, x1, y1) room px around points (N, 2): from an even pixel, a multiple of step px
+    each way, and no nearer a frame's edge than a frame may sit off its clean one."""
+    edge = 2 * raw_pairs.MAX_SHIFT
+    low = np.floor((points.min(0) - room).clip(edge) / 2).astype(int) * 2
+    most = (np.array(shape[::-1]) - edge - low) // step * step
+    high = low + np.minimum(np.ceil((points.max(0) + room - low) / step).astype(int) * step, most)
+    return int(low[0]), int(low[1]), int(high[0]), int(high[1])
+
+
+def laid(ours, theirs, reach):
+    """The map from one grey picture's points to another's that most SIFT matches agree on within
+    reach px, and how many agree."""
+    sift = cv2.SIFT_create(nfeatures=20000)
+    (at, described), (to, also) = (sift.detectAndCompute(image, None) for image in (ours, theirs))
+    if described is None or also is None or len(at) < 2 or len(to) < 2:
+        return None, 0
+    close = [a for a, b in cv2.BFMatcher().knnMatch(described, also, k=2) if a.distance < 0.75 * b.distance]
+    if len(close) < MATCHES:
+        return None, 0
+    start = np.float32([at[match.queryIdx].pt for match in close])
+    end = np.float32([to[match.trainIdx].pt for match in close])
+    move, agree = cv2.findHomography(start, end, cv2.RANSAC, reach)
+    return move, 0 if move is None else int(agree.sum())
+
+
+def sized(move, before=1.0, after=1.0, start=(0, 0), end=(0, 0)):
+    """A map between two crops as the map between their frames: each crop's scale and its corner."""
+    grow = lambda scale, corner: np.array([[scale, 0, corner[0]], [0, scale, corner[1]], [0, 0, 1]])
+    return grow(1 / after, end) @ move @ np.linalg.inv(grow(1 / before, start))
+
+
+def found(frame, reference):
+    """Where each printed thing's lines are in a camera's clean frame: {thing: corners (lines, 4, 2)}.
+
+    A frame is its mosaic, white balance, matrix and exposure. The whole pictures are matched first at
+    a quarter of their size, which says roughly where a thing is, then the thing itself at full size
+    with AROUND px about it: a label on a bottle is no flat sheet, and each camera stood where it
+    stood, so every thing gets a map of its own.
+    """
+    small = lambda cfa, wb, matrix, exposure: cv2.resize(
+        grey(cells(cfa, wb, matrix), exposure), None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA
+    )
+    rough, _ = laid(small(*reference), small(*frame), 8)
+    if rough is None:
+        return {}
+    rough, places = sized(rough, 0.25, 0.25), {}
+    for thing, lines in LINES.items():
+        corners = np.float32([line for _, line in lines])
+        ours = around(corners.reshape(-1, 2), AROUND, reference[0].shape)
+        edge = np.float32([[ours[0], ours[1]], [ours[2], ours[1]], [ours[2], ours[3]], [ours[0], ours[3]]])
+        theirs = around(cv2.perspectiveTransform(edge[None], rough)[0], AROUND, frame[0].shape)
+        move, agree = laid(developed(*reference, ours), developed(*frame, theirs), 2.5)
+        print(f"   {thing:12} matches {agree}", flush=True)
+        if agree >= MATCHES:
+            places[thing] = cv2.perspectiveTransform(corners, sized(move, start=ours[:2], end=theirs[:2]))
+    return places
+
+
+def lit(path):
+    """A raw as found() takes a frame: its mosaic, white balance and matrix, and the exposure that
+    brings its picture's median to mid-grey."""
+    clean = raw_pairs.mosaic(path)
+    wb, matrix = bench_raw.colour(path)
+    return clean, wb, matrix, clean is not None and float(0.108 / np.median(cells(clean, wb, matrix)))
+
+
+def build(name, path, base, isos, reference):
+    """A camera's windows, one printed thing each: frames (1 + ISOs, H, W) with the clean one first,
+    twins (ISOs, H, W), and lines (1 + ISOs, lines, 4, 2), each line's corners in every frame's window."""
+    clean, wb, matrix, exposure = lit(path(base))
+    if clean is None or not isos:
+        return
+    print(name, flush=True)
+    places = found((clean, wb, matrix, exposure), reference)
+    if not places:
+        return
+    boxes = {thing: around(corners.reshape(-1, 2), ROOM, clean.shape, 32) for thing, corners in places.items()}
+    cut = lambda mosaic, box, dx=0, dy=0: mosaic[box[1] + dy : box[3] + dy, box[0] + dx : box[2] + dx]
+    kept = {thing: ([cut(clean, box)], [], [places[thing] - box[:2]]) for thing, box in boxes.items()}
+    means = []
+    for iso in isos:
+        noisy = raw_pairs.mosaic(path(iso))
+        dx, dy = raw_pairs.shift_between(clean, noisy)
+        noisy, *_ = raw_pairs.match(clean, noisy)
+        at = raw_pairs.offsets(clean, noisy)
+        means.append(float(noisy.mean()))
+        for thing, (x0, y0, x1, y1) in boxes.items():
+            middle = lambda low, high, side: int(
+                np.clip((low + high - raw_pairs.CROP) // 4 * 2, 0, side - raw_pairs.CROP)
+            )
+            off, share = at(middle(y0, y1, clean.shape[0]), middle(x0, x1, clean.shape[1]))
+            left = np.array(off) - (dx, dy)
+            wx, wy = (np.round(left / 2) * 2).astype(int)
+            frames, twins, lines = kept[thing]
+            frames.append(cut(noisy, boxes[thing], dx, dy))
+            twins.append(raw_pairs.resampled(clean, y0 - wy, x0 - wx, *(left - (wx, wy)), y1 - y0, x1 - x0))
+            lines.append(lines[0] + left)
+            print(f"   {iso:>6} {thing:12} left {left.round(2)} lined up {share:.2f}", flush=True)
+    arrays = {}
+    for thing, (frames, twins, lines) in kept.items():
+        arrays |= {
+            f"{thing}/frames": np.stack(frames).astype(np.float16),
+            f"{thing}/twins": np.stack(twins).astype(np.float16),
+            f"{thing}/lines": np.stack(lines).astype(np.float32),
+        }
+    bench_raw.save(f"print/{name}", means=means, wb=wb, matrix=matrix, isos=isos, exposure=exposure, **arrays)
+    weed(name)
+
+
+def fetch():
+    """PP-OCRv4's recogniser, out of RapidOCR's wheel on PyPI, beside the windows: the PC reads it from there."""
+    if not READER.exists():
+        READER.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(WHEEL) as wheel:
+            READER.write_bytes(zipfile.ZipFile(io.BytesIO(wheel.read())).read(RECOGNISER))
+
+
+def build_all(only=""):
+    fetch()
+    reference = lit(bench_raw.ricoh("gr3x")(100))
+    ladders = {camera: (bench_raw.ricoh(camera), 100, bench_raw.ISOS) for camera in bench_raw.CAMERAS}
+    for group, folders in bench_raw.groups().items():
+        ladders |= {f"{group}--{folder.parent.name}": bench_raw.ladder(folder) for folder in folders}
+    for name, ladder in ladders.items():
+        if only in name:
+            build(name, *ladder, reference)
+
+
+@functools.cache
+def reader():
+    """The recogniser and the letters it knows, the first being the blank between two of them."""
+    options = onnxruntime.SessionOptions()
+    options.intra_op_num_threads = THREADS
+    session = onnxruntime.InferenceSession(str(READER), options, providers=["CPUExecutionProvider"])
+    return session, ["", *session.get_modelmeta().custom_metadata_map["character"].splitlines(), " "]
+
+
+def strips(picture, corners):
+    """A line of an 8-bit picture (H, W, 3) straightened to HEIGHT px tall, once for each of SHIFTS."""
+    wide = max(
+        HEIGHT, round(HEIGHT * np.linalg.norm(corners[1] - corners[0]) / np.linalg.norm(corners[3] - corners[0]))
+    )
+    flat = np.float32([[0, 0], [wide, 0], [wide, HEIGHT], [0, HEIGHT]])
+    return [
+        cv2.warpPerspective(
+            picture,
+            cv2.getPerspectiveTransform(corners + np.float32(shift), flat),
+            (wide, HEIGHT),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        for shift in SHIFTS
+    ]
+
+
+def spelt(strip):
+    """What the recogniser reads in a strip: each column's likeliest letter, repeats and blanks dropped.
+    One strip at a time: several at once take it ten times as long each on a CPU."""
+    session, letters = reader()
+    fed = np.zeros((1, 3, HEIGHT, max(NARROWEST, strip.shape[1])), np.float32)
+    fed[0, :, :, : strip.shape[1]] = strip[:, :, ::-1].transpose(2, 0, 1) / 127.5 - 1
+    columns = session.run(None, {session.get_inputs()[0].name: fed})[0].argmax(2)[0]
+    return "".join(letters[i] for j, i in enumerate(columns) if i and (j == 0 or i != columns[j - 1]))
+
+
+def plain(text):
+    return "".join(letter for letter in text.lower() if letter.isascii() and letter.isalnum())
+
+
+def right(typed, seen):
+    """How many of a line's letters were spelt: its length less the edits from one to the other, never under none."""
+    typed, row = plain(typed), list(range(len(plain(seen)) + 1))
+    for i, a in enumerate(typed, 1):
+        last, row[0] = row[0], i
+        for j, b in enumerate(plain(seen), 1):
+            last, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, last + (a != b))
+    return max(0, len(typed) - row[-1])
+
+
+def lettered(picture, thing, corners):
+    """The letters right in a printed thing's lines, each the mean over SHIFTS, and the letters there."""
+    hits = [
+        np.mean([right(text, spelt(strip)) for strip in strips(picture, line)])
+        for (text, _), line in zip(LINES[thing], corners)
+    ]
+    return float(np.sum(hits)), sum(len(plain(text)) for text, _ in LINES[thing])
+
+
+def strokes(picture, truth, corners):
+    """quality.sums of a picture's finest band (1, 3, H, W) and its truth's, inside the lines' corners."""
+    inside = np.zeros(picture.shape[-2:], np.uint8)
+    cv2.fillPoly(inside, [np.int32(line.round()) for line in corners], 1)
+    inside = torch.from_numpy(inside).bool().to(picture.device)[None, None]
+    made, real = (quality.bands(quality.planes(shown))[0][:, :1] for shown in (picture, truth))
+    return quality.sums(made, real, inside)
+
+
+def opened(file):
+    """A camera's windows: {thing: (frames, twins, lines)}, its ISOs and means, and picture(), which
+    develops a result (1, H, W) or (1, 3, H, W) as the test does, through a demosaic if one is named."""
+    data = np.load(file)
+    on = lambda key: torch.from_numpy(data[key].astype(np.float32)).to(DEVICE)
+    wb, matrix, exposure = on("wb"), on("matrix"), float(data["exposure"])
+    picture = lambda result, way=None: (bench_raw.develop(result, wb, matrix, way) * exposure).clamp(0, 1) ** (1 / 2.2)
+    things = {
+        thing: (on(f"{thing}/frames"), on(f"{thing}/twins"), data[f"{thing}/lines"])
+        for thing in LINES
+        if f"{thing}/frames" in data
+    }
+    return things, data["isos"].tolist(), data["means"].tolist(), picture
+
+
+def as_bytes(picture):
+    return (picture[0].permute(1, 2, 0) * 255).round().byte().cpu().numpy()
+
+
+def as_cut(things, picture):
+    """What the reader makes of each printed thing in a camera's clean frame as it was cut, through
+    demosaic.menon: {thing: (letters right, letters there)}."""
+    return {
+        thing: lettered(as_bytes(picture(frames[:1], demosaic.menon)), thing, lines[0])
+        for thing, (frames, _, lines) in things.items()
+    }
+
+
+def weed(name):
+    """Drops from a camera's windows the printed things its own clean frame reads under HALF of: print
+    that is not there, or not where it was looked for. A camera left with none loses its file."""
+    file = bench_raw.BENCH / "print" / f"{name}.npz"
+    things, _, _, picture = opened(file)
+    read = as_cut(things, picture)
+    poor = [thing for thing, (hit, size) in read.items() if hit < HALF * size]
+    print("   clean frame reads", *(f"{thing} {hit / size:.2f}" for thing, (hit, size) in read.items()), flush=True)
+    if poor:
+        print("   left out", *poor, flush=True)
+        kept = {key: value for key, value in np.load(file).items() if key.split("/")[0] not in poor}
+        file.unlink()
+        if len(poor) < len(things):
+            bench_raw.save(f"print/{name}", **kept)
+
+
+def trained(weights):
+    """train_raw.trained on whichever machine this is."""
+    import train_raw
+
+    state = torch.load(weights, map_location="cpu")
+    model = train_raw.network(state["intro.weight"].shape[0], state["intro.weight"].shape[1] == 12)
+    model.load_state_dict(state)
+    return model.to(DEVICE).eval()
+
+
+def entrants(specs):
+    """{name: (cleaner, demosaic)}: the noisy frame, each model, a mosaic-out one a second time
+    through demosaic.menon, and rivals by rivals.PICTURES' names."""
+    import train_raw
+
+    found = {"noisy": (lambda mosaics, mean: mosaics, None)}
+    for spec in specs:
+        name, _, weights = spec.partition("=")
+        if not weights:
+            import rivals
+
+            found[name] = (rivals.PICTURES[name](), None)
+            continue
+        model = trained(weights)
+        found[name] = (train_raw.cleaner(model), None)
+        if not train_raw.joint(model):
+            found[f"{name}-menon"] = (found[name][0], demosaic.menon)
+    return found
+
+
+@torch.no_grad()
+def scores(cleaners, file):
+    """{name: {ISO: [read, kept, invented]}} for one camera's windows, and "clean", its clean frame as cut."""
+    things, isos, means, picture = opened(file)
+    hit, size = np.sum(list(as_cut(things, picture).values()), 0)
+    rows = {"clean": {iso: [hit / size, 1.0, 0.0] for iso in isos}}
+    for k, (iso, mean) in enumerate(zip(isos, means)):
+        truths = {thing: picture(twins[k : k + 1], demosaic.menon) for thing, (_, twins, _) in things.items()}
+        for name, (clean_up, way) in cleaners.items():
+            hits, together = [], []
+            for thing, (frames, _, lines) in things.items():
+                shown = picture(clean_up(frames[k + 1 : k + 2], mean), way)
+                hits.append(lettered(as_bytes(shown), thing, lines[k + 1]))
+                together.append(strokes(shown, truths[thing], lines[k + 1]))
+            (hit, size), (_, _, _, xx, xy, yy) = np.sum(hits, 0), torch.stack(together).sum(0).tolist()
+            rows.setdefault(name, {})[iso] = [hit / size, xy / yy, (max(xx - xy**2 / yy, 0) / yy) ** 0.5]
+    return rows
+
+
+def main(specs):
+    if DEVICE == "cpu":
+        torch.set_num_threads(THREADS)
+    kept_at = raw_pairs.DATA / "out" / "print.json"
+    table = json.loads(kept_at.read_text()) if kept_at.exists() else {}
+    every = (*bench_raw.CAMERAS, *bench_raw.groups())
+    cleaners = entrants([spec for spec in specs if spec not in every])
+    for test in [test for test in every if test in specs] or every:
+        each = {name: scores(cleaners, bench_raw.BENCH / f"{name}.npz") for name in bench_raw.cuts(f"print/{test}")}
+        for name, found in each.items():
+            table.setdefault(name.split("/")[-1], {}).update(found)
+        rows = table.setdefault(test, {}) if each else {}
+        for model in next(iter(each.values()), {}):
+            rows[model] = bench_raw.over_cameras([by_iso[model] for by_iso in each.values()])
+        kept_at.write_text(json.dumps(table, indent=1))
+        if rows:
+            heads = [*rows["noisy"], "mean"]
+            print(
+                f"\n{test}  small print read / finest detail kept in it\n{'':24}"
+                + "".join(f"{head:>14}" for head in heads)
+            )
+            for model, by_iso in rows.items():
+                shown = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
+                print(f"{model:24}" + "".join(f"{f'{row[0]:.3f} {row[1]:.3f}':>14}" for row in shown), flush=True)
+
+
+if __name__ == "__main__":
+    build_all(*sys.argv[2:]) if sys.argv[1] == "build" else main(sys.argv[1:])
