@@ -99,6 +99,15 @@ The "as shot" ones leave each noisy frame on its black offset, as a photo comes 
 the "as shot fixed" ones take off what blacks.py knows the body's offsets to be, as raw_denoise.py does.
 run.json beside the log keeps the run's settings.
 
+PSNR hardly tells two runs apart, so every check also logs what a person can picture of the picture
+the model makes itself (bench_raw.dials, quality.py): "gr3_noise_left" on the GR III's real noisy
+frames, what is left where the truth is flat as the eye weighs it at 2x, in 8-bit levels, and
+"gr3_stops_cleaner", the same in stops against the noisy frame's. A joint run adds, on the
+full-colour tests of the GR III and the seen cameras, "detail_kept" and "detail_invented", the share
+of the truth's detail the picture holds where the truth is busy and what else it holds there, and
+"finest_kept" and "finest_invented", the same of the band 2 to 3 px across. They are not "kept" and
+"invented", which stay as they were: one size, over the whole picture.
+
 --held data/bench/night/held.json leaves the scenes that file names out of training: the ones
 bench_raw.py's night test scores, which a model has to meet for the first time there.
 """
@@ -936,6 +945,8 @@ def main(args):
             lit = bright(clean_up)
             line |= {"bright_flats": [round(error, 4) for error in lit["flats"]]}
             line |= {"bright_tiles": round(lit["tiles"], 4)} if "tiles" in lit else {}
+            look = bench_raw.dials_one(clean_up, bench_raw.kept("gr3"))
+            line |= {"gr3_noise_left": mean_of(look, 0, 4), "gr3_stops_cleaner": mean_of(look, 1, 3)}
             if args.joint:
                 colour = bench_raw.scores(clean_up, "colour/gr3", with_lpips=True, with_detail=True)[0]
                 seen_colour = bench_raw.scores(clean_up, "colour/seen", with_lpips=True, with_detail=True)[0]
@@ -950,6 +961,16 @@ def main(args):
                     "gr3_colour_invented": mean_of(colour, 3, 4),
                     "seen_colour_kept": mean_of(seen_colour, 2, 4),
                     "seen_colour_invented": mean_of(seen_colour, 3, 4),
+                }
+                looks = {
+                    "gr3_colour": bench_raw.dials_one(clean_up, bench_raw.kept("colour/gr3")),
+                    "seen_colour": bench_raw.dials(clean_up, "colour/seen"),
+                }
+                parts = ("detail_kept", "finest_kept", "detail_invented", "finest_invented")
+                line |= {
+                    f"{test}_{part}": mean_of(look, 2 + at, 4)
+                    for test, look in looks.items()
+                    for at, part in enumerate(parts)
                 }
             if critic:
                 line |= {"critic": round(judging.item() / args.check, 5)}
