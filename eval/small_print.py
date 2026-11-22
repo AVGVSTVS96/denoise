@@ -38,8 +38,10 @@ Rows go to data/out/print.json as {test: {name: {ISO: [read, kept, invented]}}},
 "gr3", "unseen" or "seen" as on the board, a group as the mean over its cameras, and each camera
 under its file's name. "noisy" is the frame as shot. "clean" is the camera's clean frame as it was
 cut, through demosaic.menon: one reading, the same at every ISO, of a picture with no noise in it. It
-is not the lined-up clean frame, the other thing that made the number jump: resampling a mosaic by
-half a pixel softens print enough to lose a third of its letters. Nothing a model is given is resampled.
+is not the lined-up clean frame, the other thing that made the number jump: a mosaic moved an odd
+pixel along is each colour plane moved half a pixel, which softens print enough to lose a third of
+its letters, and the GR IIIx's noisy frames sit that far off its clean one. Nothing a model is given
+is resampled.
 
 It runs on the GPU when there is one and on the CPU when not, there in float32 where the GPU runs
 bfloat16, so compare rows made on the same machine.
