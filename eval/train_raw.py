@@ -69,6 +69,12 @@ lens made it, which is what the network meets in a photo and binned truth, twice
 It is one camera's 104 scenes, so a quarter and no more. --night lets SID's long exposures train too
 (raw_pairs.py sid), which are kept as a split of their own so that runs without it stay as they were.
 
+--text 0.25 lays print into that share of the joint crops' truth before it is sampled to a mosaic
+(lettered()): a page of text_bank.py's rendered print, shrunk until its strokes are 1 to 4 px wide,
+turned, in one colour darker or lighter than what is under it, and blurred as a lens would. Small
+print is the finest detail anyone reads in a photo and the scenes hold little of it, so this is
+there to show the network what a stroke looks like. A run without it is what it was.
+
 --teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
 trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
 against its picture, times --distil. Its picture is steadier than the truth, which keeps most of its
@@ -128,6 +134,7 @@ import torch
 import bench_raw
 import evaluate
 import raw_pairs
+import text_bank
 
 PAIRS = evaluate.DATA / "rawpairs"
 NOISE = evaluate.DATA / "noise"
@@ -169,6 +176,7 @@ READ_COUNTS = (1, 300)
 MOST_BANDING = 0.3
 TAPS = 7
 NEXT_GREEN = (((0, 1, 0, -1), (0, 2, -1, 0)), ((3, 2, 0, 1), (3, 1, 1, 0)))
+STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -705,6 +713,38 @@ def made_up_noise(clean, row, offsets, tails, darks):
     return torch.where(step > 0, torch.round(noisy / step.clamp(min=1e-12)) * step, noisy)
 
 
+def lettered(truth, pages):
+    """Camera RGB (N, 3, H, H) with print laid into each: one of text_bank.py's pages (pages, P, P) of coverage.
+
+    The page is shrunk until its strokes are between STROKES px wide, even on a log scale, and set
+    down with its middle anywhere in the crop, at any quarter turn and TILT radians or so off it.
+    It is blurred by between SOFT px, so that it is no sharper than a lens draws, and on the page,
+    before the shrinking, which would otherwise break thin strokes up; the taps reach REACH px of the
+    page. The ink is one colour: the mean of what lies under the letters, between CONTRAST times
+    darker or, as often, lighter, each colour by its own share of that, and never past white.
+    """
+    n, side, device = len(truth), truth.shape[-1], truth.device
+    page = pages[torch.randint(len(pages), (n,), device=device)].float() / 255
+    shrunk = text_bank.STROKE / spread(n, device, *STROKES)
+    soft = torch.empty(n, 1, device=device).uniform_(*SOFT) * shrunk[:, None]
+    taps = torch.exp(-(torch.arange(-REACH, REACH + 1, device=device) ** 2) / (2 * soft**2))
+    taps = taps / taps.sum(1, keepdim=True)
+    page = torch.nn.functional.conv2d(page[None], taps.view(n, 1, 1, -1), padding=(0, REACH), groups=n)
+    page = torch.nn.functional.conv2d(page, taps.view(n, 1, -1, 1), padding=(REACH, 0), groups=n)
+    turn = torch.randint(4, (n,), device=device) * (math.pi / 2) + torch.randn(n, device=device) * TILT
+    spin = torch.stack([turn.cos(), -turn.sin(), turn.sin(), turn.cos()], 1).view(n, 2, 2)
+    spin = spin * (shrunk * side / pages.shape[-1]).view(n, 1, 1)
+    middle = torch.empty(n, 2, 1, device=device).uniform_(-1, 1)
+    placed = torch.cat([spin, -spin @ middle], 2)
+    grid = torch.nn.functional.affine_grid(placed, (n, 1, side, side), align_corners=False)
+    cover = torch.nn.functional.grid_sample(page.transpose(0, 1), grid, align_corners=False)
+    under = (truth * cover).sum((2, 3), keepdim=True) / cover.sum((2, 3), keepdim=True).clamp(min=1e-6)
+    share = 1 - torch.rand(n, 1, 1, 1, device=device) * torch.rand(n, 3, 1, 1, device=device)
+    contrast = spread(n, device, *CONTRAST).view(n, 1, 1, 1) ** share
+    dark = torch.rand(n, 1, 1, 1, device=device) < 0.5
+    return torch.lerp(truth, torch.where(dark, under / contrast, (under * contrast).clamp(max=1)), cover)
+
+
 def gains(clean, lit=0.0):
     """Scale each crop to LEVEL, from six times darker to twice brighter.
 
@@ -823,6 +863,9 @@ def main(args):
     unbinned = float(args.truth[1]) if args.truth else 0
     if not 0 <= args.joint * unbinned <= max(args.joint - 1, 0):
         raise SystemExit("--truth's share has to leave one of --joint's crops to the binned truth")
+    if args.text and not args.joint:
+        raise SystemExit("--text lays print into the joint crops' truth, for a --joint run")
+    pages = torch.from_numpy(np.load(text_bank.OUT)).cuda() if args.text else None
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
@@ -888,6 +931,9 @@ def main(args):
             truth = bench_raw.full_colour(alone, args.bin)
             if taken:
                 truth = torch.cat([truth, truths.batch(taken)[0]])
+            printed = int(args.joint * args.text + lot.random()) if args.text else 0
+            if printed:
+                truth = torch.cat([lettered(truth[:printed], pages), truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
             noisy = at_white(under_noise(bench_raw.mosaiced(truth)), g)
@@ -1046,6 +1092,7 @@ if __name__ == "__main__":
         metavar=("FOLDER", "SHARE"),
         help="a folder of truth measured in full colour, and the share of the joint crops taken from it unbinned",
     )
+    parser.add_argument("--text", type=float, default=0, help="share of the joint crops with print laid into the truth")
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
