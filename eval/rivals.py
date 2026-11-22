@@ -40,6 +40,7 @@ On the night test a rival gets its like-for-like row alone, "<name>-cfa" for one
 picture, and is fed each frame as shot, with no gain: none of these apps brightens a photo before its network.
 
     uv run rivals.py night rawforge-jdd darktable             the night test alone
+    uv run rivals.py shift rawforge-jdd darktable             the shift test alone
 
 A model of ours gets "<name>-x8", the mean over the mosaic's eight flips and turns.
 """
@@ -354,14 +355,25 @@ def ensemble(clean_up):
 
 
 def replayed(clean_up):
-    """clean_up, and a second cleaner that hands the first one's pictures back in order, as mosaics."""
-    pictures = []
+    """clean_up, and a second cleaner that hands the first one's pictures back in order, as the
+    mosaics they are held as until then."""
+    held = []
 
     def first(mosaics, mean):
-        pictures.append(clean_up(mosaics, mean))
-        return pictures[-1]
+        picture = clean_up(mosaics, mean)
+        held.append(bench_raw.mosaiced(picture))
+        return picture
 
-    return first, lambda mosaics, mean: bench_raw.mosaiced(pictures.pop(0))
+    return first, lambda mosaics, mean: held.pop(0)
+
+
+@torch.no_grad()
+def scores(cleaners, camera):
+    """bench_raw.scores of each cleaner, one camera's file at a time: what a rival's first row holds
+    for its second is then one camera's pictures, where a whole group's are more than the card has."""
+    cuts = map(bench_raw.windows, bench_raw.cuts(camera))
+    each = [[bench_raw.score_one(clean_up, cut, with_lpips=True) for clean_up in cleaners] for cut in cuts]
+    return [[bench_raw.over_cameras(kind) for kind in zip(*files)] for files in zip(*each)]
 
 
 def rows(spec):
@@ -391,15 +403,15 @@ def main(specs, only=""):
         cleaners, own = rows(spec)
         for camera in (*bench_raw.CAMERAS, *bench_raw.groups(), "exact") if not only else ():
             tests = (camera,) if camera == "exact" else (camera, f"{camera}-aligned")
-            for name, clean_up in cleaners.items():
-                for test, by_iso in zip(tests, bench_raw.scores(clean_up, camera, with_lpips=True)):
+            for name, kinds in zip(cleaners, scores(cleaners.values(), camera)):
+                for test, by_iso in zip(tests, kinds):
                     add(test, name, by_iso)
         for camera in (*bench_raw.CAMERAS, *bench_raw.groups()) if own and not only else ():
             add(f"{camera}-colour", spec, bench_raw.scores(own, f"colour/{camera}", True, with_detail=True)[0])
-        if own and not only:
+        if own and only in ("", "shift"):
             add("shift", spec, bench_raw.scores(own, "shift", True, with_detail=True)[0])
         name = f"{spec}-cfa" if spec in PICTURES else spec
-        for test, by_gain in bench_raw.night(name, own).items() if own else ():
+        for test, by_gain in bench_raw.night(name, own).items() if own and only in ("", "night") else ():
             add(test, name, by_gain)
 
 
@@ -407,4 +419,5 @@ if __name__ == "__main__":
     if sys.argv[1:] in (["cameras"], ["fetch"]):
         {"cameras": cameras, "fetch": fetch}[sys.argv[1]]()
     else:
-        main(sys.argv[1:][sys.argv[1] == "night" :], "night" * (sys.argv[1] == "night"))
+        only = sys.argv[1] if sys.argv[1] in ("night", "shift") else ""
+        main(sys.argv[1 + bool(only) :], only)
