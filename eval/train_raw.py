@@ -114,7 +114,10 @@ its raw files does to a scene; its own frames do.
 --pairs 0.5 sends that share of --batch's draws to the scenes whose real noisy frames train, in place
 of PAIR_SHARE, and with --levels half of those (SMOOTH_SHARE) to the frames of cameras that smooth
 their raw (smoothed()): the ones whose row of the table has a pixel's noise moving with a
-neighbour's by more than TIED, a twelfth of the real noisy frames. A run without either is what it was.
+neighbour's by more than TIED, a twelfth of the real noisy frames. --favour 0.1 SCENE SCENE gives
+the scenes of those names that share of the real pairs' draws between them, every frame of theirs
+alike, before the rest is halved: one camera's few pairs, when the run is for that camera most of
+all. A run without any of the three is what it was.
 
 denoise() scales a whole photo by one gain, so a lamp-lit part of a dark photo reaches the network
 tens of times brighter than any crop in training, which a model answers with garbage. Two cures, to
@@ -489,14 +492,15 @@ class Crops:
     brightest value the noisy crop holds, in place of the clean twin, and the crop brings how far it
     sits off that frame as (dx, dy) sensor pixels, flipped and turned with it. With pairs that share
     of the draws goes to the scenes whose real noisy frames train, SMOOTH_SHARE of it to their frames
-    in smooth, a set of (scene, ISO), when there are some.
+    in smooth, a set of (scene, ISO), when there are some. With favour, a share and scenes' names, the
+    scenes of those names get that share of the pairs' draws first.
     """
 
     folder, room, reads, frames, whole = PAIRS, POOL, READS, [0, -1], None
 
-    def __init__(self, scenes, size, seed, real, as_shot, twins=False, pairs=0, smooth=frozenset()):
+    def __init__(self, scenes, size, seed, real, as_shot, twins=False, pairs=0, smooth=frozenset(), favour=(0, ())):
         self.size, self.real, self.as_shot, self.rng, self.pool = size, real, as_shot, random.Random(seed), []
-        self.twins, self.pairs, self.smooth = twins, pairs, smooth
+        self.twins, self.pairs, self.smooth, self.favour = twins, pairs, smooth, favour
         self.use(scenes)
         threading.Thread(target=self.read, daemon=True).start()
 
@@ -511,20 +515,31 @@ class Crops:
     def apportioned(self, scenes, draws):
         """The draws with self.pairs of them sent to the scenes whose real noisy frames train: such a
         scene once for its frames in self.smooth, which get SMOOTH_SHARE of that between them, and once
-        for its other frames, each kind shared out among its own as the scenes were."""
-        kinds = {"clean": [], "smooth": [], "plain": []}
+        for its other frames, each kind shared out among its own as the scenes were. The scenes
+        self.favour names come out of both first, whole, with its share of the pairs' draws."""
+        most, names = self.favour
+        kinds = {"clean": [], "favoured": [], "smooth": [], "plain": []}
         for scene, weight, _ in draws:
             frames = scenes[scene] if fnmatch.fnmatch(scene, self.real) else []
+            favoured = any(fnmatch.fnmatch(scene, name) for name in names)
             smooth = [k for k, frame in enumerate(frames, 1) if (scene, frame["iso"]) in self.smooth]
             plain = [k for k in range(1, len(frames) + 1) if k not in smooth]
             if not frames:
                 kinds["clean"].append((scene, weight, None))
-            if smooth:
+            elif favoured:
+                kinds["favoured"].append((scene, weight, [*range(1, len(frames) + 1)]))
+            if smooth and not favoured:
                 kinds["smooth"].append((scene, weight, smooth))
-            if plain:
+            if plain and not favoured:
                 kinds["plain"].append((scene, weight, plain))
         some = SMOOTH_SHARE if kinds["smooth"] and kinds["plain"] else float(bool(kinds["smooth"]))
-        shares = {"clean": 1 - self.pairs, "smooth": self.pairs * some, "plain": self.pairs * (1 - some)}
+        rest = self.pairs * (1 - most * bool(kinds["favoured"]))
+        shares = {
+            "clean": 1 - self.pairs,
+            "favoured": self.pairs - rest,
+            "smooth": rest * some,
+            "plain": rest * (1 - some),
+        }
         totals = {kind: sum(weight for _, weight, _ in found) for kind, found in kinds.items()}
         return [
             (scene, weight * shares[kind] / totals[kind], among)
@@ -1039,7 +1054,10 @@ def main(args):
     train = training()
     own = f"*{camera.stem}-*" if args.profile else "*"
     smooth = smoothed(measured(args.levels)) if args.pairs and args.levels else frozenset()
-    crops = Crops(train, args.size[0], args.seed + step, own, args.offsets, bool(twin), args.pairs, smooth)
+    if args.favour and not args.pairs:
+        raise SystemExit("--favour shares out --pairs' draws")
+    favour = (float(args.favour[0]), tuple(args.favour[1:])) if args.favour else (0, ())
+    crops = Crops(train, args.size[0], args.seed + step, own, args.offsets, bool(twin), args.pairs, smooth, favour)
     big = None
     if args.size[1:]:
         wide = training(raw_pairs.BIG)
@@ -1294,6 +1312,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pairs", type=float, default=0, help="share of --batch's draws from the scenes whose real noisy frames train"
+    )
+    parser.add_argument(
+        "--favour",
+        nargs="+",
+        metavar=("SHARE", "SCENE"),
+        help="a share of --pairs' draws, and the scenes with real noisy frames that get it between them",
     )
     parser.add_argument("--teacher", help="a bigger joint model's weights, to distil into this one")
     parser.add_argument("--distil", type=float, default=1, help="weight of the loss against the teacher's picture")
