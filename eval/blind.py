@@ -2,6 +2,7 @@
 
     uv run blind.py crop PHOTO X Y [NOTE]     add a crop: a raw, and the crop's middle as fractions of its frame
     uv run blind.py add joint-v2=data/models/raw/joint-v2/joint.pth darktable rawforge-jdd dxo=FOLDER
+    uv run blind.py add gemini-3-pro-image=data/out/frontier/R0006362-signs_gemini-3-pro-image.png
     uv run blind.py first joint-v1:joint-v2   the pairs the page asks before the rest
     uv run blind.py table                     who beat whom, from the picks so far
 
@@ -12,13 +13,16 @@ two entrants' pictures of one crop, in an order of its own, and saves each pick 
 
 A crop is SIDE px of a photo, developed as the app develops it (raw_develop.py): blacks.py's offsets
 off, the entrant's camera RGB, then the photo's white balance, matrix, exposure and tone curve. An
-entrant is one of three kinds:
+entrant is one of four kinds:
 
     NAME=WEIGHTS.pth   a joint model of ours, through train_raw.denoise() on the whole photo's gain and
                        tiles, of which only the tiles that reach the crop run
     a rivals.py name   a rival that hands back a picture, fed as rivals.py feeds it, on the crop and
                        MARGIN px around it
     NAME=FOLDER        what a program made of the photo, as a linear DNG (kit.py)
+    NAME=PICTURE.png   what a hosted model made (frontier.py) of the user's photo as raw_denoise.py rendered
+                       it, or of a piece of that: the crops it holds, warped onto what it was given, with
+                       the render taken back off. Name it once for every picture it made
 
 add makes whatever pictures are missing, so a new crop or a new entrant is the same one command.
 """
@@ -37,7 +41,9 @@ import rawpy
 import torch
 
 import blacks
+import frontier
 import kit
+import raw_denoise
 import raw_develop
 import raw_pairs
 import rivals
@@ -49,6 +55,8 @@ SHEET = pathlib.Path(os.environ.get("BLIND_SHEET", pathlib.Path.home() / "Develo
 PICKS = SHEET.parents[1] / "data" / f"{SHEET.name}.json"
 CROPS = raw_pairs.DATA / "blind" / "crops.json"
 SHARPEST = 0.5
+RENDER = raw_denoise.HIS.with_suffix(".png")
+LINEAR_BELOW, SLOPE, POWER, LIFT = 0.0812, 4.5, 1 / 2.222, 0.0993
 Shot = collections.namedtuple("Shot", "photo path mosaic look flip red iso camera rival")
 
 
@@ -153,11 +161,49 @@ def program(folder):
     return run
 
 
+@functools.cache
+def brightness():
+    return raw_denoise.his_brightness(raw_denoise.HIS)
+
+
+def unrendered(picture, balance, matrix):
+    """A picture (H, W, 3, 8 bits) of RENDER's kind as the camera RGB (3, H, W) it would develop from:
+    libraw's curve and brightness off, then the photo's matrix and white balance."""
+    encoded = picture / 255
+    toe = encoded < LINEAR_BELOW
+    linear = np.where(toe, encoded / SLOPE, ((encoded + LIFT) / (1 + LIFT)) ** (1 / POWER)) / brightness()
+    return np.einsum("ij,hwj->ihw", np.linalg.inv(matrix), linear) / balance[:, None, None]
+
+
+def hosted(file):
+    """A hosted model's picture of a piece of RENDER, the piece it was given being the file of its name before the "_"."""
+    rgb = lambda path: cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+    render, given = rgb(RENDER), rgb(RENDER.with_name(pathlib.Path(file).name.split("_")[0] + ".png"))
+    across, down = cv2.minMaxLoc(cv2.matchTemplate(render, given[:MARGIN, :MARGIN], cv2.TM_SQDIFF))[2]
+    if not np.array_equal(render[down:, across:][: given.shape[0], : given.shape[1]], given):
+        sys.exit(f"{file} was made of a picture that is not a piece of {RENDER.name}")
+    made = cv2.resize(rgb(file), given.shape[1::-1], interpolation=cv2.INTER_AREA)
+
+    def run(taken, window):
+        top, left, height, width = window
+        y, x = top - down, left - across
+        if taken.path != raw_denoise.HIS or min(y, x, given.shape[0] - y - height, given.shape[1] - x - width) < 0:
+            return None
+        rows, columns = slice(max(0, y - MARGIN), y + height + MARGIN), slice(max(0, x - MARGIN), x + width + MARGIN)
+        around = frontier.align(made[rows, columns], given[rows, columns])[0]
+        cut = around[y - rows.start :, x - columns.start :][:height, :width]
+        return unrendered(cut, *taken.look[:2]).astype(np.float32)
+
+    return run
+
+
 def entrant(spec):
     """An entrant's name, and what makes its camera RGB (3, SIDE, SIDE) of a window of a photo, or None."""
     name, _, source = spec.partition("=")
     if source and pathlib.Path(source).is_dir():
         return name, program(source)
+    if source.endswith(".png"):
+        return name, hosted(source)
     return name, ours(source) if source else rival(name)
 
 
