@@ -392,6 +392,8 @@ def main(specs):
     kept_at = raw_pairs.DATA / "out" / "print.json"
     table = json.loads(kept_at.read_text()) if kept_at.exists() else {}
     every = (*bench_raw.CAMERAS, *bench_raw.groups())
+    if not any(bench_raw.cuts(f"print/{test}") for test in every):
+        sys.exit(f"no windows in {READER.parent}: build them on the server, or mount that folder here")
     cleaners = entrants([spec for spec in specs if spec not in every])
     for test in [test for test in every if test in specs] or every:
         each = {name: scores(cleaners, bench_raw.BENCH / f"{name}.npz") for name in bench_raw.cuts(f"print/{test}")}
