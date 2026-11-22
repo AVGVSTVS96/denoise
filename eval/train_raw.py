@@ -81,6 +81,16 @@ the truth as it was. The truth and the mosaic made of it are otherwise equally s
 hands back a picture as soft as the lens drew it: this shows it a photo softer than its answer, for
 it to give back the band the lens took. A run without it is what it was.
 
+--smoothed 0.25 makes that share of the frames under laid-over noise, of both kinds of crop, what a
+camera that smooths its raw files hands over: the noise is a row's of --levels' table whose noise
+is tied (tied()), mixed as --mixing mixes it, and the scene under it has been through that row's
+filter too (filtered()), by a share drawn per crop from none of it to all. --mixing ties the noise
+and leaves the scene as sharp as ever, and so does the GR III's real noise; a Ricoh above ISO 6,400
+has lost a fifth and more of its finest detail to its own smoothing. The truth stays as sharp as it
+was, so the network is asked for the detail back, and the share is drawn because a camera spares
+more of the scene than of the noise, by an amount that changes with its ISO. --soften is a lens, a
+blur under the noise; this is the blur over it. A run without it is what it was.
+
 --teacher takes a bigger joint model's weights, --width 64's, and distils it into the one being
 trained: frozen, it cleans the same noisy crops of both kinds, and the loss adds picture_loss
 against its picture, times --distil. Its picture is steadier than the truth, which keeps most of its
@@ -661,16 +671,18 @@ def measured(path):
     return found if isinstance(found, list) else list(found["iso"].values())
 
 
-def smoothed(rows):
-    """The real noisy frames of cameras that smooth their raw, as (scene, ISO): the rows of fit_noise.py's
-    table in which a pixel's noise moves with a neighbour's, the green beside it or its own colour's
-    next pixel across or down, by more than TIED. A row is one scene's frame, named as raw_pairs.py
-    names a review site's ladder."""
+def tied(rows):
+    """The rows of fit_noise.py's table whose camera smooths its raw: a pixel's noise moves with a
+    neighbour's, the green beside it or its own colour's next pixel across or down, by more than TIED."""
     tie = lambda row: max(max(row.get(part, [0.0])) for part in ("beside", "across", "down"))
+    return [row for row in rows if tie(row) > TIED]
+
+
+def smoothed(rows):
+    """The real noisy frames of cameras that smooth their raw, as (scene, ISO): tied()'s rows of
+    fit_noise.py's table. A row is one scene's frame, named as raw_pairs.py names a review site's ladder."""
     return frozenset(
-        (f"ladder-{row['site']}-{row['camera']}-{row['scene']}", row["iso"])
-        for row in rows
-        if "site" in row and tie(row) > TIED
+        (f"ladder-{row['site']}-{row['camera']}-{row['scene']}", row["iso"]) for row in tied(rows) if "site" in row
     )
 
 
@@ -705,14 +717,28 @@ def mixers(rows):
     return (taps / np.sqrt((taps**2).sum((2, 3, 4), keepdims=True))).astype(np.float32)
 
 
-def mixed(unit, taps):
+def mixed(unit, taps, edge="circular"):
     """Unit-strength noise (N, H, W), each mosaic's colour planes run through its filter of mixers().
 
     A plane's edges meet round the back, so the noise at an edge is as strong and as mixed as elsewhere.
+    A scene has nothing round the back: with the edge "reflect" a plane is mirrored past its edges.
     """
     n, h, w = unit.shape
-    planes = torch.nn.functional.pad(pack(unit), [TAPS // 2] * 4, "circular").flatten(0, 1)[None]
+    planes = torch.nn.functional.pad(pack(unit), [TAPS // 2] * 4, edge).flatten(0, 1)[None]
     return unpack(torch.nn.functional.conv2d(planes, taps.flatten(0, 1), groups=n).view(n, 4, h // 2, w // 2))
+
+
+def filtered(scene, row):
+    """Clean mosaics (N, H, W) as a camera that smooths its raw files leaves a scene: through the row's
+    filter of mixers(), by the row's share "smoothed" (N,), from 0, as sharp as it was, to 1.
+
+    The taps are brought to add up to one, so that a flat area keeps its brightness, and they work on
+    the mosaic balanced until its four colour planes have one mean, so that the crop keeps its colour:
+    the filter moves red and blue towards the greens beside them. The scene is mirrored past its edges.
+    """
+    taps = row["mix"] / row["mix"].sum((2, 3, 4), keepdim=True)
+    balance = sites(1 / pack(scene).mean((2, 3)).clamp(min=1e-6), scene)
+    return torch.lerp(scene, mixed(scene * balance, taps, "reflect") / balance, row["smoothed"].view(-1, 1, 1))
 
 
 def table(rows, mixing=False):
@@ -795,7 +821,8 @@ def made_up_noise(clean, row, offsets, tails, darks):
     dark frame, at the row's read level, in place of made-up read noise, banding and offset. A row
     with a mixing filter has its shot and read noise, a dark frame's too, run through it: each
     pixel's is brought to unit strength first and scaled back after, so banding and offset stay as
-    they are and no pixel's noise changes strength.
+    they are and no pixel's noise changes strength. A row with a share "smoothed" has the scene under
+    that noise run through the filter too, by that share (filtered()).
     """
     n, device = clean.shape[0], clean.device
     shot, read = sites(row["shot"], clean), sites(row["read"], clean)
@@ -813,7 +840,8 @@ def made_up_noise(clean, row, offsets, tails, darks):
     counted, dark = torch.poisson(light / shot) * shot, unit * read + banding
     if "mix" in row:
         strength = (light * shot + read**2).sqrt().clamp(min=1e-12)
-        counted = light + mixed((counted - light + unit * read) / strength, row["mix"]) * strength
+        scene = filtered(light, row) if "smoothed" in row else light
+        counted = scene + mixed((counted - light + unit * read) / strength, row["mix"]) * strength
         dark = banding
     noisy = counted + dark + sites(lift * offsets, clean)
     step = row["step"].view(n, 1, 1) * tails
@@ -995,6 +1023,9 @@ def main(args):
     twin = trained(args.twins[0]).to(memory_format=torch.channels_last) if args.twins else None
     if twin and not (args.joint and joint(twin)):
         raise SystemExit("--twins is a joint model's weights, for a --joint run")
+    if args.smoothed and not args.levels:
+        raise SystemExit("--smoothed draws the rows of --levels' table whose noise is tied")
+    cameras = table(tied(measured(args.levels)), True) if args.smoothed else None
     bench_raw.kept("gr3")
     val = scenes("val", args.scenes)
     log = (out / "log.jsonl").open("a")
@@ -1029,6 +1060,11 @@ def main(args):
         if bank:
             real = torch.rand(len(clean), 1, 1, device=clean.device) < share
             laid = torch.where(real, bank_noise(clean, bank, args.offsets), laid)
+        if cameras:
+            n, device = len(clean), clean.device
+            row = drawn(n, device, cameras, 1) | {"smoothed": torch.rand(n, device=device)}
+            smooth = torch.rand(n, 1, 1, device=device) < args.smoothed
+            laid = torch.where(smooth, made_up_noise(clean, row, args.offsets, args.tails, darks), laid)
         return laid
 
     def at_white(noisy, gain):
@@ -1245,6 +1281,9 @@ if __name__ == "__main__":
         nargs=2,
         metavar=("LOW", "HIGH"),
         help="the joint crops' truth is blurred by between these px before it is sampled to a mosaic",
+    )
+    parser.add_argument(
+        "--smoothed", type=float, default=0, help="share of laid-over noise that a camera smoothed, the scene with it"
     )
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument(
