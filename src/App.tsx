@@ -17,6 +17,7 @@ type Job = {
   height: number;
   stage: "decode" | "model" | "clean" | "done";
   raw?: boolean;
+  band?: number;
   loaded: number;
   modelBytes: number;
   done: number;
@@ -104,7 +105,10 @@ export function App() {
           case "start":
             size = { width: data.width, height: data.height };
             onDevice = data.raw ? "on-device-raw" : "on-device";
-            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw, stage: "model" });
+            setJob(
+              (j) =>
+                j && { ...j, width: data.width, height: data.height, raw: data.raw, band: data.band, stage: "model" },
+            );
 
             return;
           case "original":
@@ -436,20 +440,22 @@ function Editor({
 }) {
   const [split, setSplit] = useState(50);
   const [strength, setStrength] = useState(() => Number(localStorage.getItem("strength") ?? 100));
-  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 25));
+  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 50));
   const [actual, setActual] = useState(false);
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
   const image = useRef<HTMLDivElement>(null);
   const done = job.stage === "done";
+  const band = job.band ?? 0;
+  const finer = band > 0 ? fine : 0;
 
   useEffect(() => {
     if (job.cleaned) canvas.current?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
   }, [job.cleaned, canvas]);
 
   useEffect(() => {
-    if (done && job.raw && fine > 0) withDetail(canvas.current!, detail.current!).catch(() => {});
-  }, [done, job.raw, fine, canvas, detail]);
+    if (done && finer > 0) withDetail(input.current!, canvas.current!, detail.current!, band).catch(() => {});
+  }, [done, finer, band, input, canvas, detail]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -529,7 +535,7 @@ function Editor({
               )}
               <div className="absolute inset-0" style={job.raw ? { opacity: strength / 100 } : undefined}>
                 <canvas ref={canvas} width={job.width} height={job.height} className="absolute inset-0 size-full" />
-                {job.raw && (
+                {band > 0 && (
                   <canvas
                     ref={detail}
                     width={job.width}
@@ -562,7 +568,7 @@ function Editor({
           {done && job.raw && (
             <>
               <Dial name="Strength" value={strength} onChange={setStrength} />
-              <Dial name="Detail" value={fine} onChange={setFine} />
+              {band > 0 && <Dial name="Detail" value={fine} onChange={setFine} />}
             </>
           )}
           <Button onClick={() => setActual((a) => !a)} disabled={!job.width}>
@@ -574,8 +580,8 @@ function Editor({
               primary
               onClick={async () =>
                 save(
-                  job.raw && (strength < 100 || fine > 0)
-                    ? await blended(input.current!, canvas.current!, detail.current!, strength, fine)
+                  job.raw && (strength < 100 || finer > 0)
+                    ? await blended(input.current!, canvas.current!, detail.current, strength, finer, band)
                     : job.result!,
                   `${job.name}-denoised.jpg`,
                 )
@@ -723,24 +729,25 @@ function eta(ms: number) {
 }
 
 const STRIP = 256;
-const finer = new WeakMap<HTMLCanvasElement, Promise<void>>();
+const filling = new WeakMap<HTMLCanvasElement, Promise<void>>();
 
-async function fill(over: HTMLCanvasElement, onto: HTMLCanvasElement) {
+async function fill(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement, band: number) {
   const { width, height } = over;
-  const [made, drawn] = [over, onto].map((canvas) => canvas.getContext("2d")!);
+  const [shot, made, drawn] = [under, over, onto].map((canvas) => canvas.getContext("2d")!);
 
   for (let y = 0; y < height && onto.isConnected; y += STRIP) {
     const top = Math.max(0, y - MARGIN);
     const rows = Math.min(height, y + STRIP + MARGIN) - top;
-    const pixels = detailed(made.getImageData(0, top, width, rows).data, width);
+    const result = made.getImageData(0, top, width, rows).data;
+    const pixels = detailed(result, shot.getImageData(0, top, width, rows).data, width, band);
     drawn.putImageData(new ImageData(pixels, width, rows), 0, top, 0, y - top, width, STRIP);
     await new Promise((next) => setTimeout(next));
   }
 }
 
-function withDetail(over: HTMLCanvasElement, onto: HTMLCanvasElement) {
-  const filled = finer.get(onto) ?? fill(over, onto);
-  finer.set(onto, filled);
+function withDetail(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement, band: number) {
+  const filled = filling.get(onto) ?? fill(under, over, onto, band);
+  filling.set(onto, filled);
 
   return filled;
 }
@@ -748,16 +755,17 @@ function withDetail(over: HTMLCanvasElement, onto: HTMLCanvasElement) {
 async function blended(
   under: HTMLCanvasElement,
   over: HTMLCanvasElement,
-  onto: HTMLCanvasElement,
+  onto: HTMLCanvasElement | null,
   strength: number,
   fine: number,
+  band: number,
 ) {
   const mixed = new OffscreenCanvas(over.width, over.height);
   const ctx = mixed.getContext("2d")!;
   ctx.drawImage(over, 0, 0);
 
-  if (fine > 0) {
-    await withDetail(over, onto);
+  if (onto && fine > 0) {
+    await withDetail(under, over, onto, band);
     ctx.globalAlpha = fine / 100;
     ctx.drawImage(onto, 0, 0);
   }

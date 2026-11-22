@@ -23,11 +23,14 @@ const MAX_GAIN = 64;
 const EXPOSURE = 1.4;
 const STEPS = 65535;
 const UNHELD: Brightest = { block: TILE, level: Infinity };
-const REACH = 8;
+const REACH = 4;
 export const MARGIN = 2 * REACH;
 const QUIET = 4;
 const BUSY = 8;
-const SHARPEST = 2;
+const MOST = 0.5;
+const GRAINY = 25600;
+
+export const detailBand = (iso: number) => MOST * Math.min(1, Math.max(0, 1 - Math.log2(iso / GRAINY)));
 
 const mirrored = (size: number, padded: number) =>
   Int32Array.from({ length: padded }, (_, p) => {
@@ -259,15 +262,16 @@ function boxed(plane: Float32Array, width: number) {
   return plane;
 }
 
-export function detailed(result: Uint8ClampedArray, width: number) {
+export function detailed(result: Uint8ClampedArray, input: Uint8ClampedArray, width: number, band: number) {
   const bright = brightness(result);
   const busy = boxed(bright.slice(), width);
 
   for (let i = 0; i < busy.length; i++) busy[i] = (bright[i] - busy[i]) ** 2;
 
   boxed(busy, width);
+  const noisy = brightness(input);
   const detail = new Uint8ClampedArray(result);
-  const height = bright.length / width;
+  const height = noisy.length / width;
 
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
@@ -275,10 +279,9 @@ export function detailed(result: Uint8ClampedArray, width: number) {
       const share = (Math.sqrt(Math.max(0, busy[q])) - QUIET) / (BUSY - QUIET);
 
       if (share <= 0) continue;
-      const beside = bright[q - 1] + bright[q + 1] + bright[q - width] + bright[q + width];
-      const corners = bright[q - width - 1] + bright[q - width + 1] + bright[q + width - 1] + bright[q + width + 1];
-      const fine = bright[q] - (4 * bright[q] + 2 * beside + corners) / 16;
-      const back = SHARPEST * Math.min(1, share) * fine;
+      const beside = noisy[q - 1] + noisy[q + 1] + noisy[q - width] + noisy[q + width];
+      const corners = noisy[q - width - 1] + noisy[q - width + 1] + noisy[q + width - 1] + noisy[q + width + 1];
+      const back = band * Math.min(1, share) * (noisy[q] - (4 * noisy[q] + 2 * beside + corners) / 16);
 
       for (let k = 0; k < 3; k++) detail[4 * q + k] = result[4 * q + k] + back;
     }

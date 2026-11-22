@@ -1,12 +1,13 @@
 """The app's Detail step (src/raw.ts) in numpy, and how far the app's own picture is from it.
 
-    uv run detail.py RESULT.ppm DETAIL.ppm      raw_check.ts's result and Detail pictures of one photo
+    uv run detail.py RESULT.ppm INPUT.ppm DETAIL.ppm ISO      raw_check.ts's three pictures of one photo
 
-The step sharpens a result's own finest detail where the picture is busy and nowhere else: the finest
-band of the result's brightness (what a 3 px blur takes away) is added to it SHARPEST times over where
-its brightness moves by more than QUIET levels within 17 px, in full from BUSY levels up. Nothing of
-the noisy input comes back, so no grain does, and no colour is touched. The app's Detail slider fades
-from the result to this picture: at 50 the band is added once over.
+The step gives a photo back its camera's own finest detail where the picture is busy and nowhere else:
+the finest band of the developed input's brightness (what a 3 px blur takes away) is added to the
+result where the result's own brightness moves by more than QUIET levels within 9 px, in full from
+BUSY levels up. It makes nothing up and touches no colour, and what it adds is the input's noise in
+that band as much as its detail. So the picture the app's Detail slider fades to holds MOST of that
+band and no more, and less of it above ISO GRAINY: none a stop higher, where it is all grain.
 """
 
 import sys
@@ -15,33 +16,38 @@ import cv2
 import numpy as np
 
 LUMA = np.array([0.299, 0.587, 0.114])
-REACH, QUIET, BUSY, SHARPEST = 8, 4.0, 8.0, 2.0
+REACH, QUIET, BUSY, MOST, GRAINY = 4, 4.0, 8.0, 0.5, 25600
 SOFT = np.array([0.25, 0.5, 0.25])
 
 
 def box(plane):
-    """Each pixel's mean over the 17 px around it, as far as the picture reaches."""
+    """Each pixel's mean over the 9 px around it, as far as the picture reaches."""
     blur = lambda of: cv2.blur(of, (2 * REACH + 1,) * 2, borderType=cv2.BORDER_CONSTANT)
     return blur(plane) / blur(np.ones_like(plane))
 
 
 def busy(result):
-    """How far a picture's brightness moves within 17 px, pooled over 17 px, in 8-bit levels (H, W)."""
+    """How far a picture's brightness moves within 9 px, pooled over 9 px, in 8-bit levels (H, W)."""
     bright = result @ LUMA
     return np.sqrt(box((bright - box(bright)) ** 2).clip(0))
 
 
-def detailed(result):
-    """A result (H, W, 3, 8 bits) with its own finest band of brightness added SHARPEST times where it is busy."""
-    bright = result @ LUMA
-    fine = np.pad((bright - cv2.sepFilter2D(bright, -1, SOFT, SOFT))[1:-1, 1:-1], 1)
-    back = SHARPEST * np.clip((busy(result) - QUIET) / (BUSY - QUIET), 0, 1) * fine
+def band(iso):
+    """How much of the noisy frame's finest band the Detail picture holds: MOST up to ISO GRAINY, none from a stop above."""
+    return MOST * float(np.clip(1 - np.log2(max(iso, 1) / GRAINY), 0, 1))
+
+
+def detailed(result, shot, share):
+    """A result (H, W, 3, 8 bits) with that share of its developed input's finest band of brightness back where it is busy."""
+    noisy = shot @ LUMA
+    fine = np.pad((noisy - cv2.sepFilter2D(noisy, -1, SOFT, SOFT))[1:-1, 1:-1], 1)
+    back = share * np.clip((busy(result) - QUIET) / (BUSY - QUIET), 0, 1) * fine
     return np.clip(np.rint(result + back[..., None]), 0, 255).astype(np.uint8)
 
 
-def main(result, detail):
-    result, theirs = (cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) for path in (result, detail))
-    ours = detailed(result)
+def main(result, shot, detail, iso):
+    result, shot, theirs = (cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) for path in (result, shot, detail))
+    ours = detailed(result, shot, band(int(iso)))
     apart = np.abs(theirs.astype(np.int32) - ours)
     lively = busy(result) > QUIET
     print(

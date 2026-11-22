@@ -3,11 +3,11 @@ import * as cloud from "./cloud";
 import { blackOffsets } from "./blacks";
 import { rawPhoto, rawPreview, type Raw } from "./dng";
 import { loadModel, models, type ModelKind } from "./model";
-import { clean, CORE, PIECE } from "./raw";
+import { clean, CORE, detailBand, PIECE } from "./raw";
 
 export type FromWorker =
   | { type: "model"; loaded: number; total: number }
-  | { type: "start"; width: number; height: number; raw: boolean }
+  | { type: "start"; width: number; height: number; raw: boolean; band: number }
   | { type: "original"; blob: Blob }
   | { type: "tile" | "input"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
@@ -140,7 +140,7 @@ function flush(
 async function runCloud(file: Blob, key: string, model: cloud.Model) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: false });
+  post({ type: "start", width: W, height: H, raw: false, band: 0 });
   const tile = Math.min(cloud.TILE, W, H);
   const overlap = Math.min(cloud.OVERLAP, tile >> 2);
   const xs = positions(W, tile, overlap);
@@ -191,7 +191,7 @@ const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
 async function run(file: Blob) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: false });
+  post({ type: "start", width: W, height: H, raw: false, band: 0 });
   const src = ctx.getImageData(0, 0, W, H).data;
   const sess = await getSession("photo");
   const xs = positions(W);
@@ -304,7 +304,7 @@ async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
   if (!made) throw new Error("This photo is too large for this browser.");
   const { canvas, ctx } = made;
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: true });
+  post({ type: "start", width: W, height: H, raw: true, band: detailBand(raw.iso) });
   originalUpright(file, raw).catch(() => {});
   const turn = ctx.getTransform();
   const dx = Math.ceil(crop.x * scale);

@@ -4,7 +4,7 @@ import * as ort from "onnxruntime-web";
 import manifest from "../public/model/raw.json";
 import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
-import { clean, detailed, photoGain } from "../src/raw";
+import { clean, detailBand, detailed, photoGain } from "../src/raw";
 
 const [photo, out, input, detail] = process.argv.slice(2);
 const model = join(import.meta.dirname, "../public/model");
@@ -70,7 +70,7 @@ await writeFile(out, Buffer.concat([head, picture]));
 if (input) await writeFile(input, Buffer.concat([head, shot]));
 
 if (detail) {
-  const fine = detailed(opaque(picture), width);
+  const fine = detailed(opaque(picture), opaque(shot), width, detailBand(iso));
 
   await writeFile(detail, Buffer.concat([head, Buffer.from(fine.filter((_, i) => i % 4 < 3))]));
 }
