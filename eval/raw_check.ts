@@ -4,13 +4,21 @@ import * as ort from "onnxruntime-web";
 import manifest from "../public/model/raw.json";
 import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
-import { clean, photoGain } from "../src/raw";
+import { clean, detailed, photoGain } from "../src/raw";
 
-const [photo, out, input] = process.argv.slice(2);
+const [photo, out, input, detail] = process.argv.slice(2);
 const model = join(import.meta.dirname, "../public/model");
 const parts = await Promise.all(manifest.parts.map((part) => readFile(join(model, part))));
 
 ort.env.wasm.numThreads = 4;
+
+const opaque = (rgb: Uint8Array) => {
+  const rgba = new Uint8ClampedArray((rgb.length / 3) * 4).fill(255);
+
+  for (let i = 0; i < rgb.length; i++) rgba[i + Math.floor(i / 3)] = rgb[i];
+
+  return rgba;
+};
 
 const session = await ort.InferenceSession.create(Buffer.concat(parts), { executionProviders: ["wasm"] });
 const raw = await rawPhoto(new Blob([await readFile(photo)]));
@@ -60,3 +68,9 @@ const head = Buffer.from(`P6\n${width} ${height}\n255\n`);
 await writeFile(out, Buffer.concat([head, picture]));
 
 if (input) await writeFile(input, Buffer.concat([head, shot]));
+
+if (detail) {
+  const fine = detailed(opaque(picture), opaque(shot), width);
+
+  await writeFile(detail, Buffer.concat([head, Buffer.from(fine.filter((_, i) => i % 4 < 3))]));
+}
