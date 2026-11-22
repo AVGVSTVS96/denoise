@@ -35,7 +35,7 @@ import raw_pairs
 
 OUT = raw_pairs.DATA / "noise" / "text.npy"
 LOCALES = pathlib.Path("/usr/share/locale")
-PAGES, SIDE, STROKE = 512, 512, 4
+PAGES, SIDE, STROKE = 2048, 512, 4
 TRIAL, SAMPLE, WORDS = 100, 24, 400
 CAPITALS = 0.25
 LANGUAGES = {
