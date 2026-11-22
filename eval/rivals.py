@@ -192,7 +192,9 @@ def darktable():
 
     def clean_up(mosaics, mean):
         planes = train_raw.pack(mosaics)
-        tiles = torch.nn.functional.pad(planes, (128, 128, 128, 128), mode="reflect")
+        tiles = torch.nn.functional.pad(
+            torch.nn.functional.pad(planes, (64,) * 4, mode="reflect"), (64,) * 4, mode="reflect"
+        )
         rgb = torch.cat([model(part) for part in tiles.split(4)])[..., 256:-256, 256:-256]
         red, green, also_green, blue = level(planes).unbind(1)
         return rgb * torch.stack([red, (green + also_green) / 2, blue], 1) / level(rgb)
