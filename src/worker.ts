@@ -3,15 +3,15 @@ import * as cloud from "./cloud";
 import { blackOffsets } from "./blacks";
 import { rawPhoto, rawPreview, type Raw } from "./dng";
 import { loadModel, models, type ModelKind } from "./model";
-import { clean, CORE, detailBand, PIECE } from "./raw";
+import { clean, CORE, detailBand, grain, PIECE } from "./raw";
 
 export type FromWorker =
   | { type: "model"; loaded: number; total: number }
-  | { type: "start"; width: number; height: number; raw: boolean; band: number }
+  | { type: "start"; width: number; height: number; raw: boolean }
   | { type: "original"; blob: Blob }
   | { type: "tile" | "input"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
-  | { type: "done"; blob: Blob }
+  | { type: "done"; blob: Blob; band: number }
   | { type: "error"; message: string };
 
 const TILE = 512;
@@ -140,7 +140,7 @@ function flush(
 async function runCloud(file: Blob, key: string, model: cloud.Model) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: false, band: 0 });
+  post({ type: "start", width: W, height: H, raw: false });
   const tile = Math.min(cloud.TILE, W, H);
   const overlap = Math.min(cloud.OVERLAP, tile >> 2);
   const xs = positions(W, tile, overlap);
@@ -183,7 +183,7 @@ async function runCloud(file: Blob, key: string, model: cloud.Model) {
     flush(ctx, acc, W, wy, r === ys.length - 1 ? tile : ys[r + 1] - wy, 1);
   }
 
-  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band: 0 });
 }
 
 const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
@@ -191,7 +191,7 @@ const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
 async function run(file: Blob) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: false, band: 0 });
+  post({ type: "start", width: W, height: H, raw: false });
   const src = ctx.getImageData(0, 0, W, H).data;
   const sess = await getSession("photo");
   const xs = positions(W);
@@ -252,7 +252,7 @@ async function run(file: Blob) {
     flush(ctx, acc, W, wy, r === ys.length - 1 ? winH : ys[r + 1] - wy, 255);
   }
 
-  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band: 0 });
 }
 
 const TURNS = [
@@ -304,7 +304,7 @@ async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
   if (!made) throw new Error("This photo is too large for this browser.");
   const { canvas, ctx } = made;
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H, raw: true, band: detailBand(raw.iso) });
+  post({ type: "start", width: W, height: H, raw: true });
   originalUpright(file, raw).catch(() => {});
   const turn = ctx.getTransform();
   const dx = Math.ceil(crop.x * scale);
@@ -329,6 +329,8 @@ async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
   };
 
   post({ type: "progress", done: 0, total: 1 });
+  let squares = 0;
+  let flat = 0;
 
   await clean(raw, offsets, models.raw.brightest, network, (piece, done, total) => {
     const x = (piece.x + crop.x) * scale - dx;
@@ -342,8 +344,7 @@ async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
     const right = Math.min(W, Math.floor(Math.max(from.x, to.x)));
     const bottom = Math.min(H, Math.floor(Math.max(from.y, to.y)));
 
-    const shown = (
-      type: "tile" | "input",
+    const drawn = (
       pixels: Uint8ClampedArray<ArrayBuffer>,
       onto: OffscreenCanvasRenderingContext2D,
       atX: number,
@@ -351,17 +352,24 @@ async function runRaw(file: Blob, raw: Raw, borrowed: boolean) {
     ) => {
       held.putImageData(new ImageData(pixels, piece.width, piece.height), 0, 0);
       onto.drawImage(scratch, 0, 0, piece.width, piece.height, x, y, w, h);
-      const { data } = onto.getImageData(atX, atY, right - left, bottom - top);
-      post({ type, x: left, y: top, w: right - left, h: bottom - top, pixels: data }, [data.buffer]);
+
+      return onto.getImageData(atX, atY, right - left, bottom - top).data;
     };
 
     turned.setTransform(turn.a, turn.b, turn.c, turn.d, turn.e - left, turn.f - top);
-    shown("input", piece.input, turned, 0, 0);
-    shown("tile", piece.pixels, ctx, left, top);
+    const at = { x: left, y: top, w: right - left, h: bottom - top };
+    const input = drawn(piece.input, turned, 0, 0);
+    const tile = drawn(piece.pixels, ctx, left, top);
+    const found = grain(tile, input, at.w);
+    squares += found.squares;
+    flat += found.flat;
+    post({ type: "input", ...at, pixels: input }, [input.buffer]);
+    post({ type: "tile", ...at, pixels: tile }, [tile.buffer]);
     post({ type: "progress", done, total });
   });
 
-  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  const band = detailBand(Math.sqrt(squares / Math.max(flat, 1)));
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band });
   canvas.width = 0;
 }
 

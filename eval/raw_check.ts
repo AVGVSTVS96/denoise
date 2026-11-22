@@ -4,7 +4,7 @@ import * as ort from "onnxruntime-web";
 import manifest from "../public/model/raw.json";
 import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
-import { clean, detailBand, detailed, photoGain } from "../src/raw";
+import { clean, detailBand, detailed, grain, photoGain } from "../src/raw";
 
 const [photo, out, input, detail] = process.argv.slice(2);
 const model = join(import.meta.dirname, "../public/model");
@@ -30,6 +30,8 @@ const { width, height } = raw.crop;
 const picture = new Uint8Array(width * height * 3);
 const shot = new Uint8Array(input ? picture.length : 0);
 const started = performance.now();
+let squares = 0;
+let flat = 0;
 const { camera, serial, iso } = raw;
 
 console.log(JSON.stringify({ camera, serial, iso, offsets, gain: photoGain(raw, offsets), width, height }));
@@ -59,6 +61,9 @@ await clean(
       }
     }
 
+    const found = grain(piece.pixels, piece.input, piece.width);
+    squares += found.squares;
+    flat += found.flat;
     console.log(`${done}/${total} tiles, ${Math.round((performance.now() - started) / 1000)}s`);
   },
 );
@@ -69,8 +74,12 @@ await writeFile(out, Buffer.concat([head, picture]));
 
 if (input) await writeFile(input, Buffer.concat([head, shot]));
 
+const noise = Math.sqrt(squares / Math.max(flat, 1));
+
+console.log(JSON.stringify({ noise, band: detailBand(noise) }));
+
 if (detail) {
-  const fine = detailed(opaque(picture), opaque(shot), width, detailBand(iso));
+  const fine = detailed(opaque(picture), opaque(shot), width, detailBand(noise));
 
   await writeFile(detail, Buffer.concat([head, Buffer.from(fine.filter((_, i) => i % 4 < 3))]));
 }

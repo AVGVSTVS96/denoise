@@ -28,9 +28,10 @@ export const MARGIN = 2 * REACH;
 const QUIET = 4;
 const BUSY = 8;
 const MOST = 0.5;
-const GRAINY = 25600;
+const CALM = 8.2;
+const GRAINY = 9;
 
-export const detailBand = (iso: number) => MOST * Math.min(1, Math.max(0, 1 - Math.log2(iso / GRAINY)));
+export const detailBand = (noise: number) => MOST * Math.min(1, Math.max(0, (GRAINY - noise) / (GRAINY - CALM)));
 
 const mirrored = (size: number, padded: number) =>
   Int32Array.from({ length: padded }, (_, p) => {
@@ -262,13 +263,44 @@ function boxed(plane: Float32Array, width: number) {
   return plane;
 }
 
-export function detailed(result: Uint8ClampedArray, input: Uint8ClampedArray, width: number, band: number) {
+function busyness(result: Uint8ClampedArray, width: number) {
   const bright = brightness(result);
   const busy = boxed(bright.slice(), width);
 
   for (let i = 0; i < busy.length; i++) busy[i] = (bright[i] - busy[i]) ** 2;
 
-  boxed(busy, width);
+  return boxed(busy, width);
+}
+
+function finest(bright: Float32Array, q: number, width: number) {
+  const beside = bright[q - 1] + bright[q + 1] + bright[q - width] + bright[q + width];
+  const corners = bright[q - width - 1] + bright[q - width + 1] + bright[q + width - 1] + bright[q + width + 1];
+
+  return bright[q] - (4 * bright[q] + 2 * beside + corners) / 16;
+}
+
+export function grain(result: Uint8ClampedArray, input: Uint8ClampedArray, width: number) {
+  const busy = busyness(result, width);
+  const noisy = brightness(input);
+  const height = noisy.length / width;
+  let squares = 0;
+  let flat = 0;
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const q = y * width + x;
+
+      if (busy[q] > QUIET * QUIET) continue;
+      squares += finest(noisy, q, width) ** 2;
+      flat++;
+    }
+  }
+
+  return { squares, flat };
+}
+
+export function detailed(result: Uint8ClampedArray, input: Uint8ClampedArray, width: number, band: number) {
+  const busy = busyness(result, width);
   const noisy = brightness(input);
   const detail = new Uint8ClampedArray(result);
   const height = noisy.length / width;
@@ -279,9 +311,7 @@ export function detailed(result: Uint8ClampedArray, input: Uint8ClampedArray, wi
       const share = (Math.sqrt(Math.max(0, busy[q])) - QUIET) / (BUSY - QUIET);
 
       if (share <= 0) continue;
-      const beside = noisy[q - 1] + noisy[q + 1] + noisy[q - width] + noisy[q + width];
-      const corners = noisy[q - width - 1] + noisy[q - width + 1] + noisy[q + width - 1] + noisy[q + width + 1];
-      const back = band * Math.min(1, share) * (noisy[q] - (4 * noisy[q] + 2 * beside + corners) / 16);
+      const back = band * Math.min(1, share) * finest(noisy, q, width);
 
       for (let k = 0; k < 3; k++) detail[4 * q + k] = result[4 * q + k] + back;
     }

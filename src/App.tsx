@@ -105,10 +105,7 @@ export function App() {
           case "start":
             size = { width: data.width, height: data.height };
             onDevice = data.raw ? "on-device-raw" : "on-device";
-            setJob(
-              (j) =>
-                j && { ...j, width: data.width, height: data.height, raw: data.raw, band: data.band, stage: "model" },
-            );
+            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw, stage: "model" });
 
             return;
           case "original":
@@ -148,7 +145,9 @@ export function App() {
             return;
           case "done":
             lock?.release();
-            setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
+            setJob(
+              (j) => j && { ...j, stage: "done", result: data.blob, band: data.band, finishedAt: performance.now() },
+            );
 
             if (sharing())
               share(file, data.blob, { model: key ? MODELS[model].id : onDevice, ...size }).catch(() => {});
