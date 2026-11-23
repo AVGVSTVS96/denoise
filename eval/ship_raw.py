@@ -3,6 +3,7 @@
     uv run ship_raw.py data/models/raw/joint-v1/joint.pth      a finished run's weights
     uv run ship_raw.py data/models/raw/joint-v1/last.pth       a run still training: its averaged weights
     uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright      a model trained with --bright
+    uv run ship_raw.py data/models/raw/r12-soften/joint.pth bright crisp      a second model, beside the first
 
 The app packs a mosaic tile into four planes (R, G, G, B) and gets camera RGB at the mosaic's size
 back, so the file holds train_raw's fed() and made() around the network: the fixed mix to twelve
@@ -28,7 +29,8 @@ Three checks before anything is written into the app:
   the fp16 file against PyTorch on bench_raw.py's full-colour windows, every ISO of the GR III;
   the fp16 file against the fp32 one on the same windows, which is what half precision alone costs.
 
-Writes public/model/<hash>/raw-joint-fp16.partN (under 20 MB each), public/model/raw.json, and
+Writes public/model/<hash>/raw-joint-fp16.partN (under 20 MB each), public/model/raw.json (or the
+manifest named last, which the app offers as a choice and fetches only when chosen), and
 src/blacks.json, the black offsets blacks.py knows camera bodies by, which the app takes off as
 raw_denoise.py does. A body is named there by a hash of its camera name and serial number, so the
 app can look its own photo up and the review sites' serial numbers stay out of the repo.
@@ -57,7 +59,6 @@ import train_raw
 
 APP = pathlib.Path(__file__).parent.parent
 PUBLIC = APP / "public" / "model"
-OUT = evaluate.MODELS / "raw-joint"
 PART = 20_000_000
 TILE = 1024
 CEILING = 8.0
@@ -213,9 +214,9 @@ def parity(model, fp32, fp16, camera="colour/gr3"):
     return {f"fp16 against {name}": summed(rows) for name, rows in against.items()}
 
 
-def shipped(fp16, name, held):
-    """The file cut into the app's parts, under its hash, and the last shipped raw model's parts gone."""
-    manifest = PUBLIC / "raw.json"
+def shipped(fp16, name, held, manifest):
+    """The file cut into the app's parts, under its hash, and the parts this manifest last named gone."""
+    manifest = PUBLIC / f"{manifest}.json"
     if manifest.exists():
         shutil.rmtree(PUBLIC / json.loads(manifest.read_text())["parts"][0].split("/")[0], ignore_errors=True)
     blob, digest = fp16.read_bytes(), export.sha256_file(fp16)
@@ -234,15 +235,15 @@ def shipped(fp16, name, held):
     return manifest
 
 
-def main(checkpoint, bright=""):
+def main(checkpoint, bright="", manifest="raw"):
     held = bright != "bright"
     model, name = loaded(pathlib.Path(checkpoint))
-    fp32, fp16 = pathlib.Path(f"{OUT}-fp32.onnx"), pathlib.Path(f"{OUT}-fp16.onnx")
+    fp32, fp16 = (evaluate.MODELS / f"{manifest}-joint-{precision}.onnx" for precision in ("fp32", "fp16"))
     exported(model, fp32)
     export.convert_fp16(fp32, fp16)
     report = {"model": name, "fp16 range": audit(fp32, fp16, held), "parity": parity(model, fp32, fp16)}
     print(json.dumps(report, indent=1))
-    print(shipped(fp16, f"{name}, fp16", held), fp16.stat().st_size, export.sha256_file(fp16))
+    print(shipped(fp16, f"{name}, fp16", held, manifest), fp16.stat().st_size, export.sha256_file(fp16))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
     uv run raw_develop.py MODEL.pth PHOTO.dng OUT.png             the picture
     uv run raw_develop.py MODEL.pth PHOTO.dng OUT.png APP.ppm     and how far the app's picture is from it
+    uv run raw_develop.py MODEL.pth PHOTO.dng OUT.png APP.ppm crisp     for the model shipped as crisp.json
 
 The reference for the app's raw path (src/dng.ts, src/raw.ts), built from other parts: rawpy reads the
 mosaic and the camera's colour, exiv2 the DNG's crop and exposure, blacks.py's offsets come off where
@@ -66,7 +67,7 @@ def developed(picture, balance, matrix, curve):
     return curve[np.floor(np.clip(linear, 0, 1) * STEPS + 0.5).astype(np.int32)]
 
 
-def main(weights, photo, out, app=None):
+def main(weights, photo, out, app=None, manifest="raw"):
     photo = pathlib.Path(photo)
     model = ship_raw.loaded(pathlib.Path(weights))[0].model.cuda()
     with rawpy.imread(str(photo)) as raw:
@@ -75,7 +76,7 @@ def main(weights, photo, out, app=None):
     mosaic = raw_pairs.mosaic(photo)
     offsets = blacks.of(photo, borrowed=False).reshape(2, 2)
     mosaic = mosaic - np.tile(offsets, (mosaic.shape[0] // 2, mosaic.shape[1] // 2))
-    held = json.loads((ship_raw.PUBLIC / "raw.json").read_text())["brightest"] is not None
+    held = json.loads((ship_raw.PUBLIC / f"{manifest}.json").read_text())["brightest"] is not None
     whole = developed(train_raw.denoise(model, mosaic, held=held), *look(photo))
     x, y = (max(0, round(at) - shift) for at, shift in zip(tag(photo, "DefaultCropOrigin", [0, 0]), red[::-1]))
     width, height = (round(side) for side in tag(photo, "DefaultCropSize", mosaic.shape[::-1]))
