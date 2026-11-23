@@ -75,6 +75,15 @@ turned, in one colour darker or lighter than what is under it, and blurred as a 
 print is the finest detail anyone reads in a photo and the scenes hold little of it, so this is
 there to show the network what a stroke looks like. A run without it is what it was.
 
+--reader 0.01 adds, at that weight, a loss that looks at that laid print as a reader does
+(reader_loss()): the picture and its truth, each cut to a window of the page's lines the right way
+up and at the page's own size, go through a frozen text network, CRAFT's backbone (text_reader.py),
+and the loss is how far apart the two come out at three depths of it, near the page's ink and
+nowhere else. It compares and never asks: the network gives no verdict on what is a letter and the
+page's words are no label, so all it can pull towards is the truth's own strokes. A crop without a
+page gets none of it, and a run without it is what it was. --reader alone takes READER, which made
+the term about a fifth of picture_loss on the crops with print when it was set.
+
 --soften 0.3 0.9 blurs each joint crop's truth as a lens blurs, by a width drawn per crop between
 those two, in px of the truth, before it is sampled to a mosaic (softened()); the loss stays against
 the truth as it was. The truth and the mosaic made of it are otherwise equally sharp, so the network
@@ -182,6 +191,7 @@ import bench_raw
 import evaluate
 import raw_pairs
 import text_bank
+import text_reader
 
 PAIRS = evaluate.DATA / "rawpairs"
 NOISE = evaluate.DATA / "noise"
@@ -227,6 +237,8 @@ STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
 EDGE = 16
 SMOOTH_SHARE, TIED = 0.5, 0.1
 FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 12800), 0.15
+#: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
+WINDOW, NEAR, READER = 256, 17, 1.0
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -898,6 +910,8 @@ def made_up_noise(clean, row, offsets, tails, darks):
 
 def lettered(truth, pages):
     """Camera RGB (N, 3, H, H) with print laid into each: one of text_bank.py's pages (pages, P, P) of coverage.
+    With it, for reader_loss(), how much of each pixel the ink covers (N, 1, H, H), and the map (N, 2, 2)
+    from where a pixel is in the crop to where it is on the page, each from -1 to 1 across.
 
     The page is shrunk until its strokes are between STROKES px wide, even on a log scale, and set
     down with its middle anywhere in the crop, at any quarter turn and TILT radians or so off it.
@@ -925,7 +939,42 @@ def lettered(truth, pages):
     share = 1 - torch.rand(n, 1, 1, 1, device=device) * torch.rand(n, 3, 1, 1, device=device)
     contrast = spread(n, device, *CONTRAST).view(n, 1, 1, 1) ** share
     dark = torch.rand(n, 1, 1, 1, device=device) < 0.5
-    return torch.lerp(truth, torch.where(dark, under / contrast, (under * contrast).clamp(max=1)), cover)
+    return torch.lerp(truth, torch.where(dark, under / contrast, (under * contrast).clamp(max=1)), cover), cover, spin
+
+
+def reader_loss(reader, picture, truth, cover, spin):
+    """How far a picture of laid print (N, 3, H, H) is from its truth as a text network sees the two.
+
+    Each is developed() and cut to a window of WINDOW px of its page, the right way up and at the
+    page's own size, where strokes are text_bank.STROKE px wide and a line some 35 px tall, about
+    the middle of the ink that fell inside the crop (cover and spin, lettered()'s). The windows go
+    through text_reader.py's frozen backbone, and the loss is the mean distance between their planes
+    at each of its TAPS, counted within NEAR px of the page's ink: the scene past the lines, and
+    what of a window fell outside the crop, count for nothing.
+    """
+    n, side, device = len(cover), cover.shape[-1], cover.device
+    along = (torch.arange(side, device=device) + 0.5) * 2 / side - 1
+    middle = torch.stack([(cover.sum((1, 2)) * along).sum(1), (cover.sum((1, 3)) * along).sum(1)], 1)
+    middle = middle / cover.sum((1, 2, 3)).clamp(min=1e-6).view(n, 1)
+    placed = torch.cat([torch.linalg.inv(spin) * WINDOW / text_bank.SIDE, middle.view(n, 2, 1)], 2)
+    grid = torch.nn.functional.affine_grid(placed, (n, 1, WINDOW, WINDOW), align_corners=False)
+    cut = lambda whole: torch.nn.functional.grid_sample(whole, grid, align_corners=False)
+    near = torch.nn.functional.max_pool2d(cut(cover), NEAR, 1, NEAR // 2)
+    apart = 0
+    for seen, known in zip(*(read(reader, cut(look)) for look in developed(picture, truth))):
+        counted = torch.nn.functional.interpolate(near, seen.shape[-2:], mode="area")
+        apart = apart + ((seen - known).abs().mean(1, keepdim=True) * counted).sum() / counted.sum().clamp(min=1)
+    return apart / len(text_reader.TAPS)
+
+
+def read(reader, look):
+    """A developed picture (N, 3, H, W), from -1 to 1, as the planes of text_reader.py's backbone at each of its TAPS."""
+    spot = lambda numbers: held(numbers, look.device).view(1, 3, 1, 1)
+    planes = ((look + 1) / 2 - spot(text_reader.MEAN)) / spot(text_reader.SPREAD)
+    for at, layer in enumerate(reader):
+        planes = layer(planes)
+        if at in text_reader.TAPS:
+            yield planes
 
 
 def softened(truth, low, high, noise=None):
@@ -1079,6 +1128,9 @@ def main(args):
         raise SystemExit("--soften's noise is weak or strong beside the GR III's rows of --levels' table")
     follow = followed(measured(args.levels)) if args.soften and args.soften[2:] else None
     pages = torch.from_numpy(np.load(text_bank.OUT)).cuda() if args.text else None
+    if args.reader and not args.text:
+        raise SystemExit("--reader compares laid print through a text network, for a run with --text")
+    reader = text_reader.network() if args.reader else None
     twin = trained(args.twins[0]).to(memory_format=torch.channels_last) if args.twins else None
     if twin and not (args.joint and joint(twin)):
         raise SystemExit("--twins is a joint model's weights, for a --joint run")
@@ -1182,7 +1234,8 @@ def main(args):
                 truth = torch.cat([truth, truths.batch(taken)[0]])
             printed = int(args.joint * args.text + lot.random()) if args.text else 0
             if printed:
-                truth = torch.cat([lettered(truth[:printed], pages), truth[printed:]])
+                laid, cover, spin = lettered(truth[:printed], pages)
+                truth = torch.cat([laid, truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
             if follow:
@@ -1196,6 +1249,8 @@ def main(args):
                 loss = loss + args.distil * picture_loss(picture, taught(teacher, noisy))
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
+            if reader and printed:
+                loss = loss + args.reader * reader_loss(reader, picture[:printed], truth[:printed], cover, spin)
             if critic:
                 shown, wanted = developed(picture, truth)
                 critic.requires_grad_(False)
@@ -1346,6 +1401,14 @@ if __name__ == "__main__":
         help="a folder of truth measured in full colour, and the share of the joint crops taken from it unbinned",
     )
     parser.add_argument("--text", type=float, default=0, help="share of the joint crops with print laid into the truth")
+    parser.add_argument(
+        "--reader",
+        type=float,
+        nargs="?",
+        const=READER,
+        default=0,
+        help="weight of the distance between laid print and its truth through a frozen text network",
+    )
     parser.add_argument(
         "--soften",
         type=lambda word: word if word == "noise" else float(word),
