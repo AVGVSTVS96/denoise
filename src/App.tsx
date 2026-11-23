@@ -46,7 +46,7 @@ const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
 const LOOKS: RawKind[] = ["raw", "new", "crisp"];
-const LOOK = { raw: "Standard", new: "New", crisp: "Crisper" };
+const LOOK = { raw: "Standard", new: "Standard 2", crisp: "Crisper" };
 
 const fresh = (): Run => ({
   stage: "decode",
