@@ -81,14 +81,15 @@ the truth as it was. The truth and the mosaic made of it are otherwise equally s
 hands back a picture as soft as the lens drew it: this shows it a photo softer than its answer, for
 it to give back the band the lens took. A run without it is what it was.
 
---soften 0.0 1.2 noise draws that width by the noise laid over the crop, not evenly: a camera that
+--soften 0.0 0.9 noise draws that width by the noise laid over the crop, not evenly: a camera that
 smooths its raw smooths more as its ISO rises. The width is 0.0 px where the noise is as weak as the
-GR III's row of --levels' table at ISO 1,600 or weaker, 1.2 px where it is as strong as its row at
-ISO 25,600 or stronger, on a straight line in stops between (followed()), and AROUND px either way
-round that. Strength is a row's shot and read noise at the crop's own mean brightness, as the draw
-makes it (strength()); the two rows' is at LEVEL. A crop may get one of several kinds of laid-over
-noise, and each is laid over the truth blurred for its own strength. Without the word --soften is
-what it was.
+GR III's row of --levels' table at ISO 1,600 or weaker, 0.9 px where it is as strong as its row at
+ISO 12,800 or stronger, on a straight line in stops between (followed()), and AROUND px either way
+round that. Strength is a row's shot and read noise on a pixel at LEVEL, the row as the draw makes
+it, darkening included (strength()): a camera smooths by its ISO, not by how bright one part of the
+scene is, so a crop's own brightness does not move its width. A crop may get one of several kinds
+of laid-over noise, and each is laid over the truth blurred for its own strength. Without the word
+--soften is what it was.
 
 --smoothed 0.25 makes that share of the frames under laid-over noise, of both kinds of crop, what a
 camera that smooths its raw files hands over: the noise is a row's of --levels' table whose noise
@@ -225,7 +226,7 @@ NEXT_GREEN = (((0, 1, 0, -1), (0, 2, -1, 0)), ((3, 2, 0, 1), (3, 1, 1, 0)))
 STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
 EDGE = 16
 SMOOTH_SHARE, TIED = 0.5, 0.1
-FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 25600), 0.15
+FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 12800), 0.15
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -832,21 +833,19 @@ def drawn(n, device, levels, share):
     return row | {part: torch.where(measured.view(each(values)), row[part], values) for part, values in made_up.items()}
 
 
-def strength(row, level):
-    """How strong each row's noise is on a crop of mean brightness level (N,): its shot and read noise
-    together, as one figure over the colour planes."""
-    return (level.clamp(min=0)[:, None] * row["shot"] + row["read"] ** 2).mean(1).sqrt()
+def strength(row):
+    """How strong each row's noise is on a pixel at LEVEL: its shot and read noise together, as one
+    figure over the colour planes."""
+    return (LEVEL * row["shot"] + row["read"] ** 2).mean(1).sqrt()
 
 
 def followed(rows):
-    """How far a crop's noise is from weak to strong, 0 to 1, as a function of its row and its mean
-    brightness: a straight line in stops of strength() between FOLLOWED's two rows of fit_noise.py's
-    table, one camera's at two ISOs, each at LEVEL."""
+    """How far a row's noise is from weak to strong, 0 to 1, as a function of the row: a straight line
+    in stops of strength() between FOLLOWED's two rows of fit_noise.py's table, one camera's at two ISOs."""
     camera, *isos = FOLLOWED
     found = {row["iso"]: row for row in rows if row.get("camera") == camera}
-    marks = table([found[iso] for iso in isos])
-    weak, strong = strength(marks, marks["step"].new_full((2,), LEVEL)).tolist()
-    return lambda row, level: (torch.log(strength(row, level) / weak) / math.log(strong / weak)).clamp(0, 1)
+    weak, strong = strength(table([found[iso] for iso in isos])).tolist()
+    return lambda row: (torch.log(strength(row) / weak) / math.log(strong / weak)).clamp(0, 1)
 
 
 def long_tailed(like, tail):
@@ -1133,10 +1132,8 @@ def main(args):
         return laid
 
     def under_followed_noise(truth):
-        sharp = bench_raw.mosaiced(truth)
-        level = sharp.mean((1, 2))
-        soft = lambda row: bench_raw.mosaiced(softened(truth, *args.soften[:2], follow(row, level)))
-        return under_noise(sharp, soft)
+        soft = lambda row: bench_raw.mosaiced(softened(truth, *args.soften[:2], follow(row)))
+        return under_noise(bench_raw.mosaiced(truth), soft)
 
     def at_white(noisy, gain):
         return torch.minimum(noisy, gain) if args.bright else noisy
