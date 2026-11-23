@@ -45,8 +45,8 @@ type Finished = (result: Blob, info: { model: string; width: number; height: num
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
-const LOOKS: RawKind[] = ["raw", "crisp"];
-const LOOK = { raw: "Standard", crisp: "Crisper" };
+const LOOKS: RawKind[] = ["raw", "new", "crisp"];
+const LOOK = { raw: "Standard", new: "New", crisp: "Crisper" };
 
 const fresh = (): Run => ({
   stage: "decode",
@@ -157,7 +157,10 @@ export function App() {
             lock?.release();
             setError(data.message);
 
-            if (kind !== "raw") setJob((j) => j && { ...j, shown: "raw", runs: { raw: j.runs.raw } });
+            if (kind !== "raw")
+              setJob(
+                (j) => j && { ...j, shown: j.shown === kind ? "raw" : j.shown, runs: { ...j.runs, [kind]: undefined } },
+              );
 
             return;
         }
@@ -482,6 +485,7 @@ function Editor({
   const done = run.stage === "done";
   const band = run.band ?? 0;
   const finer = band > 0 ? fine : 0;
+  const busy = LOOKS.some((kind) => job.runs[kind] && job.runs[kind].stage !== "done");
 
   useEffect(() => {
     if (job.cleaned) canvases.current.raw?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
@@ -626,8 +630,9 @@ function Editor({
                   <button
                     key={kind}
                     onClick={() => onLook(kind)}
+                    disabled={busy && !job.runs[kind]}
                     aria-pressed={kind === shown}
-                    className={`h-6.5 rounded-full px-3 transition pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted hover:text-fg"}`}
+                    className={`h-6.5 rounded-full px-3 transition disabled:opacity-40 pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted enabled:hover:text-fg"}`}
                   >
                     {LOOK[kind]}
                   </button>

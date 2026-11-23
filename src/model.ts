@@ -1,5 +1,6 @@
 import crisp from "../public/model/crisp.json";
 import photo from "../public/model/manifest.json";
+import candidate from "../public/model/new.json";
 import raw from "../public/model/raw.json";
 import type { Brightest } from "./raw";
 
@@ -7,9 +8,9 @@ type Manifest = { name: string; bytes: number; sha256: string; parts: string[] }
 
 type RawManifest = Manifest & { brightest: Brightest | null };
 
-type Models = { photo: Manifest; raw: RawManifest; crisp: RawManifest };
+type Models = { photo: Manifest; raw: RawManifest; new: RawManifest; crisp: RawManifest };
 
-export const models: Models = { photo, raw, crisp };
+export const models: Models = { photo, raw, new: candidate, crisp };
 
 export type ModelKind = keyof typeof models;
 

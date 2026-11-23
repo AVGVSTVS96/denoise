@@ -7,7 +7,7 @@ import { models } from "../src/model";
 import { clean, detailBand, detailed, grain, photoGain } from "../src/raw";
 
 const [photo, out, input, detail, kind] = process.argv.slice(2);
-const manifest = kind === "crisp" ? models.crisp : models.raw;
+const manifest = kind === "new" ? models.new : kind === "crisp" ? models.crisp : models.raw;
 const model = join(import.meta.dirname, "../public/model");
 const parts = await Promise.all(manifest.parts.map((part) => readFile(join(model, part))));
 
