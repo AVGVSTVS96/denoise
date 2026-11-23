@@ -2,6 +2,7 @@
 
     uv run burst.py ladders r19-burst=data/models/raw/r19-burst/joint.pth r17-all=data/models/raw/r17-all/joint.pth
     uv run burst.py ladders gr3x gr3 r19-burst=...          on those tests alone, of gr3, gr3x, unseen and seen
+    uv run burst.py equal r19-burst=data/models/raw/r19-burst/joint.pth r17-all=data/models/raw/r17-all/joint.pth
     uv run burst.py moving data/models/raw/r19-burst/joint.pth
     uv run burst.py own data/models/raw/r19-burst/joint.pth FOLDER CLEAN
 
@@ -19,6 +20,18 @@ over all of a camera's lines and over its lines up to TALLEST px tall in its cle
 a person stops reading first, and over a group's cameras. Rows go to data/out/burst.json as
 {test: {model: {way: {"all": [right, wrong, missing, second, there], "small": [...]}}}}, each
 camera under its file's name. Without a test named it runs gr3x, gr3 and unseen.
+
+equal reads the same small print in a burst of equal frames, which no ladder holds: the GR IIIx's
+clean windows under made-up noise of the strength of its frame at PICKED, FRAMES draws that share
+nothing but the scene. Once steady, every frame the clean window as it is, and once with each later
+frame up to train_raw.SHAKE px off and turned, moved as the trainer moves them (train_raw.shaken)
+and sampled back to a mosaic: a mosaic cannot be moved without resampling, so what is moved is the
+clean window through demosaic.menon, and a later frame's samples are that demosaic's. Beside the
+two bursts, one made-up frame at PICKED and at each ISO under it: four equal frames are two stops,
+so the frame two ISOs down is what a perfect merge would read. The noise is small_print.made_up's,
+from one generator, the single frames first in small_print.py's order: a model's one-frame rows are
+its "-made" rows there, and the burst's picked frame is the single frame at PICKED. Rows go to
+data/out/burst.json under "equal".
 
 moving is for what a burst gets wrong: something that moved shows twice. It makes bursts of the
 Ricohs' full-colour windows as the trainer does (train_raw.burst), every crop with a patch that
@@ -52,7 +65,7 @@ import small_print
 import train_raw
 
 OUT = raw_pairs.DATA / "out" / "burst.json"
-PICKED, MORE, TALLEST = 12800, (1, 2), 15
+PICKED, MORE, TALLEST, FRAMES = 12800, (1, 2), 15, 4
 BLOCK, REACH = 128, 64
 
 
@@ -125,47 +138,98 @@ def shown(title, rows):
         heads = ("letters", "read %", "right", "wrong", "missing", "wrong of spelt %", "second read %")
         print(f"\n{title}, {which}\n{'':52}" + "".join(f"{head:>{len(head) + 3}}" for head in heads))
         for name, ways in rows.items():
-            for way, counts in sorted(ways.items()):
+            for way, counts in ways.items():
                 right, wrong, missing, second, there = counts[at]
                 spelt = 100 * wrong / max(right + wrong, 1e-9)
                 cells = (there, 100 * right / there, right, wrong, missing, spelt, 100 * second / there)
-                row = "".join(f"{cell:>{len(head) + 3}.1f}" for head, cell in zip(heads, cells))
+                row = "".join(f"{cell:>{len(head) + 3}.{head != 'letters':d}f}" for head, cell in zip(heads, cells))
                 print(f"{name:20}{way:32}{row}", flush=True)
 
 
-def ladders(*specs):
+def entrants(specs):
+    """{name: (cleaner, slots)} for each NAME=WEIGHTS."""
     if small_print.DEVICE == "cpu":
         torch.set_num_threads(small_print.THREADS)
-    every = (*bench_raw.CAMERAS, *bench_raw.groups())
     models = {}
-    for name, _, weights in (spec.partition("=") for spec in specs if spec not in every):
+    for name, _, weights in (spec.partition("=") for spec in specs):
         model = small_print.trained(weights)
         models[name] = (train_raw.cleaner(model), train_raw.slots(model))
+    return models
+
+
+def kept(test, rows):
+    """A test's rows added to OUT."""
     table = json.loads(OUT.read_text()) if OUT.exists() else {}
+    for model, ways in rows.items():
+        found = {way: dict(zip(("all", "small"), counts.tolist())) for way, counts in ways.items()}
+        table.setdefault(test, {}).setdefault(model, {}).update(found)
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(json.dumps(table, indent=1))
+
+
+def ladders(*specs):
+    every = (*bench_raw.CAMERAS, *bench_raw.groups())
+    models = entrants([spec for spec in specs if spec not in every])
     for test in [test for test in every if test in specs] or ("gr3x", "gr3", "unseen"):
         together, furthest = {}, 0.0
         for name in bench_raw.cuts(f"print/{test}"):
             rows, apart = camera(bench_raw.BENCH / f"{name}.npz", models)
             furthest = max(furthest, apart)
+            kept(name.split("/")[-1], rows)
             for model, ways in rows.items():
+                pooled = together.setdefault(model, {})
                 for way, counts in ways.items():
-                    table.setdefault(name.split("/")[-1], {}).setdefault(model, {})[way] = dict(
-                        zip(("all", "small"), counts.tolist())
-                    )
-                    kept = together.setdefault(model, {})
-                    kept[way] = kept.get(way, 0) + counts
+                    pooled[way] = pooled.get(way, 0) + counts
             if rows and name.split("/")[-1] != test:
                 print(f"{name}: frames lined up to {apart:.2f} px", flush=True)
         if together:
-            table.setdefault(test, {}).update(
-                {
-                    model: {way: dict(zip(("all", "small"), counts.tolist())) for way, counts in ways.items()}
-                    for model, ways in together.items()
-                }
-            )
-            OUT.parent.mkdir(parents=True, exist_ok=True)
-            OUT.write_text(json.dumps(table, indent=1))
+            kept(test, together)
             shown(f"{test}, ISO {PICKED} picked, frames lined up to {furthest:.2f} px", together)
+
+
+@torch.no_grad()
+def equal(*specs):
+    models = entrants(specs)
+    file = small_print.READER.parent / "gr3x.npz"
+    things, isos, means, picture = small_print.opened(file)
+    data, rng, rows = np.load(file), torch.Generator().manual_seed(0), {}
+    balance = torch.from_numpy(data["wb"]).to(small_print.DEVICE).view(1, 3, 1, 1)
+    under = isos[: isos.index(PICKED) + 1]
+    shot, read_noise = data["levels"][len(under) - 1]
+    alone = {
+        iso: {thing: small_print.made_up(frames[:1], *levels, rng) for thing, (frames, _, _) in things.items()}
+        for iso, levels in zip(under, data["levels"].tolist())
+    }
+    look = lambda result: small_print.as_bytes(picture(result, None))
+    for thing, (frames, _, lines) in things.items():
+        small = [n for n, line in enumerate(lines[0]) if np.linalg.norm(line[3] - line[0]) <= TALLEST]
+        clean, later = frames[:1], FRAMES - 1
+        full = demosaic.menon(clean * bench_raw.mosaiced(balance.expand(1, 3, *clean.shape[1:]))) / balance
+        move = ((torch.rand(later, 2, generator=rng) * 2 - 1) * train_raw.SHAKE).to(clean.device)
+        turn = ((torch.rand(later, generator=rng) * 2 - 1) * train_raw.TURN).to(clean.device)
+        scenes = {
+            "steady": clean.expand(later, -1, -1),
+            f"within {train_raw.SHAKE:g} px": bench_raw.mosaiced(
+                train_raw.shaken(full.expand(later, -1, -1, -1), move, turn)
+            ),
+        }
+        bursts = {
+            way: torch.cat([alone[PICKED][thing], small_print.made_up(scene, shot, read_noise, rng)])
+            for way, scene in scenes.items()
+        }
+        for name, (clean_up, slots) in models.items():
+            pooled = rows.setdefault(name, {})
+            found = {f"{iso} one frame": clean_up(alone[iso][thing], means[at]) for at, iso in enumerate(under)}
+            if slots > 1:
+                given = min(slots, FRAMES)
+                found |= {
+                    f"{PICKED} {given} frames {way}": clean_up(burst[None, :given], means[len(under) - 1])
+                    for way, burst in bursts.items()
+                }
+            for way, result in found.items():
+                pooled[way] = pooled.get(way, 0) + read(look(result), thing, lines[0], small)
+    kept("equal", rows)
+    shown(f"gr3x, clean windows under made-up noise, bursts at ISO {PICKED}'s strength", rows)
 
 
 def moved(name, clean_up, slots, rng):
@@ -192,10 +256,7 @@ def moved(name, clean_up, slots, rng):
 
 @torch.no_grad()
 def moving(weights):
-    if small_print.DEVICE == "cpu":
-        torch.set_num_threads(small_print.THREADS)
-    model = small_print.trained(weights)
-    clean_up, slots = train_raw.cleaner(model), train_raw.slots(model)
+    ((clean_up, slots),) = entrants([f"={weights}"]).values()
     rng = torch.Generator().manual_seed(0)
     torch.manual_seed(0)
     for name in bench_raw.CAMERAS:
@@ -257,4 +318,4 @@ def own(weights, folder, clean):
 
 
 if __name__ == "__main__":
-    {"ladders": ladders, "moving": moving, "own": own}[sys.argv[1]](*sys.argv[2:])
+    {"ladders": ladders, "equal": equal, "moving": moving, "own": own}[sys.argv[1]](*sys.argv[2:])
