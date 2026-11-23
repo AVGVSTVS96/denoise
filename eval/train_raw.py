@@ -75,14 +75,15 @@ turned, in one colour darker or lighter than what is under it, and blurred as a 
 print is the finest detail anyone reads in a photo and the scenes hold little of it, so this is
 there to show the network what a stroke looks like. A run without it is what it was.
 
---reader 0.01 adds, at that weight, a loss that looks at that laid print as a reader does
+--reader 0.055 adds, at that weight, a loss that looks at that laid print as a reader does
 (reader_loss()): the picture and its truth, each cut to a window of the page's lines the right way
 up and at the page's own size, go through a frozen text network, CRAFT's backbone (text_reader.py),
 and the loss is how far apart the two come out at three depths of it, near the page's ink and
 nowhere else. It compares and never asks: the network gives no verdict on what is a letter and the
 page's words are no label, so all it can pull towards is the truth's own strokes. A crop without a
-page gets none of it, and a run without it is what it was. --reader alone takes READER, which made
-the term about a fifth of picture_loss on the crops with print when it was set.
+page gets none of it, and a run without it is what it was. --reader alone takes READER: at that
+weight the term was a fifth of picture_loss on the crops with print, and a tenth of a step's loss,
+over the first 100 steps of a run from joint-v2 with --text 0.5.
 
 --soften 0.3 0.9 blurs each joint crop's truth as a lens blurs, by a width drawn per crop between
 those two, in px of the truth, before it is sampled to a mosaic (softened()); the loss stays against
@@ -238,7 +239,7 @@ EDGE = 16
 SMOOTH_SHARE, TIED = 0.5, 0.1
 FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 12800), 0.15
 #: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
-WINDOW, NEAR, READER = 256, 17, 1.0
+WINDOW, NEAR, READER = 256, 17, 0.055
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
