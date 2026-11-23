@@ -1,12 +1,13 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as ort from "onnxruntime-web";
-import manifest from "../public/model/raw.json";
 import { blackOffsets } from "../src/blacks";
 import { rawPhoto } from "../src/dng";
+import { models } from "../src/model";
 import { clean, detailBand, detailed, grain, photoGain } from "../src/raw";
 
-const [photo, out, input, detail] = process.argv.slice(2);
+const [photo, out, input, detail, kind] = process.argv.slice(2);
+const manifest = kind === "crisp" ? models.crisp : models.raw;
 const model = join(import.meta.dirname, "../public/model");
 const parts = await Promise.all(manifest.parts.map((part) => readFile(join(model, part))));
 

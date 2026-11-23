@@ -1,27 +1,32 @@
+import crisp from "../public/model/crisp.json";
 import photo from "../public/model/manifest.json";
 import raw from "../public/model/raw.json";
 import type { Brightest } from "./raw";
 
 type Manifest = { name: string; bytes: number; sha256: string; parts: string[] };
 
-type Models = { photo: Manifest; raw: Manifest & { brightest: Brightest | null } };
+type RawManifest = Manifest & { brightest: Brightest | null };
 
-export const models: Models = { photo, raw };
+type Models = { photo: Manifest; raw: RawManifest; crisp: RawManifest };
+
+export const models: Models = { photo, raw, crisp };
 
 export type ModelKind = keyof typeof models;
 
-const cacheName = (kind: ModelKind) => `model-${models[kind].sha256.slice(0, 12)}`;
+export type RawKind = Exclude<ModelKind, "photo">;
+
+const cacheName = (manifest: Manifest) => `model-${manifest.sha256.slice(0, 12)}`;
 const ATTEMPTS = 3;
 
 async function forgetOld() {
-  const current = [cacheName("photo"), cacheName("raw")];
+  const current = Object.values(models).map(cacheName);
   const names = await caches.keys();
   await Promise.all(names.filter((n) => n.startsWith("model-") && !current.includes(n)).map((n) => caches.delete(n)));
 }
 
 export async function loadModel(kind: ModelKind, onProgress: (loaded: number) => void): Promise<Uint8Array> {
   const manifest = models[kind];
-  const cache = await caches.open(cacheName(kind)).catch(() => undefined);
+  const cache = await caches.open(cacheName(manifest)).catch(() => undefined);
   const out = new Uint8Array(manifest.bytes);
   let offset = 0;
   forgetOld().catch(() => {});

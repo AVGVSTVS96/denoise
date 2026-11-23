@@ -3,20 +3,15 @@ import { borrowing, setBorrowing } from "./blacks";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
+import type { RawKind } from "./model";
 import { detailed, MARGIN } from "./raw";
 import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
-import type { FromWorker } from "./worker";
+import type { FromWorker, ToWorker } from "./worker";
 import Worker from "./worker?worker";
 
-type Job = {
-  name: string;
-  original: string;
-  cloud?: string;
-  width: number;
-  height: number;
+type Run = {
   stage: "decode" | "model" | "clean" | "done";
-  raw?: boolean;
   band?: number;
   loaded: number;
   modelBytes: number;
@@ -26,14 +21,41 @@ type Job = {
   firstTileAt?: number;
   finishedAt?: number;
   result?: Blob;
+};
+
+type Job = {
+  name: string;
+  file?: File;
+  original: string;
+  cloud?: string;
+  width: number;
+  height: number;
+  raw?: boolean;
+  shown: RawKind;
+  runs: Partial<Record<RawKind, Run>>;
   cleaned?: ImageBitmap;
   savedAt?: number;
   saving?: "saving" | "saved" | "failed";
 };
 
+type Canvases = React.RefObject<Partial<Record<RawKind, HTMLCanvasElement | null>>>;
+
+type Finished = (result: Blob, info: { model: string; width: number; height: number }) => void;
+
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
+const LOOKS: RawKind[] = ["raw", "crisp"];
+const LOOK = { raw: "Standard", crisp: "Crisper" };
+
+const fresh = (): Run => ({
+  stage: "decode",
+  loaded: 0,
+  modelBytes: 0,
+  done: 0,
+  total: 0,
+  startedAt: performance.now(),
+});
 
 const isPhoto = (f: File) => f.type.startsWith("image/") || /\.dng$/i.test(f.name);
 
@@ -43,9 +65,8 @@ export function App() {
   const [key, setKey] = useState(cloudKey);
   const [model, setModel] = useState<Model>(() => (localStorage.getItem("cloud-model") === "pro" ? "pro" : "flash"));
   const [photos, setPhotos] = useState<Photo[]>();
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const canvases: Canvases = useRef({});
   const input = useRef<HTMLCanvasElement>(null);
-  const detail = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
   useEffect(() => {
@@ -68,29 +89,9 @@ export function App() {
     return () => document.removeEventListener("visibilitychange", refresh);
   }, [key]);
 
-  const open = useCallback(
-    async (file: File) => {
+  const clean = useCallback(
+    (file: File, kind: RawKind, finished?: Finished) => {
       worker.current?.terminate();
-      setError(undefined);
-      const shown = (await rawPreview(file)) ?? file;
-      const name = file.name.replace(/\.[^.]+$/, "") || "photo";
-      setJob((old) => {
-        if (old) URL.revokeObjectURL(old.original);
-
-        return {
-          name,
-          original: URL.createObjectURL(shown),
-          cloud: key && MODELS[model].name,
-          width: 0,
-          height: 0,
-          stage: "decode",
-          loaded: 0,
-          modelBytes: 0,
-          done: 0,
-          total: 0,
-          startedAt: performance.now(),
-        };
-      });
       const w = new Worker();
       worker.current = w;
       let lock: WakeLockSentinel | undefined;
@@ -100,12 +101,21 @@ export function App() {
         .catch(() => {});
       let size = { width: 0, height: 0 };
       let onDevice = "on-device";
+
+      const change = (to: (run: Run) => Partial<Run>) =>
+        setJob((j) => {
+          const run = j?.runs[kind];
+
+          return j && run ? { ...j, runs: { ...j.runs, [kind]: { ...run, ...to(run) } } } : j;
+        });
+
       w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
         switch (data.type) {
           case "start":
             size = { width: data.width, height: data.height };
             onDevice = data.raw ? "on-device-raw" : "on-device";
-            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw, stage: "model" });
+            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw });
+            change(() => ({ stage: "model" }));
 
             return;
           case "original":
@@ -118,64 +128,91 @@ export function App() {
 
             return;
           case "model":
-            setJob((j) => j && { ...j, loaded: data.loaded, modelBytes: data.total });
+            change(() => ({ loaded: data.loaded, modelBytes: data.total }));
 
             return;
           case "progress":
-            setJob((j) => {
-              if (!j) return j;
-              const now = performance.now();
-
-              return {
-                ...j,
-                stage: "clean",
-                done: data.done,
-                total: data.total,
-                firstTileAt: data.done === 1 ? now : j.firstTileAt,
-              };
-            });
+            change((run) => ({
+              stage: "clean",
+              done: data.done,
+              total: data.total,
+              firstTileAt: data.done === 1 ? performance.now() : run.firstTileAt,
+            }));
 
             return;
           case "tile":
           case "input":
-            (data.type === "tile" ? canvas : input).current
+            (data.type === "tile" ? canvases.current[kind] : input.current)
               ?.getContext("2d")
               ?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
 
             return;
           case "done":
             lock?.release();
-            setJob(
-              (j) => j && { ...j, stage: "done", result: data.blob, band: data.band, finishedAt: performance.now() },
-            );
-
-            if (sharing())
-              share(file, data.blob, { model: key ? MODELS[model].id : onDevice, ...size }).catch(() => {});
-
-            if (key) {
-              setJob((j) => j && { ...j, saving: "saving" });
-              savePhoto(key, name, shown, data.blob).then(
-                (photo) => {
-                  setPhotos((p) => [photo, ...(p ?? [])]);
-                  setJob((j) => j && { ...j, saving: "saved" });
-                },
-                () => setJob((j) => j && { ...j, saving: "failed" }),
-              );
-            }
+            change(() => ({ stage: "done", result: data.blob, band: data.band, finishedAt: performance.now() }));
+            finished?.(data.blob, { model: onDevice, ...size });
 
             return;
           case "error":
             lock?.release();
             setError(data.message);
 
+            if (kind !== "raw") setJob((j) => j && { ...j, shown: "raw", runs: { raw: j.runs.raw } });
+
             return;
         }
       });
 
-      w.postMessage({ file, key, model, borrowed: borrowing() });
+      const order: ToWorker = { file, key, model, borrowed: borrowing(), kind };
+      w.postMessage(order);
     },
     [key, model],
   );
+
+  const open = useCallback(
+    async (file: File) => {
+      worker.current?.terminate();
+      setError(undefined);
+      const shown = (await rawPreview(file)) ?? file;
+      const name = file.name.replace(/\.[^.]+$/, "") || "photo";
+      setJob((old) => {
+        if (old) URL.revokeObjectURL(old.original);
+
+        return {
+          name,
+          file,
+          original: URL.createObjectURL(shown),
+          cloud: key && MODELS[model].name,
+          width: 0,
+          height: 0,
+          shown: "raw",
+          runs: { raw: fresh() },
+        };
+      });
+      clean(file, "raw", (result, info) => {
+        if (sharing()) share(file, result, { ...info, model: key ? MODELS[model].id : info.model }).catch(() => {});
+
+        if (key) {
+          setJob((j) => j && { ...j, saving: "saving" });
+          savePhoto(key, name, shown, result).then(
+            (photo) => {
+              setPhotos((p) => [photo, ...(p ?? [])]);
+              setJob((j) => j && { ...j, saving: "saved" });
+            },
+            () => setJob((j) => j && { ...j, saving: "failed" }),
+          );
+        }
+      });
+    },
+    [key, model, clean],
+  );
+
+  const look = (kind: RawKind) => {
+    setError(undefined);
+    setJob((j) => j && { ...j, shown: kind, runs: { ...j.runs, [kind]: j.runs[kind] ?? fresh() } });
+
+    if (job?.file && !job.runs[kind]) clean(job.file, kind);
+  };
 
   const view = async (photo: Photo) => {
     worker.current?.terminate();
@@ -192,13 +229,8 @@ export function App() {
           original: photo.original ?? photo.result!,
           width: cleaned.width,
           height: cleaned.height,
-          stage: "done",
-          loaded: 0,
-          modelBytes: 0,
-          done: 1,
-          total: 1,
-          startedAt: 0,
-          result,
+          shown: "raw",
+          runs: { raw: { ...fresh(), stage: "done", done: 1, total: 1, result } },
           cleaned,
           savedAt: photo.at,
         };
@@ -258,7 +290,7 @@ export function App() {
       </header>
       <main className="flex min-h-0 flex-1 flex-col">
         {job ? (
-          <Editor job={job} error={error} canvas={canvas} input={input} detail={detail} onNew={reset} />
+          <Editor job={job} error={error} canvases={canvases} input={input} onLook={look} onNew={reset} />
         ) : (
           <Pick
             onFile={open}
@@ -425,16 +457,16 @@ function Pick({
 function Editor({
   job,
   error,
-  canvas,
+  canvases,
   input,
-  detail,
+  onLook,
   onNew,
 }: {
   job: Job;
   error?: string;
-  canvas: React.RefObject<HTMLCanvasElement | null>;
+  canvases: Canvases;
   input: React.RefObject<HTMLCanvasElement | null>;
-  detail: React.RefObject<HTMLCanvasElement | null>;
+  onLook: (kind: RawKind) => void;
   onNew: () => void;
 }) {
   const [split, setSplit] = useState(50);
@@ -444,17 +476,21 @@ function Editor({
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
   const image = useRef<HTMLDivElement>(null);
-  const done = job.stage === "done";
-  const band = job.band ?? 0;
+  const details: Canvases = useRef({});
+  const { shown } = job;
+  const run = job.runs[shown]!;
+  const done = run.stage === "done";
+  const band = run.band ?? 0;
   const finer = band > 0 ? fine : 0;
 
   useEffect(() => {
-    if (job.cleaned) canvas.current?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
-  }, [job.cleaned, canvas]);
+    if (job.cleaned) canvases.current.raw?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
+  }, [job.cleaned, canvases]);
 
   useEffect(() => {
-    if (done && finer > 0) withDetail(input.current!, canvas.current!, detail.current!, band).catch(() => {});
-  }, [done, finer, band, input, canvas, detail]);
+    if (done && finer > 0)
+      withDetail(input.current!, canvases.current[shown]!, details.current[shown]!, band).catch(() => {});
+  }, [done, finer, band, shown, input, canvases]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -481,17 +517,17 @@ function Editor({
   useEffect(() => {
     const prefix = {
       decode: "",
-      model: job.loaded ? `${Math.round((job.loaded / job.modelBytes) * 100)}% model · ` : "",
-      clean: `${Math.round((job.done / job.total) * 100)}% · `,
+      model: run.loaded ? `${Math.round((run.loaded / run.modelBytes) * 100)}% model · ` : "",
+      clean: `${Math.round((run.done / run.total) * 100)}% · `,
       done: "Done · ",
-    }[job.stage];
+    }[run.stage];
 
     document.title = `${prefix}denoise`;
 
     return () => {
       document.title = "denoise";
     };
-  }, [job.stage, job.done, job.total, job.loaded, job.modelBytes]);
+  }, [run.stage, run.done, run.total, run.loaded, run.modelBytes]);
 
   const dragOver = (e: React.PointerEvent, box: Element) => {
     if (!done || (e.type === "pointermove" && e.buttons === 0)) return;
@@ -532,18 +568,37 @@ function Editor({
               {job.raw && (
                 <canvas ref={input} width={job.width} height={job.height} className="absolute inset-0 size-full" />
               )}
-              <div className="absolute inset-0" style={job.raw ? { opacity: strength / 100 } : undefined}>
-                <canvas ref={canvas} width={job.width} height={job.height} className="absolute inset-0 size-full" />
-                {band > 0 && (
-                  <canvas
-                    ref={detail}
-                    width={job.width}
-                    height={job.height}
-                    className="absolute inset-0 size-full"
-                    style={{ opacity: fine / 100 }}
-                  />
-                )}
-              </div>
+              {LOOKS.map(
+                (kind) =>
+                  job.runs[kind] && (
+                    <div
+                      key={kind}
+                      hidden={kind !== shown}
+                      className="absolute inset-0"
+                      style={job.raw ? { opacity: strength / 100 } : undefined}
+                    >
+                      <canvas
+                        ref={(made) => {
+                          canvases.current[kind] = made;
+                        }}
+                        width={job.width}
+                        height={job.height}
+                        className="absolute inset-0 size-full"
+                      />
+                      {(job.runs[kind].band ?? 0) > 0 && (
+                        <canvas
+                          ref={(made) => {
+                            details.current[kind] = made;
+                          }}
+                          width={job.width}
+                          height={job.height}
+                          className="absolute inset-0 size-full"
+                          style={{ opacity: fine / 100 }}
+                        />
+                      )}
+                    </div>
+                  ),
+              )}
             </div>
             {done && !actual && <Divider split={split} />}
           </div>
@@ -559,11 +614,27 @@ function Editor({
         )}
       </div>
       <footer className="relative shrink-0 px-5 py-3">
-        <Progress job={job} error={error} />
+        <Progress run={run} error={error} />
         <div className="flex flex-wrap items-center gap-x-2 gap-y-3">
           <p className="min-w-0 flex-1 truncate text-[13px] text-muted tabular-nums">
-            {error ? <span className="text-red-500">{error}</span> : status(job)}
+            {error ? <span className="text-red-500">{error}</span> : status(job, run)}
           </p>
+          {job.raw && job.runs.raw?.stage === "done" && (
+            <div className="order-first flex basis-full sm:order-none sm:mr-2 sm:basis-auto">
+              <div className="flex rounded-full border border-line bg-card p-0.5 text-[13px] font-medium pointer-coarse:text-sm">
+                {LOOKS.map((kind) => (
+                  <button
+                    key={kind}
+                    onClick={() => onLook(kind)}
+                    aria-pressed={kind === shown}
+                    className={`h-6.5 rounded-full px-3 transition pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted hover:text-fg"}`}
+                  >
+                    {LOOK[kind]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {done && job.raw && (
             <>
               <Dial name="Strength" value={strength} onChange={setStrength} />
@@ -574,14 +645,21 @@ function Editor({
             {actual ? "Fit" : "1:1"}
           </Button>
           <Button onClick={onNew}>New</Button>
-          {done && job.result && (
+          {done && run.result && (
             <Button
               primary
               onClick={async () =>
                 save(
                   job.raw && (strength < 100 || finer > 0)
-                    ? await blended(input.current!, canvas.current!, detail.current, strength, finer, band)
-                    : job.result!,
+                    ? await blended(
+                        input.current!,
+                        canvases.current[shown]!,
+                        details.current[shown],
+                        strength,
+                        finer,
+                        band,
+                      )
+                    : run.result!,
                   `${job.name}-denoised.jpg`,
                 )
               }
@@ -666,55 +744,55 @@ function Button({ primary, ...props }: React.ButtonHTMLAttributes<HTMLButtonElem
   );
 }
 
-function Progress({ job, error }: { job: Job; error?: string }) {
+function Progress({ run, error }: { run: Run; error?: string }) {
   const value =
-    job.stage === "done"
+    run.stage === "done"
       ? 1
-      : job.stage === "clean"
-        ? job.done / job.total
-        : job.stage === "model"
-          ? (job.loaded / job.modelBytes) * 0.999
+      : run.stage === "clean"
+        ? run.done / run.total
+        : run.stage === "model"
+          ? (run.loaded / run.modelBytes) * 0.999
           : 0;
 
   return (
     <div
-      className={`absolute inset-x-5 top-0 h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${job.stage === "done" ? "opacity-0" : ""}`}
+      className={`absolute inset-x-5 top-0 h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${run.stage === "done" ? "opacity-0" : ""}`}
     >
       <div
         className={`h-full rounded-full transition-[width] duration-500 ${error ? "bg-red-500" : "bg-gradient-to-r from-indigo-500 to-cyan-400"}`}
-        style={{ width: `${(job.stage === "model" && job.loaded === 0 ? 0 : value) * 100}%` }}
+        style={{ width: `${(run.stage === "model" && run.loaded === 0 ? 0 : value) * 100}%` }}
       />
     </div>
   );
 }
 
-function status(job: Job) {
+function status(job: Job, run: Run) {
   const megapixels = (job.width * job.height) / 1e6;
   const mp = `${megapixels < 10 ? megapixels.toFixed(1) : Math.round(megapixels)} MP`;
 
-  switch (job.stage) {
+  switch (run.stage) {
     case "decode":
       return "Opening photo…";
     case "model":
       if (job.cloud) return `Sending to ${job.cloud}…`;
 
-      return job.loaded > 0 && job.loaded < job.modelBytes
-        ? `Model · ${mb(job.loaded)} / ${mb(job.modelBytes)} MB`
+      return run.loaded > 0 && run.loaded < run.modelBytes
+        ? `Model · ${mb(run.loaded)} / ${mb(run.modelBytes)} MB`
         : "Starting the GPU…";
     case "clean": {
       const left =
-        job.firstTileAt && job.done > 1
-          ? ((performance.now() - job.firstTileAt) / (job.done - 1)) * (job.total - job.done)
+        run.firstTileAt && run.done > 1
+          ? ((performance.now() - run.firstTileAt) / (run.done - 1)) * (run.total - run.done)
           : undefined;
 
-      return `Cleaning · ${Math.round((job.done / job.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
+      return `Cleaning · ${Math.round((run.done / run.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
     }
 
     case "done": {
       if (job.savedAt) return `Saved ${new Date(job.savedAt).toLocaleDateString()} · ${mp}`;
       const saving = { saving: " · Saving to your photos…", saved: " · In your photos", failed: " · Not saved" };
 
-      return `Done · ${eta(job.finishedAt! - job.startedAt)} · ${mp}${job.saving ? saving[job.saving] : ""}`;
+      return `Done · ${eta(run.finishedAt! - run.startedAt)} · ${mp}${job.saving ? saving[job.saving] : ""}`;
     }
   }
 }
@@ -754,7 +832,7 @@ function withDetail(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTM
 async function blended(
   under: HTMLCanvasElement,
   over: HTMLCanvasElement,
-  onto: HTMLCanvasElement | null,
+  onto: HTMLCanvasElement | null | undefined,
   strength: number,
   fine: number,
   band: number,
