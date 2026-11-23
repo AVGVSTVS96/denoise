@@ -445,7 +445,7 @@ def trained(weights):
     import train_raw
 
     state = torch.load(weights, map_location="cpu")
-    model = train_raw.network(state["intro.weight"].shape[0], state["intro.weight"].shape[1] == 12)
+    model = train_raw.shaped(state)
     model.load_state_dict(state)
     return model.to(DEVICE).eval()
 

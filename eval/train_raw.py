@@ -101,6 +101,25 @@ scene is, so a crop's own brightness does not move its width. A crop may get one
 of laid-over noise, and each is laid over the truth blurred for its own strength. Without the word
 --soften is what it was.
 
+--burst 4 gives the network that many frames of one scene, as a camera's burst is, for one picture:
+the picked frame's, sharper and cleaner for what the others add. It is the joint network with a
+first layer beside its own (network()), for what each other frame holds that the picked one does
+not. That layer starts at nothing, so --init's model is where the run starts, to the last digit;
+the work for a picture stays what it was. The frames go in as the camera made them: lining one up
+finer than whole colour cells means resampling its mosaic, which costs print a third of its
+letters, and frames a fraction of a pixel apart hold each other's missing colours, which only
+untouched frames hand over. Each joint crop becomes a burst (burst()): the picked frame sees the
+truth as it is and the loss stays against that; each later frame sees it up to SHAKE px off and
+turned a little, by less the steadier its crop's burst was drawn, and gets its own draw of the same
+noise, with everything else the run lays on a crop, print, the lens's blur, the gain, shared. A slot with no frame holds the picked frame again
+and so adds nothing: one frame alone goes through the joint network's own layers and no other.
+Half the joint crops carry fewer frames than slots, and --batch's crops, real noisy frames among
+them, are one frame each. In half, the later frames are one or two ISO steps noisier than the
+picked one, as frames from up a camera's ladder are, and with --soften's noise each is blurred
+for its own. In half a patch sits several px off in the later frames, something that moved, for
+the network to fall back on the picked frame there: a burst's one fault is to show such a thing
+twice. A run without it is what it was.
+
 --smoothed 0.25 makes that share of the frames under laid-over noise, of both kinds of crop, what a
 camera that smooths its raw files hands over: the noise is a row's of --levels' table whose noise
 is tied (tied()), mixed as --mixing mixes it, and the scene under it has been through that row's
@@ -238,6 +257,13 @@ STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
 EDGE = 16
 SMOOTH_SHARE, TIED = 0.5, 0.1
 FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 12800), 0.15
+#: A burst's later frames: the furthest one sits off the picked frame, px either way, and the furthest it
+#: is turned, radians either way. The shares of the joint crops that carry fewer frames than slots, whose later
+#: frames are noisier, by up to STEPS ISO steps, and where a patch moved: its sides as shares of the
+#: crop's, and how far off it sits, px.
+SHAKE, TURN = 1.0, 0.003
+FEWER, UNEVEN, STEPS = 0.5, 0.5, 2
+MOVING, PATCH, OFF = 0.5, (1 / 8, 1 / 2), (3, 12)
 #: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
 WINDOW, NEAR, READER = 256, 17, 0.055
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
@@ -258,10 +284,38 @@ def held(numbers, device):
     return torch.tensor(numbers, device=device)
 
 
-def network(width=32, joint=False):
+def network(width=32, joint=False, burst=1):
     from nafnet import CONFIGS, NAFNet
 
-    return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12 if joint else 4)
+    if burst == 1:
+        return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12 if joint else 4)
+
+    class Burst(NAFNet):
+        """The joint network with a first layer for a burst: the picked frame's twelve planes, then each
+        other frame's. That layer is two that add up: the joint network's own on the picked frame,
+        and "others" on what each other frame holds that the picked one does not, their difference.
+        The picture is the picked frame's planes plus what the body makes of the sum. With others
+        at nothing, or with every slot holding the picked frame, it is the joint network on the
+        picked frame, to the last digit. The difference is what the layer learns from: under the
+        frames themselves the scene they share would drown what one adds to the other."""
+
+        def __init__(self):
+            super().__init__(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12)
+            self.others = torch.nn.Conv2d(12 * (burst - 1), width, 3, padding=1, bias=False)
+
+        def forward(self, planes):
+            picked = planes[:, :12]
+            x, skips = self.intro(picked) + self.others(planes[:, 12:] - picked.repeat(1, burst - 1, 1, 1)), []
+            for encoder, down in zip(self.encoders, self.downs):
+                x = encoder(x)
+                skips.append(x)
+                x = down(x)
+            x = self.middle_blks(x)
+            for decoder, up, skip in zip(self.decoders, self.ups, reversed(skips)):
+                x = decoder(up(x) + skip)
+            return self.ending(x) + picked
+
+    return Burst()
 
 
 def joint(model):
@@ -269,10 +323,21 @@ def joint(model):
     return model.intro.in_channels == 12
 
 
+def slots(model):
+    """How many frames of a burst a network takes: one, but for a burst network."""
+    return 1 + model.others.in_channels // 12 if hasattr(model, "others") else 1
+
+
+def shaped(state):
+    """The network a saved model's weights are for: faithful or joint, at its width, with its slots."""
+    first, others = state["intro.weight"], state.get("others.weight")
+    return network(first.shape[0], first.shape[1] == 12, 1 if others is None else 1 + others.shape[1] // 12)
+
+
 def trained(weights):
     """A saved model, faithful or joint, at whatever width it was trained."""
     state = torch.load(weights, map_location="cpu")
-    model = network(state["intro.weight"].shape[0], state["intro.weight"].shape[1] == 12)
+    model = shaped(state)
     model.load_state_dict(state)
     return model.cuda().eval()
 
@@ -285,10 +350,29 @@ def widened(state):
     return {**state, "intro.weight": first, "ending.weight": last, "ending.bias": spread @ state["ending.bias"]}
 
 
+def several(state, burst):
+    """A joint model's weights as a burst network's of that many slots, which then gives that model's
+    picture of the picked frame: the other frames' layer starts at nothing. A burst model's stay as they are."""
+    first = state["intro.weight"]
+    return {"others.weight": first.new_zeros(first.shape[0], 12 * (burst - 1), *first.shape[2:]), **state}
+
+
 def fed(model, mosaics):
-    """What a network takes of mosaics (N, H, W): their four planes, spread to twelve for a joint one."""
+    """What a network takes of mosaics (N, H, W): their four planes, spread to twelve for a joint one.
+
+    A burst network takes bursts (N, frames, H, W), the picked frame first, as each frame's twelve
+    planes one after another. A slot past the frames given holds the picked frame again, so mosaics
+    (N, H, W) fill every slot with the one frame, and a network of one slot takes a burst's picked frame.
+    """
     planes = pack(mosaics)
-    return torch.nn.functional.conv2d(planes, held(SPREAD, planes.device)[:, :, None, None]) if joint(model) else planes
+    if not joint(model):
+        return planes
+    if mosaics.dim() == 4 or slots(model) > 1:
+        burst = planes.view(len(planes), -1, *planes.shape[-3:])
+        slot = tuple(at * (at < burst.shape[1]) for at in range(slots(model)))
+        planes = burst[:, held(slot, planes.device)].flatten(0, 1)
+    spread = torch.nn.functional.conv2d(planes, held(SPREAD, planes.device)[:, :, None, None])
+    return spread.view(len(mosaics), -1, *spread.shape[-2:])
 
 
 def made(model, planes):
@@ -365,6 +449,71 @@ def moved(picture, move):
     return torch.fft.irfft2(torch.fft.rfft2(picture) * turn, s=(h, w))[..., EDGE:-EDGE, EDGE:-EDGE]
 
 
+def sheared(picture, slope, shift):
+    """Camera RGB (N, 3, H, W) with every row moved along itself: by shift (N,) px, and by slope (N,)
+    px more for each row down from the middle. As in moved(), the move turns each frequency's phase
+    and leaves its strength alone, so nothing is softened."""
+    n, _, h, w = picture.shape
+    down = torch.arange(h, device=picture.device).view(1, 1, h, 1) - (h - 1) / 2
+    by = shift.view(n, 1, 1, 1) + slope.view(n, 1, 1, 1) * down
+    across = torch.fft.rfftfreq(w, device=picture.device).view(1, 1, 1, -1)
+    return torch.fft.irfft(torch.fft.rfft(picture) * torch.exp(-2j * math.pi * across * by), n=w)
+
+
+def shaken(picture, move, turn):
+    """Camera RGB (N, 3, H, W) as a frame saw it that sat (dx, dy) px of move (N, 2) off and was turned
+    by turn (N,) radians about the picture's middle: what was at (x, y) is turned, then at (x + dx, y + dy).
+
+    A turn is three shears, of the rows, the columns and the rows again (Paeth), and the move rides on
+    the last two, so it is all sheared(): a picture resampled between its pixels loses its finest
+    detail, and a burst's later frames would then be softer than the picked one. The picture is
+    mirrored 2 * EDGE px past its edges for it, which are cut again: a spectrum takes a picture's
+    edges to meet round the back.
+    """
+    room = 2 * EDGE
+    lean = -torch.tan(turn / 2)
+    wide = sheared(torch.nn.functional.pad(picture, (room,) * 4, mode="reflect"), lean, torch.zeros_like(turn))
+    wide = sheared(wide.transpose(2, 3), turn.sin(), move[:, 1]).transpose(2, 3)
+    return sheared(wide, lean, move[:, 0] - lean * move[:, 1])[..., room:-room, room:-room]
+
+
+def burst(truth, frames, fewer=FEWER, uneven=UNEVEN, moving=MOVING):
+    """Each crop of camera RGB (N, 3, H, H) as a burst of that many frames saw it, and the burst's draws.
+
+    The picked frame comes first and sees the truth as it is. Each later frame sits off it and is
+    turned (shaken()), by up to a reach drawn per crop: from nothing, a burst on a table, to SHAKE
+    px either way and TURN radians, what is left of a hand's shake once a frame is lined up to
+    whole colour cells. In a share moving of the crops something moved: a patch, its sides between
+    PATCH of the crop's, sits between OFF px off in each later frame, each frame its own way. A
+    share fewer of the crops carry fewer frames than that, one up to all but one, and in a share
+    uneven each later frame is one to STEPS ISO steps noisier than the picked one.
+
+    Returns the frames (N * frames, 3, H, H), a crop's one after another; how many ISO steps noisier
+    each is (N, frames); which of a crop's slots are empty (N, frames); and where its patch is
+    (N, 1, H, H), nowhere in a crop without one.
+    """
+    n, side, device = len(truth), truth.shape[-1], truth.device
+    later = n * (frames - 1)
+    draw = lambda *shape: torch.rand(*shape, device=device)
+    still, reach = truth.repeat_interleave(frames - 1, 0), draw(n, 1).repeat_interleave(frames - 1, 0)
+    move, turn = (draw(later, 2) * 2 - 1) * SHAKE * reach, (draw(later) * 2 - 1) * TURN * reach[:, 0]
+    way, far = draw(later) * 2 * math.pi, OFF[0] + draw(later) * (OFF[1] - OFF[0])
+    off = torch.stack([way.cos(), way.sin()], 1) * far[:, None]
+    sides = (PATCH[0] + draw(n, 2) * (PATCH[1] - PATCH[0])) * side
+    corner = draw(n, 2) * (side - sides)
+    along = torch.arange(side, device=device)
+    within = lambda k: (along >= corner[:, k, None]) & (along < (corner + sides)[:, k, None])
+    patch = (within(1)[:, :, None] & within(0)[:, None, :] & (draw(n, 1, 1) < moving))[:, None]
+    seen = torch.where(
+        patch.repeat_interleave(frames - 1, 0), shaken(still, move + off, turn), shaken(still, move, turn)
+    )
+    seen = torch.cat([truth[:, None], seen.view(n, frames - 1, *truth.shape[1:])], 1).flatten(0, 1)
+    given = torch.where(draw(n) < fewer, torch.randint(1, frames, (n,), device=device), frames)
+    steps = torch.randint(1, STEPS + 1, (n, frames), device=device) * (draw(n, 1) < uneven)
+    slot = torch.arange(frames, device=device)
+    return seen, steps * (slot > 0), slot >= given[:, None], patch
+
+
 @functools.cache
 def sampled(h, w, device):
     """Where an RGGB mosaic (H, W) measured each colour of camera RGB (3, H, W)."""
@@ -427,7 +576,7 @@ def tile_gain(tile, gain):
 def cleaner(model, tiled=False):
     """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled by their photo's mean, and out
     cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model. With tiled each mosaic gets the
-    gain denoise() gives a tile."""
+    gain denoise() gives a tile. Bursts (N, frames, H, W) go in as mosaics do, the picked frame first."""
 
     def at(mosaics, gain):
         with torch.autocast("cuda", torch.bfloat16):
@@ -482,10 +631,12 @@ def denoise(model, mosaic, tile=1024, overlap=64, window=None):
     the middle half of what they share; the last row and column of tiles sit flush with the far edge.
     Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model. With window (y, x, height,
     width) only the tiles that reach it run and only it comes back, the same pixels the whole photo gives.
+    A burst (frames, H, W) goes through as a photo does, on the picked frame's gains, the picked frame first.
     """
-    top, left, height, width = window or (0, 0, *mosaic.shape)
-    gain = float(np.clip(LEVEL / max(float(mosaic.mean()), 1e-6), 1, MAX_GAIN))
-    padded = np.pad(mosaic, overlap, "reflect")
+    picked, sides = mosaic.reshape(-1, *mosaic.shape[-2:])[0], [(0, 0)] * (mosaic.ndim - 2) + [(overlap, overlap)] * 2
+    top, left, height, width = window or (0, 0, *picked.shape)
+    gain = float(np.clip(LEVEL / max(float(picked.mean()), 1e-6), 1, MAX_GAIN))
+    mosaic, padded = np.pad(mosaic, sides, "reflect"), np.pad(picked, overlap, "reflect")
     out = np.zeros((3, *padded.shape) if joint(model) else padded.shape, padded.dtype)
     weight = np.zeros(padded.shape, padded.dtype)
     inward = np.minimum(np.arange(tile), np.arange(tile)[::-1]) + 0.5
@@ -495,9 +646,9 @@ def denoise(model, mosaic, tile=1024, overlap=64, window=None):
     starts = lambda side, at, span: [s for s in every(side) if s < at + span + overlap and at + overlap < s + tile]
     for y in starts(padded.shape[0], top, height):
         for x in starts(padded.shape[1], left, width):
-            piece = padded[y : y + tile, x : x + tile]
-            own = tile_gain(piece, gain)
-            shown = torch.from_numpy(np.ascontiguousarray(piece * own)).cuda()[None]
+            own = tile_gain(padded[y : y + tile, x : x + tile], gain)
+            piece = mosaic[..., y : y + tile, x : x + tile]
+            shown = torch.from_numpy(np.ascontiguousarray(piece * own)).to(model.intro.weight.device)[None]
             with torch.autocast("cuda", torch.bfloat16):
                 result = made(model, model(fed(model, shown)).float())[0].cpu().numpy()
             out[..., y : y + tile, x : x + tile] += result / own * fade
@@ -655,12 +806,13 @@ def spread(n, device, low, high):
     return torch.exp(torch.empty(n, device=device).uniform_(math.log(low), math.log(high)))
 
 
-def windows(fields, n, size):
-    """n windows of mosaics (frames, H, W), each from a frame picked at random and starting on red.
+def windows(fields, n, size, frame=None):
+    """n windows of mosaics (frames, H, W), each from a frame picked at random, or from the n frames
+    named, and starting on red.
 
     Returns which frames, and the windows.
     """
-    frame = torch.randint(len(fields), (n,), device=fields.device)
+    frame = torch.randint(len(fields), (n,), device=fields.device) if frame is None else frame
     along = torch.arange(size, device=fields.device)
     span = lambda side: torch.randint((side - size) // 2, (n,), device=fields.device)[:, None] * 2 + along
     rows, columns = span(fields.shape[1]), span(fields.shape[2])
@@ -675,7 +827,8 @@ def sites(planes, like):
 
 def bank_drawn(n, size, bank):
     """n rows of the GR III's real noise for crops of that size at LEVEL brightness: each a window of one
-    ISO's unit-strength field, with that ISO's shot noise, read noise and black offset per colour plane.
+    ISO's unit-strength field, with which ISO, and that ISO's shot noise, read noise and black offset
+    per colour plane.
 
     The photo is taken as shot 1-16x darker than LEVEL and brought up, as a dim night frame is, but
     never past FLOOR.
@@ -684,7 +837,7 @@ def bank_drawn(n, size, bank):
     iso, unit = windows(fields, n, size)
     darkest = LEVEL / (FLOOR * shot[iso].mean(1))
     dim = torch.minimum(spread(n, fields.device, 1, 16), darkest).clamp(min=1).view(n, 1)
-    return {"unit": unit, "shot": shot[iso] * dim, "read": read[iso] * dim, "offset": offset[iso] * dim}
+    return {"iso": iso, "unit": unit, "shot": shot[iso] * dim, "read": read[iso] * dim, "offset": offset[iso] * dim}
 
 
 def bank_noise(clean, row, offsets):
@@ -840,10 +993,30 @@ def drawn(n, device, levels, share):
     row = {part: values[pick] for part, values in levels.items()}
     dim = torch.minimum(spread(n, device, 1, 16), LEVEL / (FLOOR * row["shot"].mean(1))).clamp(min=1)
     each = lambda values: (n, *[1] * (values.dim() - 1))
-    unscaled = lambda part, values: values if part in ("tail", "mix") else values * dim.view(each(values))
-    row = {part: unscaled(part, values) for part, values in row.items()}
+    row = dimmed(row, dim)
     measured = torch.rand(n, device=device) < share
     return row | {part: torch.where(measured.view(each(values)), row[part], values) for part, values in made_up.items()}
+
+
+def dimmed(row, times):
+    """Rows of noise levels as their photos shot that many times (N,) darker and brought up: every
+    level that many times what it was. The tails' shape, the mixing, the share smoothed and which
+    of the GR III's fields a row is stay."""
+    grown = lambda values: values * times.view(-1, *[1] * (values.dim() - 1))
+    kept = ("tail", "mix", "smoothed", "iso", "unit")
+    return {part: values if part in kept else grown(values) for part, values in row.items()}
+
+
+def framed(row, steps, fields=None):
+    """Each crop's row of noise levels as its burst's, a row for each frame (N * frames): the crop's
+    own, with 2 ** steps (N, frames) times the noise, as a frame that many ISO steps up has, but never
+    past FLOOR (dimmed()). A row of the GR III's real noise gets a window of its ISO's field, of
+    fields, for each frame."""
+    each = {part: values.repeat_interleave(steps.shape[1], 0) for part, values in row.items() if part != "unit"}
+    if "unit" in row:
+        each["unit"] = windows(fields, len(each["iso"]), row["unit"].shape[-1], each["iso"])[1]
+    most = LEVEL / (FLOOR * each["shot"].mean(1))
+    return dimmed(each, torch.minimum(2.0 ** steps.flatten(), most).clamp(min=1))
 
 
 def strength(row):
@@ -978,16 +1151,18 @@ def read(reader, look):
             yield planes
 
 
-def softened(truth, low, high, noise=None):
+def softened(truth, low, high, noise=None, frames=1):
     """Camera RGB (N, 3, H, W), each blurred as a lens blurs it: a Gaussian between low and high px wide, drawn per crop.
 
     With noise (N,), how far each crop's noise is from weak to strong (followed()), the width is that
-    far from low to high and AROUND px either way round that, and never under none.
+    far from low to high and AROUND px either way round that, and never under none. With frames the
+    pictures are bursts of that many, a crop's one after another, and a crop's frames share its draw.
     A tap is the Gaussian's share of one pixel, so an edge between two pixels comes out as that lens
     draws it; taps read off the curve at each pixel's middle would hardly blur under half a pixel.
     The picture is mirrored past its edges.
     """
-    n, draw = len(truth), torch.empty(len(truth), 1, device=truth.device).uniform_
+    n, crops = len(truth), len(truth) // frames
+    draw = lambda low, high: torch.empty(crops, 1, device=truth.device).uniform_(low, high).repeat_interleave(frames, 0)
     if noise is None:
         width, widest = draw(low, high), high
     else:
@@ -1077,10 +1252,13 @@ def main(args):
     levels = table(measured(args.profile or args.levels), args.mixing) if args.profile or args.levels else None
     darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
     share, rows = (1, 1) if args.profile else (BANK_SHARE, TABLE_SHARE)
-    model = network(args.width, bool(args.joint)).cuda().to(memory_format=torch.channels_last)
+    if args.burst > 1 and not args.joint:
+        raise SystemExit("--burst gives the joint crops several frames, for a --joint run")
+    model = network(args.width, bool(args.joint), args.burst).cuda().to(memory_format=torch.channels_last)
     if args.init:
         state = torch.load(args.init, map_location="cpu")
-        model.load_state_dict(widened(state) if args.joint and state["intro.weight"].shape[1] == 4 else state)
+        state = widened(state) if args.joint and state["intro.weight"].shape[1] == 4 else state
+        model.load_state_dict(several(state, args.burst) if args.burst > 1 else state)
     else:
         sidd = torch.load(evaluate.MODELS / f"NAFNet-SIDD-width{args.width}.pth", map_location="cpu")["params"]
         model.load_state_dict({k: v for k, v in sidd.items() if not k.startswith(("intro", "ending"))}, strict=False)
@@ -1169,24 +1347,31 @@ def main(args):
             raise SystemExit(f"no crops in {folder}: uv run pixel_shift.py")
         truths = TruthCrops(folder, sharp, args.size[-1] // args.bin, args.seed + step, "*", False)
 
-    def under_noise(clean, scene=None):
-        n, device = len(clean), clean.device
+    def under_noise(clean, scene=None, steps=None):
+        frames = 1 if steps is None else steps.shape[1]
+        n, device = len(clean) // frames, clean.device
         under = scene or (lambda row: clean)
-        row = drawn(n, device, levels, rows)
+        each = (lambda values: values) if steps is None else (lambda values: values.repeat_interleave(frames, 0))
+        of = (lambda row: row) if steps is None else (lambda row: framed(row, steps, bank and bank[0]))
+        row = of(drawn(n, device, levels, rows))
         laid = made_up_noise(under(row), row, args.offsets, args.tails, darks)
         if bank:
             real = torch.rand(n, 1, 1, device=device) < share
-            row = bank_drawn(n, clean.shape[-1], bank)
-            laid = torch.where(real, bank_noise(under(row), row, args.offsets), laid)
+            row = of(bank_drawn(n, clean.shape[-1], bank))
+            laid = torch.where(each(real), bank_noise(under(row), row, args.offsets), laid)
         if cameras:
-            row = drawn(n, device, cameras, 1) | {"smoothed": torch.rand(n, device=device)}
+            row = of(drawn(n, device, cameras, 1) | {"smoothed": torch.rand(n, device=device)})
             smooth = torch.rand(n, 1, 1, device=device) < args.smoothed
-            laid = torch.where(smooth, made_up_noise(under(row), row, args.offsets, args.tails, darks), laid)
+            laid = torch.where(each(smooth), made_up_noise(under(row), row, args.offsets, args.tails, darks), laid)
         return laid
 
-    def under_followed_noise(truth):
-        soft = lambda row: bench_raw.mosaiced(softened(truth, *args.soften[:2], follow(row)))
-        return under_noise(bench_raw.mosaiced(truth), soft)
+    def noisy_of(scene, steps=None):
+        frames = 1 if steps is None else steps.shape[1]
+        if follow:
+            soft = lambda row: bench_raw.mosaiced(softened(scene, *args.soften[:2], follow(row), frames))
+            return under_noise(bench_raw.mosaiced(scene), soft, steps)
+        soft = softened(scene, *args.soften, frames=frames) if args.soften else scene
+        return under_noise(bench_raw.mosaiced(soft), None, steps)
 
     def at_white(noisy, gain):
         return torch.minimum(noisy, gain) if args.bright else noisy
@@ -1239,11 +1424,12 @@ def main(args):
                 truth = torch.cat([laid, truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
-            if follow:
-                noisy = at_white(under_followed_noise(truth), g)
+            if args.burst > 1:
+                seen, steps, empty, _ = burst(truth, args.burst)
+                noisy = noisy_of(seen, steps).view(len(truth), args.burst, *truth.shape[-2:])
+                noisy = at_white(torch.where(empty[:, :, None, None], noisy[:, :1], noisy), g[:, None])
             else:
-                soft = softened(truth, *args.soften) if args.soften else truth
-                noisy = at_white(under_noise(bench_raw.mosaiced(soft)), g)
+                noisy = at_white(noisy_of(truth), g)
             picture = cleaned(noisy)
             loss = loss + picture_loss(picture, truth)
             if teacher:
@@ -1421,6 +1607,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--smoothed", type=float, default=0, help="share of laid-over noise that a camera smoothed, the scene with it"
     )
+    parser.add_argument("--burst", type=int, default=1, help="frames of one scene the joint crops give the network")
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument(
         "--twins",
