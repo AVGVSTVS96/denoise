@@ -156,7 +156,12 @@ def made_up_tiles():
 
 
 def peaks(fp32, fp16):
-    """The fp32 graph with, for every step the fp16 file runs in fp16, its largest value as an output."""
+    """The fp32 graph with, for every step the fp16 file runs in fp16, its largest value as an output.
+
+    Run in priority order, which takes a step's largest value as soon as the step is made and lets its
+    values go. The default order leaves all of that to the end and holds every step's values until then,
+    13 GB for one tile where this holds 1.
+    """
     model = onnx.load(str(fp32))
     half = {node.name for node in onnx.load(str(fp16)).graph.node} - set(export.fp32_islands(model))
     names = []
@@ -165,7 +170,9 @@ def peaks(fp32, fp16):
         model.graph.node.append(onnx.helper.make_node("ReduceMax", [f"{node.name}/size"], [node.name], keepdims=0))
         model.graph.output.append(onnx.helper.make_tensor_value_info(node.name, onnx.TensorProto.FLOAT, []))
         names.append(node.name)
-    return ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]), names
+    options = ort.SessionOptions()
+    options.execution_order = ort.ExecutionOrder.PRIORITY_BASED
+    return ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"]), names
 
 
 def audit(fp32, fp16, held):
