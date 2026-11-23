@@ -81,6 +81,15 @@ the truth as it was. The truth and the mosaic made of it are otherwise equally s
 hands back a picture as soft as the lens drew it: this shows it a photo softer than its answer, for
 it to give back the band the lens took. A run without it is what it was.
 
+--soften 0.0 1.2 noise draws that width by the noise laid over the crop, not evenly: a camera that
+smooths its raw smooths more as its ISO rises. The width is 0.0 px where the noise is as weak as the
+GR III's row of --levels' table at ISO 1,600 or weaker, 1.2 px where it is as strong as its row at
+ISO 25,600 or stronger, on a straight line in stops between (followed()), and AROUND px either way
+round that. Strength is a row's shot and read noise at the crop's own mean brightness, as the draw
+makes it (strength()); the two rows' is at LEVEL. A crop may get one of several kinds of laid-over
+noise, and each is laid over the truth blurred for its own strength. Without the word --soften is
+what it was.
+
 --smoothed 0.25 makes that share of the frames under laid-over noise, of both kinds of crop, what a
 camera that smooths its raw files hands over: the noise is a row's of --levels' table whose noise
 is tied (tied()), mixed as --mixing mixes it, and the scene under it has been through that row's
@@ -216,6 +225,7 @@ NEXT_GREEN = (((0, 1, 0, -1), (0, 2, -1, 0)), ((3, 2, 0, 1), (3, 1, 1, 0)))
 STROKES, SOFT, TILT, CONTRAST, REACH = (1, 4), (0.5, 1.2), 0.15, (1.5, 16), 15
 EDGE = 16
 SMOOTH_SHARE, TIED = 0.5, 0.1
+FOLLOWED, AROUND = ("ricoh-gr-iii", 1600, 25600), 0.15
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -649,21 +659,28 @@ def sites(planes, like):
     return unpack(planes.view(n, 4, 1, 1).expand(n, 4, h // 2, w // 2))
 
 
-def bank_noise(clean, bank, offsets):
-    """The GR III's real noise on clean mosaics (N, H, W) already at LEVEL brightness.
+def bank_drawn(n, size, bank):
+    """n rows of the GR III's real noise for crops of that size at LEVEL brightness: each a window of one
+    ISO's unit-strength field, with that ISO's shot noise, read noise and black offset per colour plane.
 
-    Each crop gets a window of one ISO's unit-strength field, scaled by that ISO's shot and read noise
-    at the brightness under it. The photo is taken as shot 1-16x darker than LEVEL and brought up, as
-    a dim night frame is, but never past FLOOR. With offsets it keeps the black offset that ISO's
-    frame sat on.
+    The photo is taken as shot 1-16x darker than LEVEL and brought up, as a dim night frame is, but
+    never past FLOOR.
     """
     fields, shot, read, offset = bank
-    n = clean.shape[0]
-    iso, unit = windows(fields, n, clean.shape[-1])
+    iso, unit = windows(fields, n, size)
     darkest = LEVEL / (FLOOR * shot[iso].mean(1))
-    dim = torch.minimum(spread(n, clean.device, 1, 16), darkest).clamp(min=1).view(n, 1)
-    variance = clean.clamp(min=0) * sites(shot[iso] * dim, clean) + sites(read[iso] * dim, clean) ** 2
-    return clean + unit * variance.sqrt() + sites(offset[iso] * dim * offsets, clean)
+    dim = torch.minimum(spread(n, fields.device, 1, 16), darkest).clamp(min=1).view(n, 1)
+    return {"unit": unit, "shot": shot[iso] * dim, "read": read[iso] * dim, "offset": offset[iso] * dim}
+
+
+def bank_noise(clean, row, offsets):
+    """The GR III's real noise on clean mosaics (N, H, W) already at LEVEL brightness, at bank_drawn()'s rows.
+
+    Each crop's window is scaled by its row's shot and read noise at the brightness under it. With
+    offsets it keeps the black offset that ISO's frame sat on.
+    """
+    variance = clean.clamp(min=0) * sites(row["shot"], clean) + sites(row["read"], clean) ** 2
+    return clean + row["unit"] * variance.sqrt() + sites(row["offset"] * offsets, clean)
 
 
 def noise_bank(profile):
@@ -815,6 +832,23 @@ def drawn(n, device, levels, share):
     return row | {part: torch.where(measured.view(each(values)), row[part], values) for part, values in made_up.items()}
 
 
+def strength(row, level):
+    """How strong each row's noise is on a crop of mean brightness level (N,): its shot and read noise
+    together, as one figure over the colour planes."""
+    return (level.clamp(min=0)[:, None] * row["shot"] + row["read"] ** 2).mean(1).sqrt()
+
+
+def followed(rows):
+    """How far a crop's noise is from weak to strong, 0 to 1, as a function of its row and its mean
+    brightness: a straight line in stops of strength() between FOLLOWED's two rows of fit_noise.py's
+    table, one camera's at two ISOs, each at LEVEL."""
+    camera, *isos = FOLLOWED
+    found = {row["iso"]: row for row in rows if row.get("camera") == camera}
+    marks = table([found[iso] for iso in isos])
+    weak, strong = strength(marks, marks["step"].new_full((2,), LEVEL)).tolist()
+    return lambda row, level: (torch.log(strength(row, level) / weak) / math.log(strong / weak)).clamp(0, 1)
+
+
 def long_tailed(like, tail):
     """Unit-strength noise the shape of like (N, H, W) from Tukey's lambda distribution, ELD's read noise.
 
@@ -895,15 +929,21 @@ def lettered(truth, pages):
     return torch.lerp(truth, torch.where(dark, under / contrast, (under * contrast).clamp(max=1)), cover)
 
 
-def softened(truth, low, high):
+def softened(truth, low, high, noise=None):
     """Camera RGB (N, 3, H, W), each blurred as a lens blurs it: a Gaussian between low and high px wide, drawn per crop.
 
+    With noise (N,), how far each crop's noise is from weak to strong (followed()), the width is that
+    far from low to high and AROUND px either way round that, and never under none.
     A tap is the Gaussian's share of one pixel, so an edge between two pixels comes out as that lens
     draws it; taps read off the curve at each pixel's middle would hardly blur under half a pixel.
     The picture is mirrored past its edges.
     """
-    n, reach = len(truth), math.ceil(3 * high)
-    width = torch.empty(n, 1, device=truth.device).uniform_(low, high)
+    n, draw = len(truth), torch.empty(len(truth), 1, device=truth.device).uniform_
+    if noise is None:
+        width, widest = draw(low, high), high
+    else:
+        width, widest = (low + (high - low) * noise[:, None] + draw(-AROUND, AROUND)).clamp(min=0), high + AROUND
+    reach = math.ceil(3 * widest)
     sides = torch.arange(-reach, reach + 2, device=truth.device) - 0.5
     taps = torch.erf(sides / (width * math.sqrt(2))).diff(dim=1)
     taps = (taps / taps.sum(1, keepdim=True)).repeat_interleave(3, 0)
@@ -1034,6 +1074,11 @@ def main(args):
         raise SystemExit("--text lays print into the joint crops' truth, for a --joint run")
     if args.soften and not args.joint:
         raise SystemExit("--soften blurs the joint crops' truth, for a --joint run")
+    if args.soften and [type(word) for word in args.soften] not in ([float] * 2, [float, float, str]):
+        raise SystemExit("--soften takes LOW HIGH, and after them the word noise for a width that follows the noise")
+    if args.soften and args.soften[2:] and not args.levels:
+        raise SystemExit("--soften's noise is weak or strong beside the GR III's rows of --levels' table")
+    follow = followed(measured(args.levels)) if args.soften and args.soften[2:] else None
     pages = torch.from_numpy(np.load(text_bank.OUT)).cuda() if args.text else None
     twin = trained(args.twins[0]).to(memory_format=torch.channels_last) if args.twins else None
     if twin and not (args.joint and joint(twin)):
@@ -1072,18 +1117,26 @@ def main(args):
             raise SystemExit(f"no crops in {folder}: uv run pixel_shift.py")
         truths = TruthCrops(folder, sharp, args.size[-1] // args.bin, args.seed + step, "*", False)
 
-    def under_noise(clean):
-        row = drawn(len(clean), clean.device, levels, rows)
-        laid = made_up_noise(clean, row, args.offsets, args.tails, darks)
+    def under_noise(clean, scene=None):
+        n, device = len(clean), clean.device
+        under = scene or (lambda row: clean)
+        row = drawn(n, device, levels, rows)
+        laid = made_up_noise(under(row), row, args.offsets, args.tails, darks)
         if bank:
-            real = torch.rand(len(clean), 1, 1, device=clean.device) < share
-            laid = torch.where(real, bank_noise(clean, bank, args.offsets), laid)
+            real = torch.rand(n, 1, 1, device=device) < share
+            row = bank_drawn(n, clean.shape[-1], bank)
+            laid = torch.where(real, bank_noise(under(row), row, args.offsets), laid)
         if cameras:
-            n, device = len(clean), clean.device
             row = drawn(n, device, cameras, 1) | {"smoothed": torch.rand(n, device=device)}
             smooth = torch.rand(n, 1, 1, device=device) < args.smoothed
-            laid = torch.where(smooth, made_up_noise(clean, row, args.offsets, args.tails, darks), laid)
+            laid = torch.where(smooth, made_up_noise(under(row), row, args.offsets, args.tails, darks), laid)
         return laid
+
+    def under_followed_noise(truth):
+        sharp = bench_raw.mosaiced(truth)
+        level = sharp.mean((1, 2))
+        soft = lambda row: bench_raw.mosaiced(softened(truth, *args.soften[:2], follow(row, level)))
+        return under_noise(sharp, soft)
 
     def at_white(noisy, gain):
         return torch.minimum(noisy, gain) if args.bright else noisy
@@ -1135,8 +1188,11 @@ def main(args):
                 truth = torch.cat([lettered(truth[:printed], pages), truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
-            soft = softened(truth, *args.soften) if args.soften else truth
-            noisy = at_white(under_noise(bench_raw.mosaiced(soft)), g)
+            if follow:
+                noisy = at_white(under_followed_noise(truth), g)
+            else:
+                soft = softened(truth, *args.soften) if args.soften else truth
+                noisy = at_white(under_noise(bench_raw.mosaiced(soft)), g)
             picture = cleaned(noisy)
             loss = loss + picture_loss(picture, truth)
             if teacher:
@@ -1295,10 +1351,11 @@ if __name__ == "__main__":
     parser.add_argument("--text", type=float, default=0, help="share of the joint crops with print laid into the truth")
     parser.add_argument(
         "--soften",
-        type=float,
-        nargs=2,
+        type=lambda word: word if word == "noise" else float(word),
+        nargs="+",
         metavar=("LOW", "HIGH"),
-        help="the joint crops' truth is blurred by between these px before it is sampled to a mosaic",
+        help="the joint crops' truth is blurred by between these px before it is sampled to a mosaic;"
+        " with the word noise after them, by more the stronger the noise laid over it",
     )
     parser.add_argument(
         "--smoothed", type=float, default=0, help="share of laid-over noise that a camera smoothed, the scene with it"
