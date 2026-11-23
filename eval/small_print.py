@@ -24,6 +24,17 @@ times, each a fraction of a pixel along (SHIFTS), and a line's score is the mean
 letters right: its length less the edits between what was typed and what was spelt, letters and
 digits only, capitals and small letters alike. "read" is the letters right over the letters there.
 
+The letters not read right are of two kinds, and a denoiser that draws print can trade one for the
+other: "missing" are the line's letters the reader did not spell at all, and "wrong" are the rest,
+where it spelt another letter in a letter's place or a letter where there is none. Of the ways to
+get from the typed line to the spelt one in the fewest edits, the one with the fewest letters
+missing is taken (edits). The three add up to the letters there.
+
+One reader's habits could pass for a model's, so a second one spells the same strips: EasyOCR's
+English recogniser (github.com/JaidedAI/EasyOCR, Apache 2.0), a different network trained by other
+people on other data, as "second", its letters right over the letters there. Where the two readers
+rank two models differently, say so; do not average them.
+
 Beside it, "kept" and "invented": quality.py's finest band, detail 2 to 3 px across, of the picture
 inside the lines' corners against the lined-up clean frame's, as quality.measure has them. kept is
 the share of the clean frame's strokes the picture holds and invented what else it holds there, over
@@ -34,7 +45,8 @@ own, and it leans toward a picture that went through demosaic.menon itself. So r
 models that make their picture the same way, at one ISO: detail on real noise, which the full-colour
 tests cannot give.
 
-Rows go to data/out/print.json as {test: {name: {ISO: [read, kept, invented]}}}, a test being "gr3x",
+Rows go to data/out/print.json as {test: {name: {ISO: [read, kept, invented, wrong, missing, second]}}},
+each a share of the letters there but kept and invented, a test being "gr3x",
 "gr3", "unseen" or "seen" as on the board, a group as the mean over its cameras, and each camera
 under its file's name. "noisy" is the frame as shot. "clean" is the camera's clean frame as it was
 cut, through demosaic.menon: one reading, the same at every ISO, of a picture with no noise in it. It
@@ -62,6 +74,7 @@ bfloat16, so compare rows made on the same machine.
 import functools
 import io
 import json
+import string
 import sys
 import urllib.request
 import zipfile
@@ -83,6 +96,10 @@ WHEEL = (
     "rapidocr_onnxruntime-1.4.4-py3-none-any.whl"
 )
 RECOGNISER = "rapidocr_onnxruntime/models/ch_PP-OCRv4_rec_infer.onnx"
+SECOND = bench_raw.BENCH / "print" / "second.pth"
+RELEASE = "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip"
+#: What the second reader spells with, after the blank between two letters, and how tall it takes a strip.
+LETTERS, TALL = string.digits + string.punctuation + " €" + string.ascii_uppercase + string.ascii_lowercase, 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 THREADS = 4
 HEIGHT, NARROWEST = 48, 320
@@ -224,11 +241,13 @@ def build(name, path, base, isos, reference):
 
 
 def fetch():
-    """PP-OCRv4's recogniser, out of RapidOCR's wheel on PyPI, beside the windows: the PC reads it from there."""
-    if not READER.exists():
-        READER.parent.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(WHEEL) as wheel:
-            READER.write_bytes(zipfile.ZipFile(io.BytesIO(wheel.read())).read(RECOGNISER))
+    """PP-OCRv4's recogniser, out of RapidOCR's wheel on PyPI, and EasyOCR's English one, out of its
+    releases on GitHub, beside the windows: the PC reads them from there."""
+    for file, source, packed in ((READER, WHEEL, RECOGNISER), (SECOND, RELEASE, "english_g2.pth")):
+        if not file.exists():
+            file.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(source) as archive:
+                file.write_bytes(zipfile.ZipFile(io.BytesIO(archive.read())).read(packed))
 
 
 def build_all(only=""):
@@ -279,27 +298,93 @@ def spelt(strip):
     return "".join(letters[i] for j, i in enumerate(columns) if i and (j == 0 or i != columns[j - 1]))
 
 
+class Lines(torch.nn.Module):
+    """EasyOCR's second-generation recogniser, layer for layer: a strip of grey (N, 1, TALL, W) through
+    seven convolutions to a column of features every 4 px, two LSTMs that run along the line both
+    ways, and each column's score for the blank and for each of LETTERS."""
+
+    def __init__(self, width=256):
+        super().__init__()
+        conv = lambda a, b, size=3, edge=1, **more: (torch.nn.Conv2d(a, b, size, padding=edge, **more), torch.nn.ReLU())
+        normed = lambda a, b: (conv(a, b, bias=False)[0], torch.nn.BatchNorm2d(b), torch.nn.ReLU())
+        pool = torch.nn.MaxPool2d
+        self.strokes = torch.nn.Sequential(
+            *conv(1, width // 8),
+            pool(2),
+            *conv(width // 8, width // 4),
+            pool(2),
+            *conv(width // 4, width // 2),
+            *conv(width // 2, width // 2),
+            pool((2, 1)),
+            *normed(width // 2, width),
+            *normed(width, width),
+            pool((2, 1)),
+            *conv(width, width, 2, 0),
+        )
+        along = lambda: (
+            torch.nn.LSTM(width, width, bidirectional=True, batch_first=True),
+            torch.nn.Linear(2 * width, width),
+        )
+        self.line = torch.nn.ModuleList([*along(), *along(), torch.nn.Linear(width, len(LETTERS) + 1)])
+
+    def forward(self, strip):
+        columns = self.strokes(strip).mean(2).transpose(1, 2)
+        for part in self.line:
+            columns = part(columns)[0] if isinstance(part, torch.nn.LSTM) else part(columns)
+        return columns
+
+
+@functools.cache
+def second():
+    """The second reader with EasyOCR's weights, which name their layers otherwise and hold them in this order."""
+    model = Lines()
+    model.load_state_dict(dict(zip(model.state_dict(), torch.load(SECOND, "cpu").values())))
+    return model.eval()
+
+
+@torch.no_grad()
+def spelt_again(strip):
+    """What the second reader reads in a strip, made TALL px tall and grey for it: spelt() by another network."""
+    wide = round(strip.shape[1] * TALL / HEIGHT)
+    grey = cv2.resize(cv2.cvtColor(strip, cv2.COLOR_RGB2GRAY), (wide, TALL), interpolation=cv2.INTER_CUBIC)
+    columns = second()(torch.from_numpy(grey)[None, None] / 127.5 - 1).argmax(2)[0].tolist()
+    return "".join(LETTERS[i - 1] for j, i in enumerate(columns) if i and (j == 0 or i != columns[j - 1]))
+
+
 def plain(text):
     return "".join(letter for letter in text.lower() if letter.isascii() and letter.isalnum())
 
 
-def right(typed, seen):
-    """How many of a line's letters were spelt: its length less the edits from one to the other, never under none."""
-    typed, row = plain(typed), list(range(len(plain(seen)) + 1))
+def edits(typed, seen):
+    """The fewest edits from a line as typed to what was spelt, and how many of them leave a letter of
+    the line unspelt: the fewest that so few edits can. The rest put another letter in a letter's
+    place or a letter where there is none."""
+    typed, seen = plain(typed), plain(seen)
+    row = [(j, 0) for j in range(len(seen) + 1)]
     for i, a in enumerate(typed, 1):
-        last, row[0] = row[0], i
-        for j, b in enumerate(plain(seen), 1):
-            last, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, last + (a != b))
-    return max(0, len(typed) - row[-1])
+        last, row[0] = row[0], (i, i)
+        for j, b in enumerate(seen, 1):
+            (above, lost), (beside, gone) = row[j], row[j - 1]
+            last, row[j] = row[j], min((above + 1, lost + 1), (beside + 1, gone), (last[0] + (a != b), last[1]))
+    return row[-1]
+
+
+def told(typed, seen):
+    """A line's letters as right, wrong and missing in what was spelt: its length less the edits, never
+    under none, is right; of the others, edits()'s unspelt letters are missing and the rest wrong."""
+    there, (changed, unspelt) = len(plain(typed)), edits(typed, seen)
+    right = max(0, there - changed)
+    return right, there - right - unspelt, unspelt
 
 
 def lettered(picture, thing, corners):
-    """The letters right in a printed thing's lines, each the mean over SHIFTS, and the letters there."""
-    hits = [
-        np.mean([right(text, spelt(strip)) for strip in strips(picture, line)])
+    """The letters of a printed thing's lines that are right, wrong and missing, and the letters the
+    second reader gets right, each line's the mean over SHIFTS, and after them the letters there."""
+    counts = [
+        np.mean([(*told(text, spelt(strip)), told(text, spelt_again(strip))[0]) for strip in strips(picture, line)], 0)
         for (text, _), line in zip(LINES[thing], corners)
     ]
-    return float(np.sum(hits)), sum(len(plain(text)) for text, _ in LINES[thing])
+    return np.array([*map(np.sum, zip(*counts)), sum(len(plain(text)) for text, _ in LINES[thing])])
 
 
 def strokes(picture, truth, corners):
@@ -331,8 +416,8 @@ def as_bytes(picture):
 
 
 def as_cut(things, picture):
-    """What the reader makes of each printed thing in a camera's clean frame as it was cut, through
-    demosaic.menon: {thing: (letters right, letters there)}."""
+    """What the readers make of each printed thing in a camera's clean frame as it was cut, through
+    demosaic.menon: {thing: lettered()'s counts}."""
     return {
         thing: lettered(as_bytes(picture(frames[:1], demosaic.menon)), thing, lines[0])
         for thing, (frames, _, lines) in things.items()
@@ -345,8 +430,8 @@ def weed(name):
     file = bench_raw.BENCH / "print" / f"{name}.npz"
     things, _, _, picture = opened(file)
     read = as_cut(things, picture)
-    poor = [thing for thing, (hit, size) in read.items() if hit < HALF * size]
-    print("   clean frame reads", *(f"{thing} {hit / size:.2f}" for thing, (hit, size) in read.items()), flush=True)
+    poor = [thing for thing, (hit, *_, size) in read.items() if hit < HALF * size]
+    print("   clean frame reads", *(f"{thing} {hit / size:.2f}" for thing, (hit, *_, size) in read.items()), flush=True)
     if poor:
         print("   left out", *poor, flush=True)
         kept = {key: value for key, value in np.load(file).items() if key.split("/")[0] not in poor}
@@ -396,12 +481,12 @@ def made_up(clean, shot, read, rng):
 
 @torch.no_grad()
 def scores(cleaners, file):
-    """{name: {ISO: [read, kept, invented]}} for one camera's windows: each cleaner on the real noisy
-    frame and, as "<name>-made", on the clean frame under made-up noise at that frame's levels; and
-    "clean", its clean frame as cut."""
+    """{name: {ISO: [read, kept, invented, wrong, missing, second]}} for one camera's windows: each
+    cleaner on the real noisy frame and, as "<name>-made", on the clean frame under made-up noise at
+    that frame's levels; and "clean", its clean frame as cut."""
     things, isos, means, picture = opened(file)
-    hit, size = np.sum(list(as_cut(things, picture).values()), 0)
-    rows = {"clean": {iso: [hit / size, 1.0, 0.0] for iso in isos}}
+    hit, wrong, missing, again, size = np.sum(list(as_cut(things, picture).values()), 0)
+    rows = {"clean": {iso: [hit / size, 1.0, 0.0, wrong / size, missing / size, again / size] for iso in isos}}
     sharp = {thing: picture(frames[:1], demosaic.menon) for thing, (frames, _, _) in things.items()}
     rng = torch.Generator().manual_seed(0)
     for k, (iso, mean, (shot, read)) in enumerate(zip(isos, means, np.load(file)["levels"].tolist())):
@@ -420,11 +505,15 @@ def scores(cleaners, file):
                     shown = picture(clean_up(frame, mean), way)
                     hits.append(lettered(as_bytes(shown), thing, corners))
                     together.append(strokes(shown, truth, corners))
-                (hit, size), (_, _, _, xx, xy, yy) = np.sum(hits, 0), torch.stack(together).sum(0).tolist()
+                hit, wrong, missing, again, size = np.sum(hits, 0)
+                _, _, _, xx, xy, yy = torch.stack(together).sum(0).tolist()
                 rows.setdefault(name + ending, {})[iso] = [
                     hit / size,
                     xy / yy,
                     (max(xx - xy**2 / yy, 0) / yy) ** 0.5,
+                    wrong / size,
+                    missing / size,
+                    again / size,
                 ]
     return rows
 
@@ -462,6 +551,13 @@ def main(specs):
             for model, by_iso in rows.items():
                 shown = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
                 print(f"{model:24}" + "".join(f"{f'{row[0]:.3f} {row[1]:.3f}':>14}" for row in shown), flush=True)
+            print(
+                f"\n{test}  letters wrong / letters missing / read by the second reader\n{'':24}"
+                + "".join(f"{head:>18}" for head in heads)
+            )
+            for model, by_iso in rows.items():
+                shown = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
+                print(f"{model:24}" + "".join(f"{' '.join(f'{part:.3f}' for part in row[3:]):>18}" for row in shown))
             print(
                 f"\n{test}  made less real, points of small print read\n{'':40}"
                 + "".join(f"{head:>9}" for head in heads)
