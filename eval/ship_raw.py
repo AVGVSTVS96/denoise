@@ -3,7 +3,7 @@
     uv run ship_raw.py data/models/raw/joint-v1/joint.pth      a finished run's weights
     uv run ship_raw.py data/models/raw/joint-v1/last.pth       a run still training: its averaged weights
     uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright      a model trained with --bright
-    uv run ship_raw.py data/models/raw/r12-soften/joint.pth bright crisp      a second model, beside the first
+    uv run ship_raw.py data/models/raw/r16-crisp/joint.pth bright crisp      a second model, beside the first
 
 The app packs a mosaic tile into four planes (R, G, G, B) and gets camera RGB at the mosaic's size
 back, so the file holds train_raw's fed() and made() around the network: the fixed mix to twelve
