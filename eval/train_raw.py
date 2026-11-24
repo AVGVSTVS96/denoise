@@ -141,6 +141,24 @@ trainer tells the offsets it drew (sat()) with that much error laid on them, mor
 two frames (slipped()), so the network trusts them as far as a line-up can be trusted. It is 12%
 more work for a picture. A run without it is what it was.
 
+--merged 8 is burst v2: the joint crops become bursts of one to that many frames, a step's crops all
+of one count, and the frames are lined up to a fraction of a pixel and merged outside the network,
+by merge.py, the code an app runs. The network is the joint one, given the merged mosaic as it is
+given one frame, with one layer beside its first (network(merged=True)) over what a mosaic cannot
+hold: the colours other frames measured where the reference has none, where the reference frame
+differs from the merge, and how much more was measured at each place (handed()). That layer starts
+at nothing, so the run starts as --init's model cleaning the merged mosaic, and one frame goes
+through the joint network's own layers and no other; the work for a picture is one frame's and a
+twenty-fifth, whatever the frames. A burst is made as --burst makes one (burst()), but as a hand holds a camera: a later frame
+sits up to HELD px off the reference and turned, by less the steadier the crop's burst was drawn,
+and the line-up has to find it. BAD of the later frames are bad ones, half of them up to ASTRAY px
+off and half smeared by SMEAR px, as a frame the hand moved in is: the reference is the sharpest,
+so a later frame is never the sharper. Patches move and later frames are noisier as in --burst.
+The merge is told each frame's noise levels as an app knows them, the laid ones up to MISTOLD stops
+out. In handed(), a place nothing measured holds its filled colour at weight HOLD, and MEASURED is
+where a mosaic measured each of the twelve planes. --teacher teaches --batch's crops alone, as with
+--burst. A run without it is what it was.
+
 --smoothed 0.25 makes that share of the frames under laid-over noise, of both kinds of crop, what a
 camera that smooths its raw files hands over: the noise is a row's of --levels' table whose noise
 is tied (tied()), mixed as --mixing mixes it, and the scene under it has been through that row's
@@ -234,6 +252,7 @@ import torch
 
 import bench_raw
 import evaluate
+import merge
 import raw_pairs
 import text_bank
 import text_reader
@@ -293,6 +312,8 @@ MOVING, PATCH, OFF = 0.5, (1 / 8, 1 / 2), (3, 12)
 #: two frames' noise together as strength() counts it, and the noise at which it is twice that: past
 #: there a line-up starts to miss (slip(), which burst.py slip measures up to the Ricohs' ISO 102,400).
 SLIP, FAILS = 1.0, 0.08
+MOST, HELD, BAD, ASTRAY, SMEAR, MISTOLD, HOLD = 8, 6.0, 0.15, 16.0, (0.7, 2.0), 0.5, 0.1
+MEASURED = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 #: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
 WINDOW, NEAR, READER = 256, 17, 0.055
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
@@ -313,9 +334,37 @@ def held(numbers, device):
     return torch.tensor(numbers, device=device)
 
 
-def network(width=32, joint=False, burst=1, apart=False):
+def network(width=32, joint=False, burst=1, apart=False, merged=False):
     from nafnet import CONFIGS, NAFNet
 
+    class Merged(NAFNet):
+        """The joint network for a burst merged outside it (merge.py), whatever its frames: the merged
+        mosaic's twelve planes through the joint network's own first layer, and beside it a layer,
+        "more", over what a mosaic cannot hold (handed()): the colours other frames measured where
+        the reference has none, where the reference frame differs from the merge, and how much more
+        was measured at each place than one frame measures. The picture is the merged mosaic's
+        planes plus what the body makes of the sum. With more at nothing it is the joint network on
+        the merged mosaic, and one frame has nothing for more, so its picture is the joint
+        network's, to the last digit. The work for a picture is one frame's and a twenty-fifth."""
+
+        def __init__(self):
+            super().__init__(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12)
+            self.more = torch.nn.Conv2d(36, width, 3, padding=1, bias=False)
+
+        def forward(self, planes):
+            merged = planes[:, :12]
+            x, skips = self.intro(merged) + self.more(planes[:, 12:]), []
+            for encoder, down in zip(self.encoders, self.downs):
+                x = encoder(x)
+                skips.append(x)
+                x = down(x)
+            x = self.middle_blks(x)
+            for decoder, up, skip in zip(self.decoders, self.ups, reversed(skips)):
+                x = decoder(up(x) + skip)
+            return self.ending(x) + merged
+
+    if merged:
+        return Merged()
     if burst == 1:
         return NAFNet(CONFIGS[f"nafnet-sidd-w{width}"], img_channel=12 if joint else 4)
 
@@ -368,7 +417,10 @@ def joint(model):
 
 
 def slots(model):
-    """How many frames of a burst a network takes: one, but for a burst network."""
+    """How many frames of a burst a network takes: one, but for a burst network, and MOST for one that
+    takes a merged burst, which has no slots to fill."""
+    if hasattr(model, "more"):
+        return MOST
     return 1 + model.others.in_channels // 12 if hasattr(model, "others") else 1
 
 
@@ -377,7 +429,7 @@ def shaped(state):
     told how far a burst's frames sit apart or not."""
     first, others = state["intro.weight"], state.get("others.weight")
     slots = 1 if others is None else 1 + others.shape[1] // 12
-    return network(first.shape[0], first.shape[1] == 12, slots, "apart.weight" in state)
+    return network(first.shape[0], first.shape[1] == 12, slots, "apart.weight" in state, "more.weight" in state)
 
 
 def trained(weights):
@@ -406,7 +458,43 @@ def several(state, burst, apart=False):
     return {"others.weight": empty(12), **({"apart.weight": empty(36)} if apart else {}), **state}
 
 
-def fed(model, mosaics, apart=None):
+def stacked(state):
+    """A joint model's weights as those of a network that takes a merged burst, which then gives that
+    model's picture of the merged mosaic: the layer for what a mosaic cannot hold starts at
+    nothing. Such a network's own weights stay as they are."""
+    first = state["intro.weight"]
+    return {"more.weight": first.new_zeros(first.shape[0], 36, *first.shape[2:]), **state}
+
+
+@torch.no_grad()
+def handed(mosaics, levels):
+    """What a network that takes a merged burst is given of bursts (N, frames, H, W), the reference
+    first, with each frame's shot and read noise, levels (frames, 2) or (N, frames, 2) on the
+    mosaics' scale: forty-eight planes (N, 48, H / 2, W / 2).
+
+    The frames are lined up and merged by merge.py, which gives each colour at every pixel a sum
+    and a weight. The first twelve planes are the merged mosaic's, spread as the joint network
+    takes one frame's (SPREAD): what a one-frame model would be given of the merge. The next
+    twelve are what the merge holds beyond a mosaic, each colour at each of a cell's four places
+    less that spread: the sum over the weight, with the spread colour held in at weight HOLD, so
+    a place nothing measured adds nothing and a place other frames measured adds what they found.
+    The next twelve are the reference frame's own planes less the merged mosaic's, where the merge
+    may have taken in something it should not. The last twelve are how much more was measured at
+    each place than one frame measures: the root of the weight, which is how many times less noise
+    is left there, less one where the mosaic has a sample.
+    """
+    with torch.autocast(mosaics.device.type, enabled=False):
+        mosaics = mosaics.float()
+        total, weight = merge.merged(mosaics, levels)
+        spread = lambda mosaic: torch.nn.functional.conv2d(pack(mosaic), held(SPREAD, mosaic.device)[:, :, None, None])
+        planes = spread(merge.mosaic(total, weight))
+        filled = torch.nn.functional.pixel_shuffle(planes, 2)
+        found = torch.nn.functional.pixel_unshuffle((total + HOLD * filled) / (weight + HOLD), 2)
+        more = torch.nn.functional.pixel_unshuffle(weight.sqrt(), 2) - held(MEASURED, mosaics.device).view(1, 12, 1, 1)
+        return torch.cat([planes, found - planes, spread(mosaics[:, 0]) - planes, more], 1)
+
+
+def fed(model, mosaics, apart=None, levels=None):
     """What a network takes of mosaics (N, H, W): their four planes, spread to twelve for a joint one.
 
     A burst network takes bursts (N, frames, H, W), the picked frame first, as each frame's twelve
@@ -416,10 +504,17 @@ def fed(model, mosaics, apart=None):
     frame's picture sits from the picked frame's, (N, later frames, 2, H / 2, W / 2) or one offset
     for a whole frame (N, later frames, 2, 1, 1), across then down, in colour cells, so half of
     what burst() and a line-up count in px. Left out, or for a slot past the frames given, it is nothing.
+    A network that takes a merged burst is given bursts as handed() makes them, with their frames'
+    noise levels, and mosaics as their twelve planes with nothing beside them.
     """
+    if hasattr(model, "more") and mosaics.dim() == 4:
+        return handed(mosaics, levels)
     planes = pack(mosaics)
     if not joint(model):
         return planes
+    if hasattr(model, "more"):
+        spread = torch.nn.functional.conv2d(planes, held(SPREAD, planes.device)[:, :, None, None])
+        return torch.cat([spread, spread.new_zeros(len(spread), 36, *spread.shape[-2:])], 1)
     if mosaics.dim() == 4 or slots(model) > 1:
         burst = planes.view(len(planes), -1, *planes.shape[-3:])
         slot = tuple(at * (at < burst.shape[1]) for at in range(slots(model)))
@@ -564,16 +659,18 @@ def slipped(apart, strong):
     return (apart + torch.randn(n, later, 2, 1, 1, device=apart.device) * size.view(n, later, 1, 1, 1)) / 2
 
 
-def burst(truth, frames, fewer=FEWER, uneven=UNEVEN, moving=MOVING):
+def burst(truth, frames, fewer=FEWER, uneven=UNEVEN, moving=MOVING, shake=SHAKE, bad=0.0):
     """Each crop of camera RGB (N, 3, H, H) as a burst of that many frames saw it, and the burst's draws.
 
     The picked frame comes first and sees the truth as it is. Each later frame sits off it and is
-    turned (shaken()), by up to a reach drawn per crop: from nothing, a burst on a table, to SHAKE
-    px either way and TURN radians, what is left of a hand's shake once a frame is lined up to
-    whole colour cells. In a share moving of the crops something moved: a patch, its sides between
-    PATCH of the crop's, sits between OFF px off in each later frame, each frame its own way. A
-    share fewer of the crops carry fewer frames than that, one up to all but one, and in a share
-    uneven each later frame is one to STEPS ISO steps noisier than the picked one.
+    turned (shaken()), by up to a reach drawn per crop: from nothing, a burst on a table, to shake
+    px either way and TURN radians: SHAKE is what is left of a hand's shake once a frame is lined
+    up to whole colour cells. A share bad of the later frames are bad ones, one half up to ASTRAY
+    px off and the other blurred by a width between SMEAR. In a share moving of the crops
+    something moved: a patch, its sides between PATCH of the crop's, sits between OFF px off in
+    each later frame, each frame its own way. A share fewer of the crops carry fewer frames than
+    that, one up to all but one, and in a share uneven each later frame is one to STEPS ISO steps
+    noisier than the picked one.
 
     Returns the frames (N * frames, 3, H, H), a crop's one after another; how many ISO steps noisier
     each is (N, frames); which of a crop's slots are empty (N, frames); where its patch is
@@ -585,7 +682,10 @@ def burst(truth, frames, fewer=FEWER, uneven=UNEVEN, moving=MOVING):
     later = n * (frames - 1)
     draw = lambda *shape: torch.rand(*shape, device=device)
     still, reach = truth.repeat_interleave(frames - 1, 0), draw(n, 1).repeat_interleave(frames - 1, 0)
-    move, turn = (draw(later, 2) * 2 - 1) * SHAKE * reach, (draw(later) * 2 - 1) * TURN * reach[:, 0]
+    move, turn = (draw(later, 2) * 2 - 1) * shake * reach, (draw(later) * 2 - 1) * TURN * reach[:, 0]
+    if bad:
+        spoilt = draw(later)
+        move = torch.where(spoilt[:, None] < bad / 2, (draw(later, 2) * 2 - 1) * ASTRAY, move)
     way, far = draw(later) * 2 * math.pi, OFF[0] + draw(later) * (OFF[1] - OFF[0])
     off = torch.stack([way.cos(), way.sin()], 1) * far[:, None]
     sides = (PATCH[0] + draw(n, 2) * (PATCH[1] - PATCH[0])) * side
@@ -596,6 +696,9 @@ def burst(truth, frames, fewer=FEWER, uneven=UNEVEN, moving=MOVING):
     seen = torch.where(
         patch.repeat_interleave(frames - 1, 0), shaken(still, move + off, turn), shaken(still, move, turn)
     )
+    if bad:
+        smeared = ((spoilt >= bad / 2) & (spoilt < bad)).view(-1, 1, 1, 1)
+        seen = torch.where(smeared, softened(seen, *SMEAR), seen)
     seen = torch.cat([truth[:, None], seen.view(n, frames - 1, *truth.shape[1:])], 1).flatten(0, 1)
     given = torch.where(draw(n) < fewer, torch.randint(1, frames, (n,), device=device), frames)
     steps = torch.randint(1, STEPS + 1, (n, frames), device=device) * (draw(n, 1) < uneven)
@@ -667,21 +770,24 @@ def cleaner(model, tiled=False):
     """bench_raw.score's view of a model: mosaics (N, H, W) in, scaled by their photo's mean, and out
     cleaned mosaics, or camera RGB (N, 3, H, W) from a joint model. With tiled each mosaic gets the
     gain denoise() gives a tile. Bursts (N, frames, H, W) go in as mosaics do, the picked frame first,
-    and with them, for a network that is told it, how far their later frames sit apart (fed())."""
+    and with them, for a network that is told it, how far their later frames sit apart (fed()), or,
+    for one that takes a merged burst, their frames' noise levels (frames, 2) on the mosaics' scale."""
 
-    def at(mosaics, gain, apart=None):
+    def at(mosaics, gain, apart=None, levels=None):
         offsets = [None] * len(mosaics) if apart is None else apart.split(8)
+        known = None if levels is None else torch.as_tensor(levels, dtype=torch.float32) * torch.tensor([gain, gain**2])
         with torch.autocast("cuda", torch.bfloat16):
             parts = [
-                made(model, model(fed(model, part * gain, off)).float()) for part, off in zip(mosaics.split(8), offsets)
+                made(model, model(fed(model, part * gain, off, known)).float())
+                for part, off in zip(mosaics.split(8), offsets)
             ]
         return torch.cat(parts) / gain
 
-    def clean_up(mosaics, mean, apart=None):
+    def clean_up(mosaics, mean, apart=None, levels=None):
         gain = min(max(LEVEL / mean, 1), MAX_GAIN)
         if tiled:
             return torch.cat([at(tile[None], tile_gain(tile, gain)) for tile in mosaics])
-        return at(mosaics, gain, apart)
+        return at(mosaics, gain, apart, levels)
 
     return clean_up
 
@@ -717,7 +823,7 @@ def bright(clean_up):
 
 
 @torch.no_grad()
-def denoise(model, mosaic, tile=1024, overlap=64, window=None, apart=None):
+def denoise(model, mosaic, tile=1024, overlap=64, window=None, apart=None, levels=None):
     """A whole normalised RGGB mosaic (H, W float32 numpy) through the model, in overlapping tiles.
 
     The photo's mean sets the gain, as a crop's does in training, and tile_gain() holds it down for a
@@ -726,7 +832,9 @@ def denoise(model, mosaic, tile=1024, overlap=64, window=None, apart=None):
     Returns the cleaned mosaic, or camera RGB (3, H, W) from a joint model. With window (y, x, height,
     width) only the tiles that reach it run and only it comes back, the same pixels the whole photo gives.
     A burst (frames, H, W) goes through as a photo does, on the picked frame's gains, the picked frame first,
-    with apart (later frames, 2, H / 2, W / 2) for a network that is told how far its frames sit apart (fed()).
+    with apart (later frames, 2, H / 2, W / 2) for a network that is told how far its frames sit apart (fed()),
+    or with levels (frames, 2), each frame's shot and read noise, for one that takes a merged burst, which
+    is then lined up and merged a tile at a time.
     """
     picked, sides = mosaic.reshape(-1, *mosaic.shape[-2:])[0], [(0, 0)] * (mosaic.ndim - 2) + [(overlap, overlap)] * 2
     top, left, height, width = window or (0, 0, *picked.shape)
@@ -749,8 +857,11 @@ def denoise(model, mosaic, tile=1024, overlap=64, window=None, apart=None):
             near = (
                 None if told is None else told[None, ..., y // 2 : (y + tile) // 2, x // 2 : (x + tile) // 2].to(device)
             )
+            known = (
+                None if levels is None else torch.as_tensor(levels, dtype=torch.float32) * torch.tensor([own, own**2])
+            )
             with torch.autocast("cuda", torch.bfloat16):
-                result = made(model, model(fed(model, shown, near)).float())[0].cpu().numpy()
+                result = made(model, model(fed(model, shown, near, known)).float())[0].cpu().numpy()
             out[..., y : y + tile, x : x + tile] += result / own * fade
             weight[y : y + tile, x : x + tile] += fade
     kept = slice(top + overlap, top + overlap + height), slice(left + overlap, left + overlap + width)
@@ -1400,10 +1511,16 @@ def main(args):
         raise SystemExit("--burst gives the joint crops several frames, for a --joint run")
     if args.apart and args.burst == 1:
         raise SystemExit("--apart tells the network how far a burst's frames sit apart, for a run with --burst")
-    model = network(args.width, bool(args.joint), args.burst, args.apart).cuda().to(memory_format=torch.channels_last)
+    if args.merged and not (args.joint and args.burst == 1):
+        raise SystemExit(
+            "--merged merges the joint crops' frames outside the network, for a --joint run without --burst"
+        )
+    model = network(args.width, bool(args.joint), args.burst, args.apart, bool(args.merged))
+    model = model.cuda().to(memory_format=torch.channels_last)
     if args.init:
         state = torch.load(args.init, map_location="cpu")
         state = widened(state) if args.joint and state["intro.weight"].shape[1] == 4 else state
+        state = stacked(state) if args.merged else state
         model.load_state_dict(several(state, args.burst, args.apart) if args.burst > 1 else state)
     else:
         sidd = torch.load(evaluate.MODELS / f"NAFNet-SIDD-width{args.width}.pth", map_location="cpu")["params"]
@@ -1500,23 +1617,31 @@ def main(args):
         each = (lambda values: values) if steps is None else (lambda values: values.repeat_interleave(frames, 0))
         of = (lambda row, fields=None: row) if steps is None else (lambda row, fields=None: framed(row, steps, fields))
         row = of(drawn(n, device, levels, rows))
-        laid, strong = made_up_noise(under(row), row, args.offsets, args.tails, darks), strength(row)
+        figures = lambda row: torch.stack([row["shot"].mean(1), (row["read"] ** 2).mean(1)], 1)
+        laid, strong, known = (
+            made_up_noise(under(row), row, args.offsets, args.tails, darks),
+            strength(row),
+            figures(row),
+        )
         if bank:
             real = torch.rand(n, 1, 1, device=device) < share
             row = of(bank_drawn(n, clean.shape[-1], bank), bank[0])
             laid = torch.where(each(real), bank_noise(under(row), row, args.offsets), laid)
             strong = torch.where(each(real).view(-1), strength(row), strong)
+            known = torch.where(each(real).view(-1, 1), figures(row), known)
         if cameras:
             row = of(drawn(n, device, cameras, 1) | {"smoothed": torch.rand(n, device=device)})
             smooth = torch.rand(n, 1, 1, device=device) < args.smoothed
             laid = torch.where(each(smooth), made_up_noise(under(row), row, args.offsets, args.tails, darks), laid)
             strong = torch.where(each(smooth).view(-1), strength(row), strong)
+            known = torch.where(each(smooth).view(-1, 1), figures(row), known)
         if body:
             mine = torch.rand(n, 1, 1, device=device) < body_share
             row = of(dark_drawn(n, clean.shape[-1], body), body[0])
             laid = torch.where(each(mine), dark_noise(under(row), row), laid)
             strong = torch.where(each(mine).view(-1), strength(row), strong)
-        return laid, strong
+            known = torch.where(each(mine).view(-1, 1), figures(row), known)
+        return laid, strong, known
 
     def noisy_of(scene, steps=None):
         frames = 1 if steps is None else steps.shape[1]
@@ -1529,9 +1654,10 @@ def main(args):
     def at_white(noisy, gain):
         return torch.minimum(noisy, gain) if args.bright else noisy
 
-    def cleaned(noisy, apart=None):
+    def cleaned(noisy, apart=None, levels=None):
         with torch.autocast("cuda", torch.bfloat16):
-            return made(model, compiled(fed(model, noisy, apart).contiguous(memory_format=torch.channels_last)).float())
+            given = fed(model, noisy, apart, levels).contiguous(memory_format=torch.channels_last)
+            return made(model, compiled(given).float())
 
     @torch.no_grad()
     def taught(by, noisy):
@@ -1577,17 +1703,25 @@ def main(args):
                 truth = torch.cat([laid, truth[printed:]])
             g = gains(bench_raw.mosaiced(truth), args.bright)
             truth = truth * g[:, None]
+            count = lot.randint(1, args.merged) if args.merged else 1
+            known = None
             if args.burst > 1:
                 seen, steps, empty, _, apart = burst(truth, args.burst)
-                noisy, strong = noisy_of(seen, steps)
+                noisy, strong, _ = noisy_of(seen, steps)
                 noisy = noisy.view(len(truth), args.burst, *truth.shape[-2:])
                 noisy = at_white(torch.where(empty[:, :, None, None], noisy[:, :1], noisy), g[:, None])
                 told = slipped(apart, strong.view(len(truth), -1)) if args.apart else None
+            elif count > 1:
+                seen, steps, _, _, _ = burst(truth, count, fewer=0, shake=HELD, bad=BAD)
+                noisy, _, known = noisy_of(seen, steps)
+                noisy, told = at_white(noisy.view(len(truth), count, *truth.shape[-2:]), g[:, None]), None
+                out = torch.empty(len(truth), 1, 1, device=truth.device).uniform_(-MISTOLD, MISTOLD)
+                known = known.view(len(truth), count, 2) * 2**out
             else:
                 noisy, told = at_white(noisy_of(truth)[0], g), None
-            picture = cleaned(noisy, told)
+            picture = cleaned(noisy, told, known)
             loss = loss + picture_loss(picture, truth)
-            if teacher and args.burst == 1:
+            if teacher and args.burst == 1 and not args.merged:
                 loss = loss + args.distil * picture_loss(picture, taught(teacher, noisy))
             if args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
@@ -1771,6 +1905,9 @@ if __name__ == "__main__":
     parser.add_argument("--burst", type=int, default=1, help="frames of one scene the joint crops give the network")
     parser.add_argument(
         "--apart", action="store_true", help="the network is told how far each later frame of a burst sits off"
+    )
+    parser.add_argument(
+        "--merged", type=int, default=0, help="the joint crops are bursts of up to this many frames, merged by merge.py"
     )
     parser.add_argument("--night", action="store_true", help="SID's long exposures train too, the split night")
     parser.add_argument(
