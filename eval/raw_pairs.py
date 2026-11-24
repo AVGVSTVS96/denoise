@@ -23,6 +23,16 @@ lowest ISO against each of its high ones, on a tripod. Most of a site's cameras 
 ladder brings few crops, and Imaging Resource's still life stays out whole, as the test. They are
 review samples, for research runs only.
 
+SID's long exposures (Chen et al., 2018) are night scenes, which training has few of: a Sony A7S II
+on a tripod for 10 or 30 s, streets under lamps and dim rooms. They are SID's truth, not clean
+frames: each was shot at its dark twin's ISO, up to 25,600, where the sensor holds 600 electrons at
+white. So only those at ISO 2,000 or less are taken, 7,500 electrons at white and more, as clean
+as the other clean frames are let in. Left out as well: the scenes bench_raw.py's night test is cut
+from, and SID's own test split, whose numbers start with 1, so a score by SID's protocol stays
+honest. They are their own split, night, which trains only when asked (train_raw.py --night).
+
+    uv run raw_pairs.py 1 0 sid          from data/sid/long, which is Sony/long of SID's Sony2025.zip
+
 A frame that turns out too noisy or not Bayer leaves <scene>.skip with its ISO and camera, so no
 worker fetches it twice.
 
@@ -70,6 +80,7 @@ BIG = DATA / "rawbig"
 NIGHT = DATA / "night-raw"
 OWN = DATA / "own" / "paths.txt"
 LADDERS = DATA / "ladders"
+SID = DATA / "sid" / "long"
 SITES = {"ir": "Imaging Resource", "pb": "Photography Blog", "epz": "ePHOTOzine", "dpreview": "DPReview"}
 #: Cameras no scene of which trains, by a part of their name on any site: bench_raw.py's unseen cameras.
 HELD_OUT = ("gr-iiix", "eos-r6", "z6-ii", "a7-iv", "a6400", "e-m1-mark-iii", "pentax-k-1", "rx100-vii", "nx500")
@@ -206,12 +217,12 @@ def offsets(clean, noisy):
     return at
 
 
-def resampled(clean, y, x, dx, dy):
+def resampled(clean, y, x, dx, dy, height=CROP, width=CROP):
     """The clean crop at (y, x) as a frame (dx, dy) sensor pixels off shows it, each colour plane on its own.
 
     Lanczos reads MARGIN pixels past the crop's edge.
     """
-    region = clean[y - MARGIN : y + CROP + MARGIN, x - MARGIN : x + CROP + MARGIN]
+    region = clean[y - MARGIN : y + height + MARGIN, x - MARGIN : x + width + MARGIN]
     out = np.empty_like(region)
     move = np.float32([[1, 0, dx / 2], [0, 1, dy / 2]])
     for i in range(2):
@@ -221,6 +232,33 @@ def resampled(clean, y, x, dx, dy):
                 plane, move, plane.shape[::-1], flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT
             )
     return out[MARGIN:-MARGIN, MARGIN:-MARGIN]
+
+
+def apart(clean, twin):
+    """The (dx, dy) sensor pixels resampled() moved a clean crop by to make its twin, read back from the two.
+
+    A moved plane's spectrum is the still one's with every frequency's phase turned in step with the
+    move, so the move is the slope of the phase between them: fitted over the lower half of the
+    frequencies, where no move of a pixel or less turns it all the way round, each frequency weighed
+    by how much of it both hold, and the four colour planes together. Each plane loses its mean and
+    fades out towards its edges first, which do not meet round the back as a spectrum takes them to.
+    A crop with nothing in it, blown to white all over, says no move.
+    """
+    side = clean.shape[0] // 2
+    fade = np.outer(np.hanning(side), np.hanning(side))
+    spectrum = lambda plane: np.fft.fft2((plane - plane.mean()) * fade)
+    planes = [(slice(i, None, 2), slice(j, None, 2)) for i in range(2) for j in range(2)]
+    both = sum(
+        spectrum(twin[plane].astype(np.float64)) * spectrum(clean[plane].astype(np.float64)).conj() for plane in planes
+    )
+    along = np.fft.fftfreq(side)
+    low = np.abs(along) < 0.25
+    weight = np.abs(both) * np.outer(low, low)
+    across, down = np.meshgrid(along, along)
+    waves = np.stack([across, down]) * weight
+    firm = waves.reshape(2, -1) @ np.stack([across, down]).reshape(2, -1).T
+    slope = np.linalg.lstsq(firm, (waves * np.angle(both)).sum((1, 2)), rcond=None)[0]
+    return tuple((-slope / np.pi).tolist())
 
 
 def corners(clean, rng, count, side=CROP):
@@ -524,17 +562,28 @@ def ladder_scenes():
         yield f"ladder-{site}-{camera}-{scene}", lambda c=clean: c, noisy, meta
 
 
+def sid_scenes():
+    for path in sorted(SID.glob("*.ARW")):
+        scene = path.name[:5]
+        if scene[0] != "1" and not (NIGHT / "pairs" / f"sid-sony-{scene}").exists():
+            meta = {"source": "SID", "license": "research", "crops": 12, "clean_iso": 2000}
+            yield f"sid-{scene}", lambda p=path: p, [], meta
+
+
 SOURCES = {
     "pairs": lambda: [*local_scenes(), *rawnind_scenes()],
     "raise": raise_scenes,
     "pixls": pixls_scenes,
     "own": own_scenes,
     "ladders": ladder_scenes,
+    "sid": sid_scenes,
 }
 
 
 def split(name):
-    """About one RawNIND scene in ten is kept out of training to watch for overfitting."""
+    """About one RawNIND scene in ten is kept out of training to watch for overfitting, and SID's are their own split."""
+    if name.startswith("sid-"):
+        return "night"
     return "val" if name.startswith("rawnind-") and hashlib.sha1(name.encode()).digest()[0] % 10 == 0 else "train"
 
 

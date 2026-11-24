@@ -6,7 +6,8 @@
 A row is one noisy frame against its camera's lowest ISO. Per colour plane: shot and read noise, the
 black offset, how long the read noise's tails are (a Tukey lambda: 0.14 is a bell curve, lower is
 longer) and the kurtosis of all the noise in the shadows that it was fitted to. For the frame: row
-banding and the raw's rounding step. All in the noisy frame's own units, black-subtracted
+banding, the raw's rounding step, and how far the noise of neighbouring pixels moves together, which a
+camera that smooths its raw files leaves behind. All in the noisy frame's own units, black-subtracted
 over the white level, as noise_bank.py's are. The cameras bench_raw.py tests on stay out, as they do
 in raw_pairs.py.
 """
@@ -30,6 +31,8 @@ BINS = 24
 LAMBDAS = np.linspace(-0.2, 0.5, 141)
 KURTOSIS = scipy.stats.tukeylambda.stats(LAMBDAS, moments="k") + 3
 BELL = 0.14
+FLATTEST = 0.15
+FAR, SCENE = 3, 0.05
 
 
 def blocks(plane, side=BLOCK):
@@ -64,6 +67,12 @@ def step(plane):
     return float(np.median(gaps))
 
 
+def exposed(truth, plane):
+    """The blocks of a colour plane that are neither black nor clipped."""
+    mean = blocks(truth).mean((1, 2))
+    return (mean > 0.0005) & (mean < 0.6) & (blocks(plane).max((1, 2)) < 0.9)
+
+
 def flat(truth, plane):
     """A colour plane where the clean one is flat, in 16 px blocks: their brightness, and what is left of them.
 
@@ -74,7 +83,7 @@ def flat(truth, plane):
     smooth = blocks(cv2.GaussianBlur(truth, (0, 0), 1.5))
     mean = blocks(truth).mean((1, 2))
     busy = smooth.std((1, 2)) / (mean + 0.002)
-    usable = (mean > 0.0005) & (mean < 0.6) & (blocks(plane).max((1, 2)) < 0.9)
+    usable = exposed(truth, plane)
     if usable.sum() < 16 * BINS:
         raise ValueError("too few blocks that are neither black nor clipped")
     keep = usable & (busy < np.percentile(busy[usable], 25))
@@ -120,6 +129,33 @@ def plane_levels(truth, plane, share):
     }
 
 
+def together(clean, noisy, gains):
+    """How far the noise of neighbouring pixels moves together, as correlations: red's and blue's with the
+    green beside it, and each colour plane's with its next pixel of the same colour across and down.
+
+    Over the flattest blocks of the clean frame that no colour is black or clipped in, each block of
+    the noisy frame less the clean one centred on its own mean, so neither the scene nor a black
+    offset counts as noise. Nothing for a frame with too few such blocks, and nothing for one whose
+    blocks still hold the scene, a frame that sits a part of a pixel off its clean one or was lit
+    another way: a camera's smoothing reaches two pixels of a colour at most, and the scene shows as
+    pixels FAR apart still moving together by more than SCENE.
+    """
+    twins, planes = ([frame[i::2, j::2] for i, j in SITES] for frame in (clean, noisy))
+    usable = np.all([exposed(twin, plane) for twin, plane in zip(twins, planes)], 0)
+    if usable.sum() < 16 * BINS:
+        return {}
+    left = [blocks(plane - gain * twin) for plane, twin, gain in zip(planes, twins, gains)]
+    busy = sum(blocks(twins[plane]).std((1, 2)) for plane in (0, 1, 3))
+    flattest = usable & (busy <= np.quantile(busy[usable], FLATTEST))
+    red, green, other, blue = noise = [part[flattest] - part[flattest].mean((1, 2), keepdims=True) for part in left]
+    alike = lambda a, b: float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
+    across = lambda apart: [alike(plane[:, :, :-apart], plane[:, :, apart:]) for plane in noise]
+    down = lambda apart: [alike(plane[:, :-apart], plane[:, apart:]) for plane in noise]
+    if max(across(FAR) + down(FAR)) > SCENE:
+        return {}
+    return {"beside": [alike(red, green), alike(blue, other)], "across": across(1), "down": down(1)}
+
+
 def measure(clean, noisy, share=1.0):
     """A noisy frame's row, or None when it sits too far from the clean one to compare."""
     dx, dy = raw_pairs.shift_between(clean, noisy)
@@ -130,6 +166,7 @@ def measure(clean, noisy, share=1.0):
     clean, noisy = clean[edge : h - edge, edge : w - edge], noisy[edge + dy : h - edge + dy, edge + dx : w - edge + dx]
     planes = [plane_levels(clean[i::2, j::2], noisy[i::2, j::2], share) for i, j in SITES]
     row = {key: [plane[key] for plane in planes] for key in ("shot", "read", "offset", "tail", "kurtosis", "gain")}
+    row |= together(clean, noisy, row["gain"])
     banding = lambda key: float(np.sqrt(max(np.mean([plane[key] for plane in planes]), 0)))
     return row | {
         "row": banding("row"),

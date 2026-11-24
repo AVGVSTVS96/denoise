@@ -45,10 +45,73 @@ classical one (demosaic.py), white-balanced first. Its "unseen" cameras are the 
 no real noise either: a real noisy frame has no full-colour truth at its own size.
 
     uv run bench_raw.py colour                                         cut only those, into data/bench/colour
+
+"shift" is a full-colour test that was not built our way: PixelShift200's five test scenes, a Sony
+A7R III's, with every colour measured at every pixel by four shots a pixel apart (pixel_shift.py).
+Its truth is at the sharpness the lens gave, where full_colour's is binned and twice as sharp, and
+neither we nor a rival made it. The noise is made up as the "<test>-colour" tests make theirs, at
+the levels measured on the same camera's still life, and it is scored as they are.
+
+    uv run bench_raw.py shift                                          cut only those
+
+A full-colour test also says how much of the truth's fine detail a result holds and how much it made
+up, with no network to judge by (detail): a run that trains on LPIPS is not picked by LPIPS. Its rows
+carry six numbers after PSNR and LPIPS: the detail kept, the detail invented, the grain in flat areas
+and the truth's own, both in 8-bit levels, and the error spectrum's peak and its highest value at the
+two-pixel limit, each over its median: the two are the same number when a two-pixel pattern is the
+largest thing wrong.
+
+PSNR folds noise and detail into one number that hardly moves, so every model scored also gets
+quality.py's numbers, which a person can picture, in data/out/quality.json: its rows are
+[noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented, texture kept,
+texture wrong] by ISO, under the board's test names. Noise left is what is left where the truth is
+flat, as the eye weighs it at 2x, in 8-bit levels, and stops cleaner is the same against the noisy
+frame's. Detail kept is the share of the truth's detail the result holds where the truth is busy, and
+invented what else it holds there; the finest is the band 2 to 3 px across, where small print lives.
+Texture kept and texture wrong are that band's kept and invented where the truth has fine detail and
+no hard edge (quality.texture): cloth and grain, which a model can paint flat while detail kept stays
+high. They are read on the real noisy frames and on shift, between models on one test. All of it is
+of the picture a model makes itself, a mosaic through the bilinear demosaic. "gr3", "gr3x", "unseen" and
+"seen" are the real noisy frames against their clean twins: read noise there, on real noise, and not
+detail, since a twin is no sharper than the result. "<test>-colour" and "shift" are the full-colour
+tests: read detail there, under made-up noise.
+
+    uv run bench_raw.py quality joint-v2=data/models/raw/joint-v2/joint.pth      those numbers alone
+
+"night" is the test of what the model is for: data/night-raw's dark scenes, ELD's, SID's Sony ones
+and RawNIND's, each a real noisy frame against a long exposure, 8 windows a pair. Its windows are in
+the noisy frame's own units, the ones denoise() meets, with the clean frame brought to them by the
+gains raw_pairs.match fitted, so a model runs at the gain denoise() gives the photo and its tiles.
+A pair scores twice: "night" with the noisy frame's black offset fitted from the clean one and taken
+off, and "night-as-shot" with it left on; the gap is what a black offset costs at that gain. Both
+sides stop at the lower of the two frames' white levels, since a long exposure clips lamps its short
+one holds. Rows are by the gain the photo needs to reach train_raw.LEVEL, named by the least of each
+range in GAINS: under 2, 2 to 8, 8 to 64, and over 64, which is past what the model takes. Some pairs
+are scenes built for training too (raw_pairs.py's night-<pair> and rawnind-<scene>): those score
+apart, as "night-trained", whichever run is scored. data/bench/night/held.json names every pair's
+scene, for train_raw.py --held to leave out; a run that does has still started from weights that met them.
+Each pair's own scores go to data/out/night.json, as [PSNR, LPIPS, as-shot PSNR, as-shot LPIPS].
+
+    uv run bench_raw.py night                                          cut its windows, into data/bench/night
+
+"<test>-colour-tiles" asks whether the same pixels come out the same in another tile or at another
+gain, on the full-colour tests cut again as 2 windows of 1,024 px a camera, the app's tile: a row is
+the PSNR of each window cleaned as one tile, as four tiles of 512 px, and as one tile at half and at
+double the gain, all on the same pixels, EDGE in from every 512 px tile's sides. Those rows are four
+PSNRs, not a PSNR and an LPIPS, so they go to data/out/tiles.json and stay off the scoreboard, and
+the check costs four passes over its windows, so it runs when asked for by name.
+
+    uv run bench_raw.py tiles                                          cut those windows, into data/bench/wide
+    uv run bench_raw.py tiles joint-v2=data/models/raw/joint-v2/joint.pth
+
+"colour", "shift", "night" or "quality" before the models scores that alone:
+
+    uv run bench_raw.py night joint-v2=data/models/raw/joint-v2/joint.pth
 """
 
 import functools
 import json
+import math
 import sys
 
 import cv2
@@ -57,6 +120,8 @@ import rawpy
 import torch
 
 import blacks
+import pixel_shift
+import quality
 import raw_pairs
 
 BENCH = raw_pairs.DATA / "bench"
@@ -64,6 +129,7 @@ CAMERAS = {"gr3": "ricoh-gr-iii--GR3hSLI{:06d}NR0.DNG", "gr3x": "ricoh-gr-iiix--
 ISOS = (3200, 6400, 12800, 25600, 51200, 102400)
 WINDOWS = 32
 STILL_LIFES = raw_pairs.LADDERS / "ir"
+SHIFT_LADDER = STILL_LIFES / "sony-alpha-ilce-a7r-iii" / "sli"
 XYZ_FROM_SRGB = np.array(
     [[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]],
     np.float32,
@@ -88,6 +154,11 @@ SEEN = [
 ]
 #: Pixels dropped from each side of a window before scoring, where a model has no neighbours to look at.
 EDGE = 16
+PAIRS = raw_pairs.NIGHT / "pairs"
+NIGHT_WINDOWS = 8
+GAINS = (1, 2, 8, 64)
+WIDE_WINDOWS = 2
+FINE, FLATTEST = 1.5, 0.3
 
 
 def groups():
@@ -285,7 +356,7 @@ def as_mosaic(clean_up):
     return lambda mosaics, mean: mosaiced(clean_up(mosaics, mean))
 
 
-def build_colour(name, path, base, isos, count):
+def build_colour(name, path, base, isos, count, side=raw_pairs.CROP, folder="colour"):
     """Windows whose truth is full colour: the lowest ISO frame binned (full_colour), and its mosaic under noise."""
     full = raw_pairs.mosaic(path(base))
     if full is None or not isos:
@@ -293,12 +364,12 @@ def build_colour(name, path, base, isos, count):
     truth = full_colour(torch.from_numpy(full)[None])
     truth = truth[..., : truth.shape[-2] // 2 * 2, : truth.shape[-1] // 2 * 2]
     clean = mosaiced(truth)[0].numpy()
-    picks = raw_pairs.corners(clean, np.random.default_rng(0), count)
-    cut = lambda frame: np.stack([frame[..., y : y + raw_pairs.CROP, x : x + raw_pairs.CROP] for y, x in picks])
+    picks = raw_pairs.corners(clean, np.random.default_rng(0), count, side)
+    cut = lambda frame: np.stack([frame[..., y : y + side, x : x + side] for y, x in picks])
     frames, means = under_noise(name, clean, full, path, isos, cut)
     wb, matrix = colour(path(base))
     save(
-        f"colour/{name}",
+        f"{folder}/{name}",
         truth=cut(truth[0].numpy()).astype(np.float16),
         frames=np.stack(frames).astype(np.float16),
         means=means,
@@ -321,6 +392,128 @@ def build_colours():
         build_colour(f"seen--{folder.parent.name}", *ladder(folder), WINDOWS // 4)
     for folder in held_out():
         build_colour(f"unseen--{folder.parent.name}-{folder.name}", *ladder(folder), WINDOWS // 4)
+
+
+def build_shifts():
+    """The shift test's windows: each of pixel_shift.TEST's scenes as measured, and its mosaic under the camera's noise.
+
+    A window where something moved between the four shots is left out (pixel_shift.still).
+    """
+    path, base, isos = ladder(SHIFT_LADDER)
+    full = raw_pairs.mosaic(path(base))
+    for scene in pixel_shift.TEST:
+        picture, apart = pixel_shift.measured(scene)
+        ratios = pixel_shift.moved(picture, apart, raw_pairs.tags(pixel_shift.shot(scene))["iso"])
+        clean = mosaiced(torch.from_numpy(picture)[None])[0].numpy()
+        found = raw_pairs.corners(clean, np.random.default_rng(0), WINDOWS // 2)
+        picks = [(y, x) for y, x in found if pixel_shift.still(ratios, y, x)]
+        cut = lambda frame: pixel_shift.cut(frame, picks)
+        frames, means = under_noise(f"shift {scene}", clean, full, path, isos, cut)
+        wb, matrix = colour(pixel_shift.shot(scene))
+        save(
+            f"shift--{SHIFT_LADDER.parent.name}-{scene}",
+            truth=cut(picture).astype(np.float16),
+            frames=np.stack(frames).astype(np.float16),
+            means=means,
+            wb=wb,
+            matrix=matrix,
+            isos=isos,
+        )
+
+
+def build_wide():
+    """The full-colour tests again as windows of the app's tile, for tiles()."""
+    wide = WIDE_WINDOWS, raw_pairs.WIDE, "wide"
+    for camera in CAMERAS:
+        build_colour(camera, ricoh(camera), 100, ISOS, *wide)
+    for folder in groups()["seen"]:
+        build_colour(f"seen--{folder.parent.name}", *ladder(folder), *wide)
+    for folder in held_out():
+        build_colour(f"unseen--{folder.parent.name}-{folder.name}", *ladder(folder), *wide)
+
+
+def scene(pair):
+    """The training scene raw_pairs.py makes of a night pair: RawNIND's under the pair's name, the others' night-<pair>."""
+    return pair if pair.startswith("rawnind-") else f"night-{pair}"
+
+
+def trains(pair):
+    """Whether a night pair's scene was built for training. One whose noisy frames have no clean twins
+    counts too: today's runs leave it out, and the runs they started from drew from it."""
+    built = raw_pairs.OUT / f"{scene(pair)}.json"
+    return built.exists() and json.loads(built.read_text())["split"] == "train"
+
+
+def build_night(folder):
+    """A night pair's windows, cut as raw_pairs.build cuts a training pair's and left in the noisy frame's own units.
+
+    raw_pairs.match puts the noisy frame on the clean one's scale, each colour plane by its own gain;
+    dividing by those gains again leaves the noisy frame as shot less its black offset, and brings the
+    clean windows and twins down to it. A pair whose frames moved apart, or do not line up, stays out.
+    The file is a test's (windows) with one noisy frame, so its ISO and mean are single numbers, and it
+    carries what rivals.py needs to know of the camera.
+    """
+    clean_path, noisy_path = next(folder.glob("clean_*")), next(folder.glob("noisy_*"))
+    clean, shot = raw_pairs.mosaic(clean_path), raw_pairs.mosaic(noisy_path)
+    if clean is None or shot is None or clean.shape != shot.shape:
+        print(folder.name, "left out: not Bayer", flush=True)
+        return
+    picks = raw_pairs.corners(clean, np.random.default_rng(0), NIGHT_WINDOWS)
+    noisy, gains, blacks = raw_pairs.match(clean, shot)
+    at = raw_pairs.offsets(clean, noisy)
+    moves, shares = (np.array(found) for found in zip(*(at(y, x) for y, x in picks)))
+    whole = (np.round(moves / 2) * 2).astype(int)
+    lined_up = min(np.median(shares), shares.min() / np.median(shares))
+    if np.abs(whole).max() > raw_pairs.MAX_SHIFT or lined_up < raw_pairs.SHARE:
+        print(
+            folder.name, "left out: moved", *moves.mean(0).round(1), "lined up", round(float(lined_up), 2), flush=True
+        )
+        return
+    side = raw_pairs.CROP
+    whites = [min(1.0, gain - black) for gain, black in zip(gains, blacks)]
+    twins = [raw_pairs.resampled(clean, y, x, dx, dy) for (y, x), (dx, dy) in zip(picks, moves - whole)]
+    crops = [
+        [clean[y : y + side, x : x + side] for y, x in picks],
+        [noisy[y + dy : y + dy + side, x + dx : x + dx + side] for (y, x), (dx, dy) in zip(picks, whole)],
+        raw_pairs.capped(np.stack(twins), whites),
+    ]
+    scale = np.tile(np.reshape(gains, (2, 2)), (side // 2, side // 2))
+    as_cut, own, twin = ((np.stack(crop) / scale).astype(np.float16) for crop in crops)
+    mean = float(np.mean([noisy[i::2, j::2].mean() / gains[2 * i + j] for i in range(2) for j in range(2)]))
+    with rawpy.imread(str(noisy_path)) as raw:
+        black = float(np.mean(raw.black_level_per_channel)) / raw.white_level
+        camera_from_xyz = raw.rgb_xyz_matrix[:3]
+    wb, matrix = colour(clean_path)
+    save(
+        f"night/{folder.name}",
+        frames=np.stack([as_cut, own]),
+        twins=twin[None],
+        mean=mean,
+        offsets=np.divide(blacks, gains, dtype=np.float32)[None],
+        whites=np.divide(whites, gains, dtype=np.float32)[None],
+        wb=wb,
+        matrix=matrix,
+        iso=raw_pairs.tags(noisy_path)["iso"],
+        trains=trains(folder.name),
+        camera_from_xyz=camera_from_xyz,
+        black_over_white=black,
+    )
+    print(
+        folder.name,
+        "mean",
+        f"{mean:.3g}",
+        "lined up",
+        round(float(lined_up), 2),
+        "trains" * trains(folder.name),
+        flush=True,
+    )
+
+
+def build_nights():
+    for folder in sorted(PAIRS.iterdir()):
+        build_night(folder)
+    held = sorted(scene(file.stem) for file in (BENCH / "night").glob("*.npz"))
+    (BENCH / "night" / "held.json").write_text(json.dumps(held))
 
 
 def bilinear(mosaic):
@@ -380,8 +573,58 @@ def perceptual():
     return lpips.LPIPS(net="alex", verbose=False).cuda().requires_grad_(False)
 
 
+def fine(picture):
+    """A picture's fine part: the picture less itself blurred by a bell of FINE px."""
+    reach = int(3 * FINE)
+    taps = torch.arange(-reach, reach + 1, dtype=picture.dtype, device=picture.device)
+    bell = torch.exp(-(taps**2) / (2 * FINE**2))
+    blur = (torch.outer(bell, bell) / bell.sum() ** 2).expand(picture.shape[1], 1, -1, -1)
+    padded = torch.nn.functional.pad(picture, (reach,) * 4, mode="reflect")
+    return picture - torch.nn.functional.conv2d(padded, blur, groups=picture.shape[1])
+
+
+def detail(result, truth):
+    """What became of the truth's fine detail in a result, pictures (N, 3, H, W), with no network to judge by.
+
+    kept is how much of the truth's fine part the result holds: its own fine part projected on the
+    truth's, 1 when all of it is there. invented is the energy of what is left of the result's fine
+    part after that, as a share of the truth's: detail and noise the truth does not have. Then the
+    grain where the truth is flattest, the result's and the truth's own, as the spread of their fine
+    parts in 8-bit levels: a result near the truth's has copied the noise its frame left in it. Last
+    the error's power spectrum, its peak and its highest value at the two-pixel limit, both over its
+    median: equal when the largest thing wrong is a pattern two pixels wide.
+    """
+    made, real = fine(result), fine(truth)
+    kept = (made * real).sum() / (real * real).sum()
+    invented = (made - kept * real).pow(2).sum() / real.pow(2).sum()
+    grey = torch.nn.functional.pad(truth.mean(1, keepdim=True), (4,) * 4, mode="reflect")
+    pooled = lambda values: torch.nn.functional.avg_pool2d(values, 9, 1)
+    rough = (pooled(grey * grey) - pooled(grey) ** 2).flatten()
+    flat = (rough <= rough.kthvalue(int(FLATTEST * len(rough))).values).view_as(truth[:, :1])
+    grain = lambda part: part.mean(1, keepdim=True)[flat].std() * 255
+    spectrum = torch.fft.fft2((result - truth).mean(1)).abs().pow(2).mean(0)
+    spectrum[0, 0] = 0
+    down, across = (side // 2 for side in spectrum.shape)
+    two_pixel = torch.stack([spectrum[0, across], spectrum[down, 0], spectrum[down, across]]).max()
+    found = kept, invented, grain(made), grain(real), spectrum.max() / spectrum.median(), two_pixel / spectrum.median()
+    return [value.item() for value in found]
+
+
+def over_cameras(each):
+    """A group's score as one camera's: each ISO's mean over the cameras that have it."""
+    had = {iso: [by_iso[iso] for by_iso in each if iso in by_iso] for iso in ISOS}
+    return {iso: np.mean(found, axis=0).tolist() for iso, found in had.items() if found}
+
+
+def cuts(camera):
+    """The files of a test, "<camera>" or "<folder>/<camera>": a Ricoh's one, or each camera's of a group."""
+    if camera.split("/")[-1] in CAMERAS:
+        return [camera] * (BENCH / f"{camera}.npz").exists()
+    return [file.relative_to(BENCH).with_suffix("").as_posix() for file in sorted(BENCH.glob(f"{camera}--*.npz"))]
+
+
 @torch.no_grad()
-def scores(clean_up, camera, with_lpips=False, demosaic=None):
+def scores(clean_up, camera, with_lpips=False, demosaic=None, with_detail=False):
     """Four {ISO: [PSNR, LPIPS]} for clean_up(mosaics (N, H, W), their frame's mean) -> cleaned mosaics.
 
     The first is against the clean windows as cut, the second against each noisy frame's clean twin,
@@ -389,14 +632,12 @@ def scores(clean_up, camera, with_lpips=False, demosaic=None):
     with the offsets blacks.py knows the body by taken off. clean_up may hand back
     camera RGB (N, 3, H, W) instead, which is scored as the picture it is. A full-colour test,
     "colour/<camera>", has one score, four times. demosaic is what a cleaned mosaic goes through
-    in place of the bilinear one (see develop).
+    in place of the bilinear one (see develop). with_detail adds detail()'s six numbers to each row.
     """
     if camera.split("/")[-1] in CAMERAS:
-        return score_one(clean_up, kept(camera), with_lpips, demosaic)
-    names = [file.relative_to(BENCH).with_suffix("").as_posix() for file in sorted(BENCH.glob(f"{camera}--*.npz"))]
-    each = [score_one(clean_up, windows(name), with_lpips, demosaic) for name in names]
-    had = [{iso: [by_iso[iso] for by_iso in kind if iso in by_iso] for iso in ISOS} for kind in zip(*each)]
-    return [{iso: np.mean(found, axis=0).tolist() for iso, found in kind.items() if found} for kind in had]
+        return score_one(clean_up, kept(camera), with_lpips, demosaic, with_detail)
+    each = [score_one(clean_up, windows(name), with_lpips, demosaic, with_detail) for name in cuts(camera)]
+    return [over_cameras(kind) for kind in zip(*each)]
 
 
 def score(clean_up, camera, with_lpips=False):
@@ -404,7 +645,9 @@ def score(clean_up, camera, with_lpips=False):
     return scores(clean_up, camera, with_lpips)[0]
 
 
-def score_one(clean_up, cut, with_lpips, demosaic=None):
+def score_one(clean_up, cut, with_lpips, demosaic=None, with_detail=False, whites=None):
+    """scores() for one file's windows. whites (ISOs, 4) is where each colour plane of a night pair's
+    truth stops: a result is sampled to a mosaic and stopped there too before it is looked at."""
     frames, isos, means, wb, matrix, twins, offsets, fixes = cut
     linear = develop(frames[0], wb, matrix)
     exposure = 0.108 / linear.median()
@@ -412,74 +655,259 @@ def score_one(clean_up, cut, with_lpips, demosaic=None):
 
     def against(result, truth):
         psnr = -10 * torch.log10(((result - truth) ** 2).mean(dim=(1, 2, 3)))
-        distance = perceptual()(result * 2 - 1, truth * 2 - 1) if with_lpips else torch.full((1,), float("nan"))
-        return [psnr.mean().item(), distance.mean().item()]
+        distance = (
+            torch.cat([perceptual()(a * 2 - 1, b * 2 - 1).flatten() for a, b in zip(result.split(4), truth.split(4))])
+            if with_lpips
+            else torch.full((1,), float("nan"))
+        )
+        return [psnr.mean().item(), distance.mean().item(), *(detail(result, truth) if with_detail else ())]
 
-    def left_on(noisy, mean, black, truth):
+    def shown(result, k):
+        if whites is not None:
+            white = whites[k].view(2, 2).repeat(result.shape[-2] // 2, result.shape[-1] // 2)
+            result = torch.minimum(mosaiced(result), white)
+        return picture(develop(result, wb, matrix, demosaic))
+
+    def left_on(noisy, mean, black, truth, k):
         lift = black.view(2, 2).repeat(noisy.shape[-2] // 2, noisy.shape[-1] // 2)
-        shot = clean_up(noisy + lift, mean + black.mean().item())
-        return against(picture(develop(shot, wb, matrix, demosaic)), truth)
+        return against(shown(clean_up(noisy + lift, mean + black.mean().item()), k), truth)
 
     as_cut, aligned, as_shot, fixed = {}, {}, {}, {}
     for k, (iso, noisy, mean) in enumerate(zip(isos, frames[1:], means)):
-        result = picture(develop(clean_up(noisy, mean), wb, matrix, demosaic))
+        result = shown(clean_up(noisy, mean), k)
         as_cut[iso] = aligned[iso] = as_shot[iso] = fixed[iso] = against(result, picture(linear))
         if twins is not None:
             truth = picture(develop(twins[k], wb, matrix))
             aligned[iso] = against(result, truth)
-            as_shot[iso] = fixed[iso] = left_on(noisy, mean, offsets[k], truth)
+            as_shot[iso] = fixed[iso] = left_on(noisy, mean, offsets[k], truth, k)
             if fixes is not None and fixes[k].any():
-                fixed[iso] = left_on(noisy, mean, offsets[k] - fixes[k], truth)
+                fixed[iso] = left_on(noisy, mean, offsets[k] - fixes[k], truth, k)
     return as_cut, aligned, as_shot, fixed
 
 
-def main(specs):
+def looked_at():
+    """The tests dials() is kept for, each with its windows' name: the real noisy frames and the full-colour tests."""
+    real = {camera: camera for camera in (*CAMERAS, *groups())}
+    return real | {f"{camera}-colour": f"colour/{camera}" for camera in real} | {"shift": "shift"}
+
+
+@torch.no_grad()
+def dials(clean_up, camera, demosaic=None):
+    """{ISO: [noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented,
+    texture kept, texture wrong]} of the picture clean_up makes of a test's windows, as quality.py
+    measures it and the eye weighs it at 2x. The truth is each noisy frame's clean twin, or a
+    full-colour test's truth. demosaic is what a cleaned mosaic goes through in place of the bilinear
+    one (see develop)."""
+    return over_cameras([dials_one(clean_up, windows(name), demosaic) for name in cuts(camera)])
+
+
+@torch.no_grad()
+def dials_one(clean_up, cut, demosaic=None):
+    """dials() for one file's windows. Flat, busy and textured are picked over all of a truth's windows together."""
+    frames, isos, means, wb, matrix, twins, *_ = cut
+    exposure = 0.108 / develop(frames[0], wb, matrix).median()
+    picture = lambda result, way=None: ((develop(result, wb, matrix, way) * exposure).clamp(0, 1) ** (1 / 2.2))[
+        ..., EDGE:-EDGE, EDGE:-EDGE
+    ]
+    found = {}
+    for k, (iso, noisy, mean) in enumerate(zip(isos, frames[1:], means)):
+        truth = picture(frames[0] if twins is None else twins[k])
+        flat, busy = quality.regions(truth)
+        untouched, *_ = quality.dials(quality.measure(picture(noisy), truth, flat, busy))
+        textured = quality.texture(truth, flat)
+        bands = quality.measure(picture(clean_up(noisy, mean), demosaic), truth, flat, busy, textured)
+        left, held, made_up = quality.dials(bands)
+        stops = 2 * math.log2(untouched / left)
+        found[iso] = [left, stops, held, bands["kept"][0], made_up, bands["invented"][0]]
+        found[iso] += [bands["texture_kept"], bands["texture_wrong"]]
+    return found
+
+
+def at_gain(clean_up, times):
+    """clean_up as it runs at times its gain: the same windows, shown to it that much brighter."""
+    return lambda mosaics, mean: clean_up(mosaics * times, mean) / times
+
+
+def quarters(windows):
+    """Windows of 1,024 px (N, ..., H, W) as their four tiles of 512 px each (4N, ..., H/2, W/2)."""
+    side = raw_pairs.CROP
+    return torch.cat([windows[..., y : y + side, x : x + side] for y in (0, side) for x in (0, side)])
+
+
+@torch.no_grad()
+def tiles(clean_up, camera):
+    """{ISO: four PSNRs} of a full-colour test's 1,024 px windows: cleaned as one tile, as four tiles of
+    512 px, and as one tile at half and at double the gain, all on the pixels EDGE in from a 512 px tile's sides."""
+    return over_cameras([tiles_one(clean_up, windows(name)) for name in cuts(f"wide/{camera}")])
+
+
+def tiles_one(clean_up, cut):
+    (truth, *frames), isos, means, wb, matrix, *_ = cut
+    linear = develop(quarters(truth), wb, matrix)
+    exposure = 0.108 / linear.median()
+    picture = lambda lin: ((lin * exposure).clamp(0, 1) ** (1 / 2.2))[..., EDGE:-EDGE, EDGE:-EDGE]
+    psnr = lambda result: (
+        (-10 * torch.log10(((picture(develop(result, wb, matrix)) - picture(linear)) ** 2).mean(dim=(1, 2, 3))))
+        .mean()
+        .item()
+    )
+    return {
+        iso: [
+            psnr(quarters(clean_up(noisy, mean))),
+            psnr(clean_up(quarters(noisy), mean)),
+            *(psnr(quarters(at_gain(clean_up, times)(noisy, mean))) for times in (0.5, 2)),
+        ]
+        for iso, noisy, mean in zip(isos, frames, means)
+    }
+
+
+def needs(gain):
+    """The range of GAINS a photo that needs a gain falls in, by the range's least."""
+    return max(low for low in GAINS if low <= max(gain, GAINS[0]))
+
+
+def pair(file):
+    """A night pair's file as score_one takes a test's windows, one ISO of them, then where its colour
+    planes stop, its ISO, its mean and whether it is a training scene."""
+    data = np.load(file)
+    on_gpu = lambda name: torch.from_numpy(data[name].astype(np.float32)).cuda()
+    iso, mean = int(data["iso"]), float(data["mean"])
+    cut = on_gpu("frames"), [iso], [mean], on_gpu("wb"), on_gpu("matrix"), on_gpu("twins"), on_gpu("offsets"), None
+    return cut, on_gpu("whites"), iso, mean, bool(data["trains"])
+
+
+@torch.no_grad()
+def night(name, clean_up):
+    """The night test's rows for a cleaner: {test: {least gain of a range: [PSNR, LPIPS]}}, each the mean
+    over that range's pairs. A picture it hands back is sampled to a mosaic and stopped at the pair's
+    white, as its truth is. The pairs that are no training scene make "night" and "night-as-shot", the
+    rest "night-trained" and its as-shot. Each pair's scores are kept under the name in
+    data/out/night.json, with the gain it needs to reach train_raw.LEVEL once its black offset is
+    off, and whether it is a training scene."""
+    import train_raw
+
+    kept_at = raw_pairs.DATA / "out" / "night.json"
+    by_pair = json.loads(kept_at.read_text()) if kept_at.exists() else {}
+    tests = {}
+    for file in sorted((BENCH / "night").glob("*.npz")):
+        cut, whites, iso, mean, trained = pair(file)
+        _, fitted, as_shot, _ = score_one(clean_up, cut, with_lpips=True, whites=whites)
+        gain = train_raw.LEVEL / max(mean, 1e-9)
+        rows = by_pair.get(file.stem, {}).get("rows", {}) | {name: [*fitted[iso], *as_shot[iso]]}
+        by_pair[file.stem] = {"gain": gain, "trains": trained, "rows": rows}
+        for ending, row in (("", fitted[iso]), ("-as-shot", as_shot[iso])):
+            test = f"night{'-trained' * trained}{ending}"
+            tests.setdefault(test, {}).setdefault(needs(gain), []).append(row)
+    kept_at.write_text(json.dumps(by_pair, indent=1))
+    return {test: {low: np.mean(rows[low], axis=0).tolist() for low in sorted(rows)} for test, rows in tests.items()}
+
+
+def main(specs, only=""):
     import demosaic
     import train_raw
 
-    board = raw_pairs.DATA / "out" / "bench.json"
-    table = json.loads(board.read_text()) if board.exists() else {}
+    board, wide, looks = (raw_pairs.DATA / "out" / file for file in ("bench.json", "tiles.json", "quality.json"))
+    table, tile_table, look_table = (
+        json.loads(file.read_text()) if file.exists() else {} for file in (board, wide, looks)
+    )
     models = {name: train_raw.trained(weights) for name, weights in (spec.split("=") for spec in specs)}
     cleaners = {"noisy": lambda noisy, mean: noisy}
     cleaners |= {name: train_raw.cleaner(model) for name, model in models.items()}
+    tiled = {"noisy": cleaners["noisy"]}
+    tiled |= {name: train_raw.cleaner(model, tiled=True) for name, model in models.items()}
     faithful = [name for name, model in models.items() if not train_raw.joint(model)]
 
-    def show(tests):
-        for test in tests:
-            print(f"\n{test}  PSNR / LPIPS\n{'':24}" + "".join(f"{iso:>14}" for iso in ISOS) + f"{'mean':>14}")
-            for name, by_iso in table[test].items():
-                cells = [*by_iso.values(), np.mean(list(by_iso.values()), axis=0)]
-                print(f"{name:24}" + "".join(f"{p:8.2f} {d:.3f}" for p, d in cells))
+    def show(rows, title, cell=lambda row: f"{row[0]:8.2f} {row[1]:.3f}", mean=True):
+        heads = [*rows["noisy"], *["mean"] * mean]
+        print(f"\n{title}\n{'':24}" + "".join(f"{head:>20}" for head in heads))
+        for name, by_iso in rows.items():
+            cells = [*by_iso.values(), *[np.mean(list(by_iso.values()), axis=0)] * mean]
+            print(f"{name:24}" + "".join(f"{cell(row):>20}" for row in cells))
 
-    for camera in (*CAMERAS, *groups(), "exact"):
+    for camera in (*CAMERAS, *groups(), "exact") if not only else ():
         kinds = () if camera == "exact" else ("aligned", "as-shot", "as-shot-fixed")
         tests = (camera, *(f"{camera}-{kind}" for kind in kinds))
         for name, clean_up in cleaners.items():
             for test, by_iso in zip(tests, scores(as_mosaic(clean_up), camera, with_lpips=True)):
                 table.setdefault(test, {})[name] = by_iso
-        show(tests)
-    for camera in (*CAMERAS, *groups()):
-        rows = table.setdefault(f"{camera}-colour", {})
+        for test in tests:
+            show(table[test], f"{test}  PSNR / LPIPS")
+    colours = {f"{camera}-colour": f"colour/{camera}" for camera in (*CAMERAS, *groups())} | {"shift": "shift"}
+    for test, cut in colours.items():
+        if only not in ("", "shift" if test == "shift" else "colour"):
+            continue
+        rows = table.setdefault(test, {})
         for name, clean_up in cleaners.items():
-            rows[name] = scores(clean_up, f"colour/{camera}", with_lpips=True)[0]
+            rows[name] = scores(clean_up, cut, True, with_detail=True)[0]
             if name in faithful:
-                rows[f"{name}-menon"] = scores(clean_up, f"colour/{camera}", True, demosaic.menon)[0]
-        show([f"{camera}-colour"])
+                rows[f"{name}-menon"] = scores(clean_up, cut, True, demosaic.menon, True)[0]
+        show(rows, f"{test}  PSNR / LPIPS")
+        show(
+            {name: by_iso for name, by_iso in rows.items() if len(next(iter(by_iso.values()))) > 2},
+            f"{test}  detail kept / invented / grain in flat areas",
+            lambda row: f"{row[2]:.3f} {row[3]:.3f} {row[4]:.2f}",
+        )
+    for camera in (*CAMERAS, *groups()) if only == "tiles" else ():
+        if not cuts(f"wide/{camera}"):
+            continue
+        rows = tile_table.setdefault(f"{camera}-colour-tiles", {})
+        rows |= {name: tiles(clean_up, camera) for name, clean_up in cleaners.items()}
+        show(
+            rows,
+            f"{camera}-colour-tiles  PSNR as one tile of 1,024 px / as four of 512 px / spread over half, one and double the gain",
+            lambda row: f"{row[0]:.2f} {row[1]:.2f} {np.ptp([row[0], *row[2:]]):.2f}",
+        )
+        wide.write_text(json.dumps(tile_table, indent=1))
+    if only in ("", "night") and any((BENCH / "night").glob("*.npz")):
+        for name, clean_up in tiled.items():
+            for test, rows in night(name, clean_up).items():
+                table.setdefault(test, {})[name] = rows
+        for test in sorted(test for test in table if test.startswith("night")):
+            show(table[test], f"{test}  PSNR / LPIPS by the least gain a photo needs", mean=False)
     board.write_text(json.dumps(table, indent=1))
+    real = (*CAMERAS, *groups())
+    for test, cut in looked_at().items():
+        if only not in ("", "quality", "" if test in real else "shift" if test == "shift" else "colour"):
+            continue
+        rows = look_table.setdefault(test, {})
+        for name, clean_up in cleaners.items():
+            rows[name] = dials(clean_up, cut)
+            if name in faithful and test not in real:
+                rows[f"{name}-menon"] = dials(clean_up, cut, demosaic.menon)
+        show(
+            rows,
+            f"{test}  stops cleaner / detail kept / finest detail kept",
+            lambda row: f"{row[1]:.2f} {row[2]:.3f} {row[3]:.3f}",
+        )
+        looks.write_text(json.dumps(look_table, indent=1))
 
+
+def build_all():
+    for camera in CAMERAS:
+        build(camera, ricoh(camera))
+    for group, folders in groups().items():
+        for folder in folders:
+            build_group(group, folder)
+    build_exact("gr3x", ricoh("gr3x"), 100, ISOS)
+    for folder in held_out():
+        build_exact(f"{folder.parent.name}-{folder.name}", *ladder(folder))
+    build_colours()
+    build_shifts()
+    build_wide()
+    build_nights()
+
+
+BUILDS = {
+    "build": build_all,
+    "colour": build_colours,
+    "shift": build_shifts,
+    "tiles": build_wide,
+    "night": build_nights,
+}
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["build"]:
-        for camera in CAMERAS:
-            build(camera, ricoh(camera))
-        for group, folders in groups().items():
-            for folder in folders:
-                build_group(group, folder)
-        build_exact("gr3x", ricoh("gr3x"), 100, ISOS)
-        for folder in held_out():
-            build_exact(f"{folder.parent.name}-{folder.name}", *ladder(folder))
-        build_colours()
-    elif sys.argv[1:] == ["colour"]:
-        build_colours()
+    only, specs = (sys.argv[1], sys.argv[2:]) if sys.argv[1] in (*BUILDS, "quality") else ("", sys.argv[1:])
+    if specs or only not in BUILDS:
+        main(specs, only)
     else:
-        main(sys.argv[1:])
+        BUILDS[only]()
