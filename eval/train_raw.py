@@ -312,7 +312,7 @@ MOVING, PATCH, OFF = 0.5, (1 / 8, 1 / 2), (3, 12)
 #: two frames' noise together as strength() counts it, and the noise at which it is twice that: past
 #: there a line-up starts to miss (slip(), which burst.py slip measures up to the Ricohs' ISO 102,400).
 SLIP, FAILS = 1.0, 0.08
-MOST, HELD, BAD, ASTRAY, SMEAR, MISTOLD, HOLD = 8, 6.0, 0.15, 16.0, (0.7, 2.0), 0.5, 0.1
+MOST, HELD, BAD, ASTRAY, SMEAR, MISTOLD, HOLD = 8, 6.0, 0.15, 16.0, (0.7, 2.0), 0.5, 1.0
 MEASURED = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 #: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
 WINDOW, NEAR, READER = 256, 17, 0.055
@@ -476,12 +476,14 @@ def handed(mosaics, levels):
     and a weight. The first twelve planes are the merged mosaic's, spread as the joint network
     takes one frame's (SPREAD): what a one-frame model would be given of the merge. The next
     twelve are what the merge holds beyond a mosaic, each colour at each of a cell's four places
-    less that spread: the sum over the weight, with the spread colour held in at weight HOLD, so
-    a place nothing measured adds nothing and a place other frames measured adds what they found.
-    The next twelve are the reference frame's own planes less the merged mosaic's, where the merge
-    may have taken in something it should not. The last twelve are how much more was measured at
-    each place than one frame measures: the root of the weight, which is how many times less noise
-    is left there, less one where the mosaic has a sample.
+    less that spread: the sum over the weight, with the spread colour held in at weight HOLD, one
+    frame's worth, so a place nothing measured adds nothing and a place other frames measured adds
+    what they found as far as they outweigh the guess. The next twelve are the reference frame's
+    own planes less the merged mosaic's, where the merge may have taken in something it should
+    not. The last twelve are how much more was measured at each place than one frame measures: the
+    root of the weight, which is how many times less noise is left there, less one where the
+    mosaic has a sample, and times LEVEL, which puts it on the picture's scale: at its own, ten
+    times the picture's, the new layer's first steps threw the network off before they taught it.
     """
     with torch.autocast(mosaics.device.type, enabled=False):
         mosaics = mosaics.float()
@@ -491,7 +493,7 @@ def handed(mosaics, levels):
         filled = torch.nn.functional.pixel_shuffle(planes, 2)
         found = torch.nn.functional.pixel_unshuffle((total + HOLD * filled) / (weight + HOLD), 2)
         more = torch.nn.functional.pixel_unshuffle(weight.sqrt(), 2) - held(MEASURED, mosaics.device).view(1, 12, 1, 1)
-        return torch.cat([planes, found - planes, spread(mosaics[:, 0]) - planes, more], 1)
+        return torch.cat([planes, found - planes, spread(mosaics[:, 0]) - planes, LEVEL * more], 1)
 
 
 def fed(model, mosaics, apart=None, levels=None):
