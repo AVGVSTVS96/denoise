@@ -462,7 +462,7 @@ def moved(name, clean_up, slots, merges, rng):
     one = clean_up(frames[:, 0], mean)
     if merges or slots == 1:
         offsets, weights = merge.flows(frames, noise)
-        sat = merge.spread(offsets.flatten(0, 1), merge.TILE, *true.shape[-2:]).view_as(true)
+        sat = merge.spread(offsets.flatten(0, 1), *true.shape[-2:]).view_as(true)
         wrong, taken = sat - true, 1 - float(weights.mean())
         many = clean_up(frames, mean, levels=noise) if merges else clean_up(aligned(frames, noise), mean)
         safe = many

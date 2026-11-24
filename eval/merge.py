@@ -11,8 +11,8 @@ whole photo, and nothing in it is learned.
 Align (flows()), on the lines of HDR+ and Handheld Multi-Frame Super-Resolution. Each frame becomes
 a grey picture at half size, the mean of every 2x2 colour cell, kept to the band between FINE and
 COARSE samples wide: finer is mostly noise, and coarser is brightness, which two exposures need not
-share. That picture is halved again and again into a pyramid whose coarsest level is still a tile
-of TILE samples across. On the coarsest level every tile is matched (matched()): it tries each
+share. That picture is halved again and again into a pyramid whose coarsest level is still TILE
+samples across, and every level is cut into tiles all alike, each about TILE samples a side. On the coarsest level every tile is matched (matched()): it tries each
 whole-sample move up to FAR either way and takes the one with the smallest mean difference, where
 a move has to earn its distance, PULL of the difference for each sample moved, so that a tile with
 nothing in it stays put. Then the fraction, on every level from the coarsest down (stepped()):
@@ -24,7 +24,7 @@ times their noise and what sitting STRAY samples off would explain: something th
 the frames is not where the camera went. Tiles are not matched again on the finer levels as HDR+
 does: at high ISO a tile's own best whole move is often noise or moire, and nothing after it could
 take that out, where steps summed over neighbours keep the offsets smooth, as a hand's shake is.
-What comes out is one offset for each tile of 2 * TILE px, (dx, dy) in sensor px: what the
+What comes out is one offset for each tile of about 2 * TILE px, (dx, dy) in sensor px: what the
 reference holds at a place the frame holds that far on. Between tile middles the offset is read
 bilinearly, which covers a small turn. Where a thing as large as a tile moved, the offsets follow
 it and come back to the camera's over a tile or two.
@@ -36,9 +36,13 @@ frames' noise (variance = shot * brightness + read, never less than one photon's
 SLACK cells off would make of the reference's gradients. It is believed fully up to LOW times that,
 not at all from HIGH, and no more than the least trusted cell its sum was taken over. So print a
 fraction of a pixel off is believed, its difference being what a small offset explains, and a
-thing that moved, a tile the line-up missed or a change in brightness is not. A frame's weight is
-its trust times the reference's noise over its own, so a noisier frame counts less: the weight is
-in reference frames' worth of light.
+thing that moved, a tile the line-up missed or a change in brightness is not. The noise a frame is
+told is never quite its own, and a camera that smooths its raw ties neighbours' noise, which that
+sum holds more of: so where the frame's usual ratio, the median over its tiles, is over one, the
+ratio is taken against it, up to EXCUSED times. A frame's weight is its trust times the
+reference's noise over its own, so a noisier frame counts less: the weight is in reference
+frames' worth of light. Before any of this merged() brings each later frame to the reference's
+brightness, by their means: two exposures of a scene are seldom quite as bright.
 
 Merge (gathered()). A mosaic cannot be moved by a fraction of a pixel without resampling each colour
 from samples two pixels apart, which costs fine print its letters. So nothing is resampled: each
@@ -62,7 +66,7 @@ TILE = 32
 FINE, COARSE = 1.0, 4.0
 FAR, PULL = 4, 0.4
 ROUNDS, DAMP, WIDE, SPARE, STRAY = 3, 0.02, 4, 3.0, 1.0
-NEAR, LOW, HIGH, SLACK = 5, 3.0, 6.0, 0.25
+NEAR, LOW, HIGH, SLACK, EXCUSED = 5, 3.0, 6.0, 0.25, 3.0
 
 
 def grey(mosaics):
@@ -88,10 +92,15 @@ def places(height, width, like):
     return x, y
 
 
-def spread(tiles, side, height, width):
+def tiles(height, width):
+    """How many tiles a level of that size is cut into, down and across: all alike, each about TILE samples a side."""
+    return max(1, round(height / TILE)), max(1, round(width / TILE))
+
+
+def spread(offsets, height, width):
     """Tiles' values (N, C, tiles down, tiles across) at every sample (N, C, height, width), read
-    bilinearly between the middles of tiles of that side."""
-    return torch.nn.functional.interpolate(tiles, scale_factor=side, mode="bilinear")[..., :height, :width]
+    bilinearly between the tiles' middles."""
+    return torch.nn.functional.interpolate(offsets, size=(height, width), mode="bilinear")
 
 
 def laid(planes, offsets):
@@ -108,13 +117,13 @@ def laid(planes, offsets):
 
 def pooled(planes):
     """Each tile's mean with its neighbours' WIDE tiles out, the nearer the more: sums for a tile's own offset."""
-    tiles = torch.nn.functional.avg_pool2d(planes, TILE, ceil_mode=True)
+    means = torch.nn.functional.adaptive_avg_pool2d(planes, tiles(*planes.shape[-2:]))
     taps = torch.tensor([0.25, 0.5, 0.25], dtype=planes.dtype, device=planes.device)
     for _ in range(WIDE):
-        wide = torch.nn.functional.pad(tiles.flatten(0, 1)[:, None], (1,) * 4, mode="replicate")
+        wide = torch.nn.functional.pad(means.flatten(0, 1)[:, None], (1,) * 4, mode="replicate")
         across = torch.nn.functional.conv2d(wide, taps.view(1, 1, 1, 3))
-        tiles = torch.nn.functional.conv2d(across, taps.view(1, 1, 3, 1)).view_as(tiles)
-    return tiles
+        means = torch.nn.functional.conv2d(across, taps.view(1, 1, 3, 1)).view_as(means)
+    return means
 
 
 def matched(reference, frame, start, reach):
@@ -122,14 +131,14 @@ def matched(reference, frame, start, reach):
     from where it starts: the move up to reach either way with the smallest mean difference, each
     move's difference raised by PULL for every sample it goes."""
     height, width = reference.shape[-2:]
-    each = start.repeat_interleave(TILE, 2).repeat_interleave(TILE, 3)[..., :height, :width].long()
+    each = torch.nn.functional.interpolate(start, size=(height, width), mode="nearest").long()
     x, y = (place.long() for place in places(height, width, reference))
     steps = torch.arange(-reach, reach + 1, device=reference.device)
     moves = torch.stack([steps.repeat(len(steps)), steps.repeat_interleave(len(steps))], 1)
     across = (x + each[:, :1] + moves[:, 0].view(1, -1, 1, 1)).clamp(0, width - 1)
     down = (y + each[:, 1:] + moves[:, 1].view(1, -1, 1, 1)).clamp(0, height - 1)
     there = frame.flatten(1).gather(1, (down * width + across).flatten(1)).view_as(across)
-    cost = torch.nn.functional.avg_pool2d((reference - there).abs(), TILE, ceil_mode=True)
+    cost = torch.nn.functional.adaptive_avg_pool2d((reference - there).abs(), start.shape[-2:])
     best = (cost * (1 + PULL * moves.to(cost).norm(dim=1).view(1, -1, 1, 1))).argmin(1)
     return start + moves.to(start)[best].permute(0, 3, 1, 2)
 
@@ -148,7 +157,7 @@ def stepped(reference, frame, offsets, spare):
     and the two differ by no more than SPARE times their noise there, spare (N, 1, H, W) its
     variance, and what sitting STRAY samples off would make of the gradient."""
     height, width = reference.shape[-2:]
-    there, inside = laid(frame, spread(offsets, TILE, height, width))
+    there, inside = laid(frame, spread(offsets, height, width))
     wide = torch.nn.functional.pad(there, (1,) * 4, mode="replicate")
     across, down = (wide[..., 1:-1, 2:] - wide[..., 1:-1, :-2]) / 2, (wide[..., 2:, 1:-1] - wide[..., :-2, 1:-1]) / 2
     rest = reference - there
@@ -179,7 +188,7 @@ def trusted(soft, offsets, spare, share):
     n, frames, height, width = soft.shape
     later = frames - 1
     there, inside = laid(
-        soft[:, 1:].reshape(n * later, 1, height, width), spread(offsets.flatten(0, 1), TILE, height, width) / 2
+        soft[:, 1:].reshape(n * later, 1, height, width), spread(offsets.flatten(0, 1), height, width) / 2
     )
     first = torch.nn.functional.pad(soft[:, :1], (1,) * 4, mode="replicate")
     across, down = (
@@ -189,7 +198,10 @@ def trusted(soft, offsets, spare, share):
     box = lambda planes: torch.nn.functional.avg_pool2d(planes, NEAR, 1, NEAR // 2, count_include_pad=False)
     apart = box((there.view(n, later, height, width) - soft[:, :1]) ** 2)
     allowed = box(spare + SLACK**2 * (across * across + down * down))
-    trust = ((HIGH - apart / allowed) / (HIGH - LOW)).clamp(0, 1) * inside.view(n, later, height, width)
+    far = apart / allowed
+    usual = torch.nn.functional.adaptive_avg_pool2d(far, tiles(height, width)).flatten(2).median(2).values
+    far = far / usual.clamp(1, EXCUSED)[..., None, None]
+    trust = ((HIGH - far) / (HIGH - LOW)).clamp(0, 1) * inside.view(n, later, height, width)
     least = -torch.nn.functional.max_pool2d(-trust, NEAR, 1, NEAR // 2)
     return (least * share)[:, :, None]
 
@@ -210,15 +222,14 @@ def flows(frames, levels):
         level[:, :1].expand(-1, later, -1, -1).reshape(n * later, 1, *level.shape[-2:]),
         level[:, 1:].reshape(n * later, 1, *level.shape[-2:]),
     )
-    tiles = lambda level: [-(-side // TILE) for side in level.shape[-2:]]
-    offsets = matched(*pair(pyramid[-1]), fine.new_zeros(n * later, 2, *tiles(pyramid[-1])), FAR)
+    offsets = matched(*pair(pyramid[-1]), fine.new_zeros(n * later, 2, *tiles(*pyramid[-1].shape[-2:])), FAR)
     for at in range(depth - 1, -1, -1):
         reference, frame = pair(pyramid[at])
         spare = passed(band, fine) * torch.nn.functional.avg_pool2d(both, 2**at).reshape(
             n * later, 1, *reference.shape[-2:]
         )
         if at < depth - 1:
-            offsets = 2 * torch.nn.functional.interpolate(offsets, size=tiles(pyramid[at]), mode="bilinear")
+            offsets = 2 * spread(offsets, *tiles(*reference.shape[-2:]))
         for _ in range(ROUNDS):
             offsets = stepped(reference, frame, offsets, spare / 4**at)
     sat = 2 * offsets.view(n, later, 2, *offsets.shape[-2:])
@@ -244,7 +255,7 @@ def gathered(frames, offsets, weights):
     if count == 1:
         return total, weight
     later = frames[:, 1:].reshape(-1, height * width)
-    each = spread(offsets.flatten(0, 1), 2 * TILE, height, width)
+    each = spread(offsets.flatten(0, 1), height, width)
     share = weights.flatten(0, 2).repeat_interleave(2, 1).repeat_interleave(2, 2)
     at_x, at_y = x + each[:, 0], y + each[:, 1]
     sums = frames.new_zeros(2, len(later), 3, height, width)
@@ -264,8 +275,15 @@ def gathered(frames, offsets, weights):
 def merged(frames, levels):
     """Bursts (N, frames, H, W), the reference first, lined up and merged: gathered()'s sums and
     weights. levels is each frame's shot and read noise, (frames, 2) or (N, frames, 2), on the
-    frames' own scale: variance = shot * brightness + read."""
-    return gathered(frames, *(flows(frames, levels) if frames.shape[1] > 1 else (None, None)))
+    frames' own scale: variance = shot * brightness + read. Each later frame is first brought to
+    the reference's brightness, its mean to the reference's, and its noise with it."""
+    if frames.shape[1] == 1:
+        return gathered(frames, None, None)
+    shot, read = noise(levels, frames)
+    mean = frames.mean((-2, -1), keepdim=True)
+    gain = mean[:, :1] / mean.clamp(min=1e-12)
+    frames = frames * gain
+    return gathered(frames, *flows(frames, torch.cat([shot * gain, read * gain**2], -1).flatten(2)))
 
 
 def mosaic(total, weight):
