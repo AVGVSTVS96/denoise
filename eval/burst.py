@@ -83,6 +83,7 @@ import sys
 
 import cv2
 import numpy as np
+import scipy.ndimage
 import torch
 
 import bench_raw
@@ -114,30 +115,25 @@ def sits(picked, other):
     than the band is not in it, and under the band two frames' noise is nothing they share, so it
     widens the answer and does not pull it. A step leaves out the cells where the two still differ
     by more than TRIM times the median: something that moved between the frames is not where the
-    camera went, and left in it drags the fit by pixels. The detail is laid with Lanczos: OpenCV's
-    cubic lays a smooth picture a twentieth short of the fraction asked for, and the fit came out
-    that much short.
+    camera went, and left in it drags the fit by pixels. The detail is laid by a spline through its
+    samples, at the place asked for. OpenCV's warps put a picture on the nearest 1/32 of its own
+    pixel, 1/16 px of a frame here, and a fit cannot see finer than its steps; its cubic also lays a
+    smooth picture a twentieth short of the fraction asked for.
     """
     green = lambda cfa: raw_pairs.green(np.ascontiguousarray(cfa, np.float32))
     band = lambda plane: cv2.GaussianBlur(plane, (0, 0), FINE) - cv2.GaussianBlur(plane, (0, 0), COARSE)
     a, b = band(green(picked)), band(green(other))
+    (dx, dy), _ = cv2.phaseCorrelate(a, b)
+    a, b = a.astype(np.float64), b.astype(np.float64)
     h, w = a.shape
     cx, cy, edge = (w - 1) / 2, (h - 1) / 2, int(MARGIN * COARSE)
     inner = (slice(edge, -edge),) * 2
     y, x = np.mgrid[:h, :w][(slice(None), *inner)] - np.array([cy, cx]).reshape(2, 1, 1)
-    (dx, dy), _ = cv2.phaseCorrelate(a, b)
     at = np.array([round(dx), round(dy), 0.0])
     for _ in range(ROUNDS):
         cos, sin = np.cos(at[2]), np.sin(at[2])
-        back = np.array(
-            [
-                [cos, sin, cx - cos * (cx + at[0]) - sin * (cy + at[1])],
-                [-sin, cos, cy + sin * (cx + at[0]) - cos * (cy + at[1])],
-            ]
-        )
-        laid = cv2.warpAffine(
-            a, back, (w, h), flags=cv2.INTER_LANCZOS4 | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT
-        )
+        start = [cy + sin * (cx + at[0]) - cos * (cy + at[1]), cx - cos * (cx + at[0]) - sin * (cy + at[1])]
+        laid = scipy.ndimage.affine_transform(a, [[cos, -sin], [sin, cos]], start, order=3, mode="reflect")
         gx, gy = -np.gradient(laid, axis=1)[inner], -np.gradient(laid, axis=0)[inner]
         rest = (b - laid)[inner].ravel()
         pulls = np.stack([gx, gy, gy * x - gx * y]).reshape(3, -1) * (np.abs(rest) < TRIM * np.median(np.abs(rest)))
