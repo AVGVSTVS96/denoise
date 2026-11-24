@@ -15,6 +15,8 @@ export type ModelKind = keyof typeof models;
 
 export type RawKind = Exclude<ModelKind, "photo">;
 
+export type Look = RawKind | "burst";
+
 const cacheName = (manifest: Manifest) => `model-${manifest.sha256.slice(0, 12)}`;
 const ATTEMPTS = 3;
 

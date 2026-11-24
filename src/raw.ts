@@ -13,8 +13,14 @@ export type Piece = {
 
 export type Brightest = { block: number; level: number };
 
+export type Frame = { raw: Raw; offsets: number[] };
+
+export type Tile = { top: number; left: number; height: number; width: number; gain: number };
+
+export type Merge = (planes: Float32Array, tile: Tile, network: Network) => Promise<Float32Array>;
+
 const TILE = 1024;
-const OVERLAP = 64;
+export const OVERLAP = 64;
 const BLEND = OVERLAP / 2;
 export const CORE = TILE - 2 * OVERLAP;
 export const PIECE = CORE + 2 * BLEND;
@@ -33,13 +39,12 @@ const GRAINY = 9;
 
 export const detailBand = (noise: number) => MOST * Math.min(1, Math.max(0, (GRAINY - noise) / (GRAINY - CALM)));
 
-const mirrored = (size: number, padded: number) =>
-  Int32Array.from({ length: padded }, (_, p) => {
-    const period = 2 * (size - 1);
-    const at = (((p - OVERLAP) % period) + period) % period;
+const mirrored = (at: number, size: number) => {
+  const period = 2 * (size - 1);
+  const within = ((at % period) + period) % period;
 
-    return at < size ? at : period - at;
-  });
+  return within < size ? within : period - within;
+};
 
 const starts = (padded: number, tile: number) => {
   const found: number[] = [];
@@ -53,7 +58,7 @@ const span = (size: number) => {
   const tile = Math.min(TILE, Math.ceil((size + 2 * OVERLAP) / 32) * 32);
   const padded = Math.max(size + 2 * OVERLAP, tile);
 
-  return { tile, from: mirrored(size, padded), starts: starts(padded, tile) };
+  return { tile, starts: starts(padded, tile) };
 };
 
 const filmic = (x: number) => (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
@@ -125,12 +130,32 @@ function bilinear(planes: Float32Array, across: number, y: number, x: number, in
   into[2] = green ? (onRed ? above : beside) : onRed ? corners : here;
 }
 
+const moved = (at: number, by: number, size: number) => mirrored(mirrored(at, size) + by, size);
+
+export function laid({ raw, offsets }: Frame, tile: Tile, dx: number, dy: number, planes: Float32Array) {
+  const plane = (tile.height * tile.width) / 4;
+  const scale = raw.black.map((black) => tile.gain / (raw.white - black));
+  const shift = raw.black.map((black, site) => (black / (raw.white - black) + offsets[site]) * tile.gain);
+  const columns = Int32Array.from({ length: tile.width }, (_, x) => moved(tile.left + x, dx, raw.width));
+
+  for (let y = 0; y < tile.height; y++) {
+    const row = (raw.top + moved(tile.top + y, dy, raw.height)) * raw.stride + raw.left;
+    const o = ((y & 1) << 1) * plane + (y >> 1) * (tile.width >> 1);
+
+    for (let x = 0; x < tile.width; x++) {
+      const site = ((y & 1) << 1) | (x & 1);
+      planes[o + (x & 1) * plane + (x >> 1)] = raw.samples[row + columns[x]] * scale[site] - shift[site];
+    }
+  }
+}
+
 export async function clean(
   raw: Raw,
   offsets: number[],
   brightest: Brightest | null,
   network: Network,
   onPiece: (piece: Piece, done: number, total: number) => void,
+  merged?: Merge,
 ) {
   const { block, level } = brightest ?? UNHELD;
   const gain = photoGain(raw, offsets);
@@ -147,8 +172,6 @@ export async function clean(
   const columns = Math.floor(across.tile / block) + 1;
   const sums = new Float64Array((Math.floor(down.tile / block) + 1) * columns);
   const whole = sums.map((_, i) => (i % columns < columns - 1 && i < sums.length - columns ? 1 : 0));
-  const scale = raw.black.map((black) => gain / (raw.white - black));
-  const shift = raw.black.map((black, site) => (black / (raw.white - black) + offsets[site]) * gain);
   const total = down.starts.length * across.starts.length;
   const { crop } = raw;
   let done = 0;
@@ -164,19 +187,15 @@ export async function clean(
       const x0 = Math.max(left - BLEND, crop.x);
       const x1 = Math.min(left + across.tile - OVERLAP - BLEND, crop.x + crop.width);
       const cols = fadeAcross.tiles[c];
+      const tile = { top: top - OVERLAP, left: left - OVERLAP, height: down.tile, width: across.tile, gain };
+      laid({ raw, offsets }, tile, 0, 0, planes);
       sums.fill(0);
 
       for (let y = 0; y < down.tile; y++) {
-        const row = (raw.top + down.from[top + y]) * raw.stride + raw.left;
-        const o = (y >> 1) * (across.tile >> 1);
+        const o = ((y & 1) << 1) * plane + (y >> 1) * (across.tile >> 1);
         const b = Math.floor(y / block) * columns;
 
-        for (let x = 0; x < across.tile; x++) {
-          const site = ((y & 1) << 1) | (x & 1);
-          const value = raw.samples[row + across.from[left + x]] * scale[site] - shift[site];
-          planes[site * plane + o + (x >> 1)] = value;
-          sums[b + Math.floor(x / block)] += value;
-        }
+        for (let x = 0; x < across.tile; x++) sums[b + Math.floor(x / block)] += planes[o + (x & 1) * plane + (x >> 1)];
       }
 
       const peak = sums.reduce((most, sum, i) => Math.max(most, sum * whole[i]), 0) / (block * block);
@@ -185,7 +204,11 @@ export async function clean(
       if (own < 1) for (let i = 0; i < planes.length; i++) planes[i] *= own;
 
       const [red, green, blue] = raw.balance.map((b) => b / lowest / gain / own);
-      const out = await network(planes, down.tile >> 1, across.tile >> 1);
+
+      const out = merged
+        ? await merged(planes, { ...tile, gain: gain * own }, network)
+        : await network(planes, down.tile >> 1, across.tile >> 1);
+
       const picture = down.tile * across.tile;
       const pixels = new Uint8ClampedArray(Math.max(0, x1 - x0) * Math.max(0, y1 - y0) * 4);
       const input = new Uint8ClampedArray(pixels.length);

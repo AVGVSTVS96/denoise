@@ -3,7 +3,7 @@ import { borrowing, setBorrowing } from "./blacks";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
-import type { RawKind } from "./model";
+import type { Look } from "./model";
 import { detailed, MARGIN } from "./raw";
 import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
@@ -26,27 +26,29 @@ type Run = {
 type Job = {
   name: string;
   file?: File;
+  more: File[];
   original: string;
   cloud?: string;
   width: number;
   height: number;
   raw?: boolean;
-  shown: RawKind;
-  runs: Partial<Record<RawKind, Run>>;
+  shown: Look;
+  runs: Partial<Record<Look, Run>>;
   cleaned?: ImageBitmap;
   savedAt?: number;
   saving?: "saving" | "saved" | "failed";
 };
 
-type Canvases = React.RefObject<Partial<Record<RawKind, HTMLCanvasElement | null>>>;
+type Canvases = React.RefObject<Partial<Record<Look, HTMLCanvasElement | null>>>;
 
 type Finished = (result: Blob, info: { model: string; width: number; height: number }) => void;
 
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
-const LOOKS: RawKind[] = ["raw", "crisp"];
-const LOOK = { raw: "Standard", crisp: "Crisper" };
+const LOOKS: Look[] = ["raw", "crisp", "burst"];
+const FRAMES = 4;
+const LOOK = { raw: "Standard", crisp: "Crisper", burst: "Burst" };
 
 const fresh = (): Run => ({
   stage: "decode",
@@ -90,7 +92,7 @@ export function App() {
   }, [key]);
 
   const clean = useCallback(
-    (file: File, kind: RawKind, finished?: Finished) => {
+    (file: File, more: File[], kind: Look, finished?: Finished) => {
       worker.current?.terminate();
       const w = new Worker();
       worker.current = w;
@@ -157,20 +159,24 @@ export function App() {
             lock?.release();
             setError(data.message);
 
-            if (kind !== "raw") setJob((j) => j && { ...j, shown: "raw", runs: { raw: j.runs.raw } });
+            if (kind !== "raw")
+              setJob(
+                (j) => j && { ...j, shown: j.shown === kind ? "raw" : j.shown, runs: { ...j.runs, [kind]: undefined } },
+              );
 
             return;
         }
       });
 
-      const order: ToWorker = { file, key, model, borrowed: borrowing(), kind };
+      const order: ToWorker = { file, more, key, model, borrowed: borrowing(), kind };
       w.postMessage(order);
     },
     [key, model],
   );
 
   const open = useCallback(
-    async (file: File) => {
+    async (files: File[]) => {
+      const [file, ...more] = files.toSorted((a, b) => a.name.localeCompare(b.name)).slice(0, FRAMES);
       worker.current?.terminate();
       setError(undefined);
       const shown = (await rawPreview(file)) ?? file;
@@ -181,6 +187,7 @@ export function App() {
         return {
           name,
           file,
+          more,
           original: URL.createObjectURL(shown),
           cloud: key && MODELS[model].name,
           width: 0,
@@ -189,7 +196,7 @@ export function App() {
           runs: { raw: fresh() },
         };
       });
-      clean(file, "raw", (result, info) => {
+      clean(file, [], "raw", (result, info) => {
         if (sharing()) share(file, result, { ...info, model: key ? MODELS[model].id : info.model }).catch(() => {});
 
         if (key) {
@@ -207,11 +214,11 @@ export function App() {
     [key, model, clean],
   );
 
-  const look = (kind: RawKind) => {
+  const look = (kind: Look) => {
     setError(undefined);
     setJob((j) => j && { ...j, shown: kind, runs: { ...j.runs, [kind]: j.runs[kind] ?? fresh() } });
 
-    if (job?.file && !job.runs[kind]) clean(job.file, kind);
+    if (job?.file && !job.runs[kind]) clean(job.file, kind === "burst" ? job.more : [], kind);
   };
 
   const view = async (photo: Photo) => {
@@ -226,6 +233,7 @@ export function App() {
 
         return {
           name: photo.name,
+          more: [],
           original: photo.original ?? photo.result!,
           width: cleaned.width,
           height: cleaned.height,
@@ -250,16 +258,16 @@ export function App() {
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      const file = [...(e.clipboardData?.files ?? [])].find(isPhoto);
+      const files = [...(e.clipboardData?.files ?? [])].filter(isPhoto);
 
-      if (file) open(file);
+      if (files.length) open(files);
     };
 
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
-      const file = [...(e.dataTransfer?.files ?? [])].find(isPhoto);
+      const files = [...(e.dataTransfer?.files ?? [])].filter(isPhoto);
 
-      if (file) open(file);
+      if (files.length) open(files);
     };
 
     const onDragOver = (e: DragEvent) => e.preventDefault();
@@ -293,7 +301,7 @@ export function App() {
           <Editor job={job} error={error} canvases={canvases} input={input} onLook={look} onNew={reset} />
         ) : (
           <Pick
-            onFile={open}
+            onFiles={open}
             cloud={Boolean(key)}
             model={model}
             onModel={(m) => {
@@ -317,7 +325,7 @@ export function App() {
 }
 
 function Pick({
-  onFile,
+  onFiles,
   cloud,
   model,
   onModel,
@@ -326,7 +334,7 @@ function Pick({
   onPhoto,
   onCloud,
 }: {
-  onFile: (f: File) => void;
+  onFiles: (files: File[]) => void;
   cloud: boolean;
   model: Model;
   onModel: (m: Model) => void;
@@ -379,11 +387,12 @@ function Pick({
             ref={input}
             type="file"
             accept="image/*,.dng"
+            multiple
             hidden
             onChange={(e) => {
-              const f = e.target.files?.[0];
+              const files = [...(e.target.files ?? [])];
 
-              if (f) onFile(f);
+              if (files.length) onFiles(files);
               e.target.value = "";
             }}
           />
@@ -466,7 +475,7 @@ function Editor({
   error?: string;
   canvases: Canvases;
   input: React.RefObject<HTMLCanvasElement | null>;
-  onLook: (kind: RawKind) => void;
+  onLook: (kind: Look) => void;
   onNew: () => void;
 }) {
   const [split, setSplit] = useState(50);
@@ -482,6 +491,8 @@ function Editor({
   const done = run.stage === "done";
   const band = run.band ?? 0;
   const finer = band > 0 ? fine : 0;
+  const busy = LOOKS.some((kind) => job.runs[kind] && job.runs[kind].stage !== "done");
+  const looks = LOOKS.filter((kind) => kind !== "burst" || job.more.length > 0);
 
   useEffect(() => {
     if (job.cleaned) canvases.current.raw?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
@@ -622,14 +633,15 @@ function Editor({
           {job.raw && job.runs.raw?.stage === "done" && (
             <div className="order-first flex basis-full sm:order-none sm:mr-2 sm:basis-auto">
               <div className="flex rounded-full border border-line bg-card p-0.5 text-[13px] font-medium pointer-coarse:text-sm">
-                {LOOKS.map((kind) => (
+                {looks.map((kind) => (
                   <button
                     key={kind}
                     onClick={() => onLook(kind)}
+                    disabled={busy && !job.runs[kind]}
                     aria-pressed={kind === shown}
-                    className={`h-6.5 rounded-full px-3 transition pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted hover:text-fg"}`}
+                    className={`h-6.5 rounded-full px-3 transition disabled:opacity-40 pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted enabled:hover:text-fg"}`}
                   >
-                    {LOOK[kind]}
+                    {kind === "burst" ? `${LOOK[kind]} of ${job.more.length + 1}` : LOOK[kind]}
                   </button>
                 ))}
               </div>

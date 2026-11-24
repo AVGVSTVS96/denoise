@@ -2,11 +2,12 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as ort from "onnxruntime-web";
 import { blackOffsets } from "../src/blacks";
+import { burst, measured } from "../src/burst";
 import { rawPhoto } from "../src/dng";
 import { models } from "../src/model";
 import { clean, detailBand, detailed, grain, photoGain } from "../src/raw";
 
-const [photo, out, input, detail, kind] = process.argv.slice(2);
+const [photo, out, input, detail, kind, ...more] = process.argv.slice(2);
 const manifest = kind === "crisp" ? models.crisp : models.raw;
 const model = join(import.meta.dirname, "../public/model");
 const parts = await Promise.all(manifest.parts.map((part) => readFile(join(model, part))));
@@ -22,11 +23,22 @@ const opaque = (rgb: Uint8Array) => {
 };
 
 const session = await ort.InferenceSession.create(Buffer.concat(parts), { executionProviders: ["wasm"] });
-const raw = await rawPhoto(new Blob([await readFile(photo)]));
 
-if (!raw) throw new Error(`${photo} is not a Bayer DNG`);
+const opened = async (path: string) => {
+  const raw = await rawPhoto(new Blob([await readFile(path)]));
 
-const offsets = await blackOffsets(raw, false);
+  if (!raw) throw new Error(`${path} is not a Bayer DNG`);
+
+  return { raw, offsets: await blackOffsets(raw, false) };
+};
+
+const picked = await opened(photo);
+const later = await Promise.all(more.map(opened));
+const { raw, offsets } = picked;
+const merged = kind === "burst" ? burst(picked, later) : undefined;
+
+for (const frame of later) console.log(JSON.stringify({ iso: frame.raw.iso, ...measured(picked, frame) }));
+
 const { width, height } = raw.crop;
 const picture = new Uint8Array(width * height * 3);
 const shot = new Uint8Array(input ? picture.length : 0);
@@ -67,6 +79,7 @@ await clean(
     flat += found.flat;
     console.log(`${done}/${total} tiles, ${Math.round((performance.now() - started) / 1000)}s`);
   },
+  merged,
 );
 
 const head = Buffer.from(`P6\n${width} ${height}\n255\n`);
