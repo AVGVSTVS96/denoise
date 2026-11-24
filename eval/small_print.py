@@ -529,19 +529,20 @@ def main(specs):
     if DEVICE == "cpu":
         torch.set_num_threads(THREADS)
     kept_at = raw_pairs.DATA / "out" / "print.json"
-    table = json.loads(kept_at.read_text()) if kept_at.exists() else {}
     every = (*bench_raw.CAMERAS, *bench_raw.groups())
     if not any(bench_raw.cuts(f"print/{test}") for test in every):
         sys.exit(f"no windows in {READER.parent}: build them on the server, or mount that folder here")
     cleaners = entrants([spec for spec in specs if spec not in every])
     for test in [test for test in every if test in specs] or every:
         each = {name: scores(cleaners, bench_raw.BENCH / f"{name}.npz") for name in bench_raw.cuts(f"print/{test}")}
+        table = json.loads(kept_at.read_text()) if kept_at.exists() else {}
         for name, found in each.items():
             table.setdefault(name.split("/")[-1], {}).update(found)
         rows = table.setdefault(test, {}) if each else {}
         for model in next(iter(each.values()), {}):
             rows[model] = bench_raw.over_cameras([by_iso[model] for by_iso in each.values()])
-        kept_at.write_text(json.dumps(table, indent=1))
+        kept_at.with_suffix(".tmp").write_text(json.dumps(table, indent=1))
+        kept_at.with_suffix(".tmp").rename(kept_at)
         if rows:
             heads = [*rows["noisy"], "mean"]
             print(
