@@ -24,6 +24,14 @@ is textured instead: where that band is FINE times its strength in the flat regi
 the truth's own noise, and nothing near steps by more than STEP 8-bit levels. They are read against a
 real noisy frame's clean twin too, between models on one test: a truth's noise and how well it sits on
 the noisy frame lower them for every model alike.
+
+A clean twin is a mosaic, so as a picture it has been through a demosaic, and a cleaned mosaic put
+through the same one shares its errors where a model's own picture does not. on_mosaic() scores with
+none on either side: a picture's own colour at each pixel against the twin's mosaic, as PSNR and as
+kept and wrong in the finest band one colour's own samples can hold. Green's lie 1.4 px apart along
+the diagonals, so its band is detail 3 to 4 px across; red's and blue's lie 2 px apart, detail 4 to
+6 px. It cannot see the 2 to 3 px band a picture has, nor how well a model fills in the two colours a
+pixel did not measure.
 """
 
 import itertools
@@ -116,6 +124,42 @@ def held(fitted):
     what else the result's band holds, over the truth's."""
     _, _, _, xx, xy, yy = fitted.unbind(-1)
     return xy / yy, ((xx - xy**2 / yy) / yy).clamp(min=0).sqrt()
+
+
+def finest(mosaic, where, apart):
+    """A developed RGGB mosaic's (N, H, W) finest band at one colour's sites, in 8-bit levels, as (N, 1, H, W).
+
+    where (H, W) is that colour's sites and apart how far its samples lie from each other in pixels.
+    The band is what a blur of SIGMAS[0] of the colour's own samples takes away from each, as bands()
+    takes a picture's finest: no other colour's sample is read, so no demosaic is. It is nothing at
+    the other colours' sites.
+    """
+    own = where.to(mosaic.dtype).expand(1, 1, -1, -1)
+    planes = mosaic[:, None]
+    soft = blurred(planes * own, SIGMAS[0] * apart) / blurred(own, SIGMAS[0] * apart)
+    return (planes - soft) * own * 255
+
+
+def on_mosaic(result, truth, busy, textured):
+    """What a result is against its truth with no demosaic on either side: developed RGGB mosaics (N, H, W), 0 to 1.
+
+    psnr_mosaic: the windows' mean PSNR over every site;
+    mosaic_kept, mosaic_wrong (3,): held() of the finest band a colour's own samples can hold, in the
+    busy region, at the green sites, the red and the blue;
+    mosaic_texture_kept, mosaic_texture_wrong (3,): the same in the textured region.
+    """
+    red = torch.zeros(result.shape[1:], dtype=torch.bool, device=result.device)
+    blue = red.clone()
+    red[0::2, 0::2] = blue[1::2, 1::2] = True
+    found = {name: [] for name in ("mosaic_kept", "mosaic_wrong", "mosaic_texture_kept", "mosaic_texture_wrong")}
+    for where, apart in ((~(red | blue), 2**0.5), (red, 2.0), (blue, 2.0)):
+        made, real = finest(result, where, apart), finest(truth, where, apart)
+        for region, name in ((busy, "mosaic"), (textured, "mosaic_texture")):
+            share, wrong = held(sums(made, real, region & where))
+            found[f"{name}_kept"].append(share.item())
+            found[f"{name}_wrong"].append(wrong.item())
+    psnr = -10 * torch.log10(((result - truth) ** 2).mean((1, 2)))
+    return {"psnr_mosaic": psnr.mean().item()} | found
 
 
 def measure(result, truth, flat, busy, textured=None):

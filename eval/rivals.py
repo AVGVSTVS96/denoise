@@ -43,7 +43,8 @@ picture, and is fed each frame as shot, with no gain: none of these apps brighte
     uv run rivals.py shift rawforge-jdd darktable             the shift test alone
 
 A rival also gets bench_raw.dials' rows in data/out/quality.json, under its own name: noise left,
-stops cleaner, detail kept and invented, of the picture it makes itself.
+stops cleaner, detail kept and invented, of the picture it makes itself, and on the real noisy frames
+bench_raw.on_mosaic's, "<test>-mosaic": that picture sampled back to a mosaic against the clean twin's.
 
     uv run rivals.py quality rawforge-jdd darktable           those numbers alone
 
@@ -420,6 +421,8 @@ def main(specs, only=""):
             add("shift", spec, bench_raw.scores(own, "shift", True, with_detail=True)[0])
         for test, cut in bench_raw.looked_at().items() if own and only in ("", "quality") else ():
             add(test, spec, bench_raw.dials(own, cut), QUALITY)
+            if test in (*bench_raw.CAMERAS, *bench_raw.groups()):
+                add(f"{test}-mosaic", spec, bench_raw.on_mosaic(own, cut), QUALITY)
         name = f"{spec}-cfa" if spec in PICTURES else spec
         for test, by_gain in bench_raw.night(name, own).items() if own and only in ("", "night") else ():
             add(test, name, by_gain)
