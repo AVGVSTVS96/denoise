@@ -46,6 +46,19 @@ picked one by whole colour cells, a block at a time (onto()), and FOLDER/burst g
 picked frame alone, merged.png, the lined-up frames averaged and cleaned as one, burst.png, and
 clean.png, each developed as the test develops pictures.
 
+Every burst a burst model gets, it gets a second time behind a guard (guarded()), as "guarded": a
+burst's one fault is to show twice what moved between its frames, and the guard takes such a place
+out of the later frames before the model sees them. Where a later frame's mean over NEAR colour
+cells a side differs from the picked frame's, in any colour plane, by more than ALLOWED times what
+the two frames' shot and read noise gives that mean, the cells it was taken over become the picked
+frame's, an empty slot to the model there. It is a mean and not an energy on purpose: print a
+pixel apart differs from itself stroke by stroke, up one side and down the other, which a mean
+over many strokes hardly sees, and a thing several pixels off moves the mean. The noise is the
+frames' own, as bench_raw.noise_levels measured it or as the test laid it, so the guard is for
+frames whose noise is known: own does not use it. A place the guard empties does not come out as
+one frame alone would have it: NAFNet weighs its channels by their means over the whole tile, so
+in a tile that has later frames elsewhere such a place is cleaned as lightly as the rest.
+
 It runs on the GPU when there is one and on the CPU when not, there in float32 where the GPU runs
 bfloat16, so compare rows made on the same machine.
 """
@@ -67,6 +80,8 @@ import train_raw
 OUT = raw_pairs.DATA / "out" / "burst.json"
 PICKED, MORE, TALLEST, FRAMES = 12800, (1, 2), 15, 4
 BLOCK, REACH = 128, 64
+#: guarded()'s neighbourhood, colour cells a side, and how many times its noise a mean over it may differ.
+NEAR, ALLOWED = 5, 6.0
 
 
 def lined_up(frames, lines):
@@ -78,6 +93,26 @@ def lined_up(frames, lines):
         moved.append(torch.roll(frame, (-int(cells[1]), -int(cells[0])), (0, 1)))
         apart = max(apart, float(np.abs(at - lines[0] - cells).max()))
     return torch.stack(moved), apart
+
+
+def guarded(bursts, levels):
+    """Bursts (N, frames, H, W) with a later frame's colour cells replaced by the picked frame's
+    wherever the two differ by more than their noise allows, and the share of those cells replaced.
+
+    levels (frames, 2) is each frame's shot and read noise, variance = shot * brightness + read. A
+    frame's four colour planes are each averaged over NEAR cells a side; a later frame is off where
+    any plane's average sits more than ALLOWED times the noise of that average from the picked
+    frame's, and with it every cell the average was taken over.
+    """
+    planes, levels = train_raw.pack(bursts), torch.as_tensor(levels, dtype=bursts.dtype, device=bursts.device)
+    picked, later = planes[:, :1], planes[:, 1:]
+    box = lambda values: torch.nn.functional.avg_pool2d(values.flatten(0, 1), NEAR, 1, NEAR // 2).view(values.shape)
+    both = lambda part: (levels[:1, part] + levels[1:, part]).view(1, -1, 1, 1, 1)
+    noise = (both(0) * box(picked).clamp(min=0) + both(1)).sqrt() / NEAR
+    off = (box(later - picked).abs() > ALLOWED * noise).any(2, keepdim=True).flatten(0, 1).float()
+    off = (torch.nn.functional.max_pool2d(off, NEAR, 1, NEAR // 2) > 0).view(later[:, :, :1].shape)
+    safe = torch.cat([picked, torch.where(off, picked, later)], 1)
+    return train_raw.unpack(safe.flatten(0, 1)).view(bursts.shape), off.float().mean().item()
 
 
 def read(shown, thing, corners, small):
@@ -101,12 +136,13 @@ def read(shown, thing, corners, small):
 
 @torch.no_grad()
 def camera(file, models):
-    """{model: {way: counts (2, 5)}} for one camera's windows, read()'s over its printed things, and how
-    far its frames sit apart once lined up; nothing for a camera without a frame at PICKED and the next ISO."""
+    """{model: {way: counts (2, 5)}} for one camera's windows, read()'s over its printed things, how far
+    its frames sit apart once lined up, and the largest share of a burst's later cells the guard
+    replaced; nothing for a camera without a frame at PICKED and the next ISO."""
     things, isos, means, picture = small_print.opened(file)
     if PICKED not in isos or isos.index(PICKED) + 1 >= len(isos):
-        return {}, 0.0
-    k, rows, furthest = isos.index(PICKED), {}, 0.0
+        return {}, 0.0, 0.0
+    k, rows, furthest, most, levels = isos.index(PICKED), {}, 0.0, 0.0, np.load(file)["levels"]
     look = lambda result: small_print.as_bytes(picture(result, None))
     for thing, (frames, _, lines) in things.items():
         small = [n for n, line in enumerate(lines[0]) if np.linalg.norm(line[3] - line[0]) <= TALLEST]
@@ -120,6 +156,9 @@ def camera(file, models):
                 found[f"{used} one frame"] = alone
                 if slots > more:
                     found[f"{used} burst"] = read(look(clean_up(burst[None], means[k])), thing, places[0], small)
+                    safe, share = guarded(burst[None], levels[k : k + 1 + more])
+                    most = max(most, share)
+                    found[f"{used} guarded"] = read(look(clean_up(safe, means[k])), thing, places[0], small)
                 if slots == 1:
                     weights = np.float32([PICKED / iso for iso in isos[k : k + 1 + more]])
                     weights /= weights.sum()
@@ -129,7 +168,7 @@ def camera(file, models):
             kept = rows.setdefault(name, {})
             for way, counts in found.items():
                 kept[way] = kept.get(way, 0) + counts
-    return rows, furthest
+    return rows, furthest, most
 
 
 def shown(title, rows):
@@ -171,20 +210,21 @@ def ladders(*specs):
     every = (*bench_raw.CAMERAS, *bench_raw.groups())
     models = entrants([spec for spec in specs if spec not in every])
     for test in [test for test in every if test in specs] or ("gr3x", "gr3", "unseen"):
-        together, furthest = {}, 0.0
+        together, furthest, most = {}, 0.0, 0.0
         for name in bench_raw.cuts(f"print/{test}"):
-            rows, apart = camera(bench_raw.BENCH / f"{name}.npz", models)
-            furthest = max(furthest, apart)
+            rows, apart, share = camera(bench_raw.BENCH / f"{name}.npz", models)
+            furthest, most = max(furthest, apart), max(most, share)
             kept(name.split("/")[-1], rows)
             for model, ways in rows.items():
                 pooled = together.setdefault(model, {})
                 for way, counts in ways.items():
                     pooled[way] = pooled.get(way, 0) + counts
             if rows and name.split("/")[-1] != test:
-                print(f"{name}: frames lined up to {apart:.2f} px", flush=True)
+                print(f"{name}: frames lined up to {apart:.2f} px, the guard took up to {share:.1%}", flush=True)
         if together:
             kept(test, together)
-            shown(f"{test}, ISO {PICKED} picked, frames lined up to {furthest:.2f} px", together)
+            lined = f"frames lined up to {furthest:.2f} px, the guard took up to {most:.1%} of a window's later cells"
+            shown(f"{test}, ISO {PICKED} picked, {lined}", together)
 
 
 @torch.no_grad()
@@ -192,7 +232,7 @@ def equal(*specs):
     models = entrants(specs)
     file = small_print.READER.parent / "gr3x.npz"
     things, isos, means, picture = small_print.opened(file)
-    data, rng, rows = np.load(file), torch.Generator().manual_seed(0), {}
+    data, rng, rows, taken = np.load(file), torch.Generator().manual_seed(0), {}, {}
     balance = torch.from_numpy(data["wb"]).to(small_print.DEVICE).view(1, 3, 1, 1)
     under = isos[: isos.index(PICKED) + 1]
     shot, read_noise = data["levels"][len(under) - 1]
@@ -214,28 +254,33 @@ def equal(*specs):
             ),
         }
         bursts = {
-            way: torch.cat([alone[PICKED][thing], small_print.made_up(scene, shot, read_noise, rng)])
+            way: torch.cat([alone[PICKED][thing], small_print.made_up(scene, shot, read_noise, rng)])[None]
             for way, scene in scenes.items()
         }
+        safe = {way: guarded(burst, [[shot, read_noise]] * FRAMES) for way, burst in bursts.items()}
+        for way, (_, share) in safe.items():
+            taken[way] = taken.get(way, 0) + share / len(things)
         for name, (clean_up, slots) in models.items():
-            pooled = rows.setdefault(name, {})
+            pooled, given = rows.setdefault(name, {}), min(slots, FRAMES)
             found = {f"{iso} one frame": clean_up(alone[iso][thing], means[at]) for at, iso in enumerate(under)}
-            if slots > 1:
-                given = min(slots, FRAMES)
-                found |= {
-                    f"{PICKED} {given} frames {way}": clean_up(burst[None, :given], means[len(under) - 1])
-                    for way, burst in bursts.items()
-                }
+            for way in bursts if slots > 1 else ():
+                found[f"{PICKED} {given} frames {way}"] = clean_up(bursts[way][:, :given], means[len(under) - 1])
+                found[f"{PICKED} {given} frames {way}, guarded"] = clean_up(
+                    safe[way][0][:, :given], means[len(under) - 1]
+                )
             for way, result in found.items():
                 pooled[way] = pooled.get(way, 0) + read(look(result), thing, lines[0], small)
     kept("equal", rows)
     shown(f"gr3x, clean windows under made-up noise, bursts at ISO {PICKED}'s strength", rows)
+    for way, share in taken.items():
+        print(f"{way}: the guard took {share:.1%} of the later frames' cells, a window's mean")
 
 
 def moved(name, clean_up, slots, rng):
     """One Ricoh's full-colour windows as bursts with a moved patch in each: how far the picture is from
-    the truth, in 8-bit levels of the developed picture, inside the patches and outside them, from the
-    burst and from the picked frame alone."""
+    the truth, in 8-bit levels of the developed picture, inside the patches and then outside them,
+    from the burst, from the burst behind the guard and from the picked frame alone; and the share
+    of the later frames' cells the guard replaced."""
     data, levels = (
         np.load(bench_raw.BENCH / "colour" / f"{name}.npz"),
         np.load(small_print.READER.parent / f"{name}.npz"),
@@ -250,8 +295,9 @@ def moved(name, clean_up, slots, rng):
     exposure = 0.108 / bench_raw.develop(truth, wb, matrix).median()
     picture = lambda result: (bench_raw.develop(result, wb, matrix) * exposure).clamp(0, 1) ** (1 / 2.2)
     apart = lambda result: 255 * (picture(result) - picture(truth)).abs().mean(1, keepdim=True)
-    burst, one = apart(clean_up(frames, mean)), apart(clean_up(frames[:, 0], mean))
-    return [float(part.mean()) for part in (burst[patch], one[patch], burst[~patch], one[~patch])]
+    safe, share = guarded(frames, [[shot, read_noise]] * frames.shape[1])
+    ways = [apart(clean_up(given, mean)) for given in (frames, safe, frames[:, 0])]
+    return [[float(way[where].mean()) for way in ways] for where in (patch, ~patch)], share
 
 
 @torch.no_grad()
@@ -260,11 +306,14 @@ def moving(weights):
     rng = torch.Generator().manual_seed(0)
     torch.manual_seed(0)
     for name in bench_raw.CAMERAS:
-        inside, alone, outside, alone_outside = moved(name, clean_up, slots, rng)
+        found, share = moved(name, clean_up, slots, rng)
+        told = [
+            f"{where} burst {burst:.3f}, guarded {safe:.3f}, one frame {one:.3f}"
+            for where, (burst, safe, one) in zip(("inside the patches", "outside them"), found)
+        ]
         print(
             f"{name}, ISO {PICKED}'s noise, {slots} frames, a moved patch in every window, 8-bit levels from the truth:"
-            f" inside the patches burst {inside:.3f}, one frame {alone:.3f};"
-            f" outside them burst {outside:.3f}, one frame {alone_outside:.3f}",
+            f" {'; '.join(told)}; the guard took {share:.1%} of the later frames' cells",
             flush=True,
         )
 
