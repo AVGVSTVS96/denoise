@@ -24,10 +24,21 @@ as fit_noise.py measured it, in place of levels drawn apart; --offsets leaves ea
 a real frame sits on, for the network to take off, in made-up noise and in the real noisy frames,
 which raw_pairs.py stores with theirs taken off; --tails gives the read noise a real sensor's long
 tails and rounds the result to the raw's steps; --darks data/noise/darks.json swaps part of the read
-noise for windows of real dark frames (dark_bank.py); --mixing makes neighbouring pixels' noise move
+noise for windows of real dark frames; --mixing makes neighbouring pixels' noise move
 together as far as fit_noise.py measured it to in the row --levels drew, at the same strength, which
 is what a camera that smooths its raw files hands over: the Ricohs and Pentaxes at every ISO, Canons
 and Sonys at their highest.
+
+--darks data/noise/gr3x.json 0.5 makes that share of the frames under laid-over noise one camera's
+own, from its lens-cap frames (dark_bank.py): a window of one of its real dark frames, at its own
+strength, over shot noise made up at that frame's ISO (dark_noise()). The window is read noise as the
+body makes it, banding, tails and the camera's smoothing with it, and with the fixed pattern and the
+black offset off: a photo of that body is to have its ISO's pattern, which dark_bank.py writes beside
+the bank, taken off before the network sees it. A dark frame holds no shot noise, so that is made up
+and run through the filter of mixers() for the row a camera of the same sensor has in fit_noise.py's
+table, which is how a camera that smooths its raw hands shot noise over. The share is DARK_SHARE
+when none is given, and a bank without shot noise in its rows, any cameras' frames, is the older
+kind above. A run without it is what it was.
 
 --joint 16 trains the joint model instead, which denoises and demosaics in one pass: packed RGGB in,
 camera RGB at the mosaic's full size out, the picture a user looks at. It is the same network with
@@ -948,9 +959,50 @@ def noise_bank(profile):
 
 
 def dark_bank(path):
-    """Real dark frames at unit strength on the GPU, each with its black offset per colour plane over its read noise."""
-    lifts = [frame["offset"] for frame in json.loads(path.read_text())]
-    return torch.from_numpy(np.load(path.with_suffix(".npy"))).cuda(), torch.tensor(lifts, device="cuda")
+    """Real dark frames at unit strength on the GPU, as dark_bank.py writes them, in one of two kinds.
+
+    Any cameras' frames, for made_up_noise() to swap for part of the read noise: the fields with each
+    one's black offset per colour plane over its read noise, and None. Or one camera's own, whose rows
+    carry shot noise, for dark_noise(): None, and the fields with each one's read noise, its ISO's
+    shot noise and the filter of mixers() that ties shot noise as the camera does.
+    """
+    found = json.loads(path.read_text())
+    frames = found["frames"] if isinstance(found, dict) else found
+    fields = torch.from_numpy(np.load(path.with_suffix(".npy"))).cuda()
+    part = lambda key: torch.tensor([frame[key] for frame in frames], device="cuda")
+    if "shot" not in frames[0]:
+        return (fields, part("offset")), None
+    return None, (
+        fields,
+        {"shot": part("shot"), "read": part("read"), "mix": torch.tensor(mixers(frames), device="cuda")},
+    )
+
+
+def dark_drawn(n, size, own):
+    """n rows of one camera's own noise for crops of that size at LEVEL brightness: each a window of one of
+    its dark frames, with which frame, that frame's read noise, its ISO's shot noise and its filter.
+
+    The photo is taken as shot 1-16x darker than LEVEL and brought up, as bank_drawn() takes it.
+    """
+    fields, levels = own
+    frame, unit = windows(fields, n, size)
+    row = {part: values[frame] for part, values in levels.items()} | {"iso": frame, "unit": unit}
+    darkest = LEVEL / (FLOOR * row["shot"].mean(1))
+    return dimmed(row, torch.minimum(spread(n, fields.device, 1, 16), darkest).clamp(min=1))
+
+
+def dark_noise(clean, row):
+    """One camera's own noise on clean mosaics (N, H, W) already at LEVEL brightness, at dark_drawn()'s rows.
+
+    Shot noise is made up, since a dark frame holds none, and run through the row's filter as
+    --mixing runs it: each pixel's is brought to unit strength first and scaled back after. Over it
+    comes the window of a real dark frame at its own strength, which the camera has tied already.
+    """
+    light = clean.clamp(min=0)
+    shot = sites(row["shot"], clean)
+    strong = (light * shot).sqrt().clamp(min=1e-12)
+    counted = torch.poisson(light / shot) * shot - light
+    return light + mixed(counted / strong, row["mix"]) * strong + row["unit"] * sites(row["read"], clean)
 
 
 def measured(path):
@@ -1339,7 +1391,10 @@ def main(args):
     if args.mixing and not args.levels:
         raise SystemExit("--mixing mixes as the rows of --levels' table say")
     levels = table(measured(args.profile or args.levels), args.mixing) if args.profile or args.levels else None
-    darks = dark_bank(pathlib.Path(args.darks)) if args.darks else None
+    darks, body = dark_bank(pathlib.Path(args.darks[0])) if args.darks else (None, None)
+    if args.darks and args.darks[1:] and not body:
+        raise SystemExit("--darks' share is of one camera's own frames, a bank whose rows carry shot noise")
+    body_share = float(args.darks[1]) if body and args.darks[1:] else DARK_SHARE
     share, rows = (1, 1) if args.profile else (BANK_SHARE, TABLE_SHARE)
     if args.burst > 1 and not args.joint:
         raise SystemExit("--burst gives the joint crops several frames, for a --joint run")
@@ -1443,12 +1498,12 @@ def main(args):
         n, device = len(clean) // frames, clean.device
         under = scene or (lambda row: clean)
         each = (lambda values: values) if steps is None else (lambda values: values.repeat_interleave(frames, 0))
-        of = (lambda row: row) if steps is None else (lambda row: framed(row, steps, bank and bank[0]))
+        of = (lambda row, fields=None: row) if steps is None else (lambda row, fields=None: framed(row, steps, fields))
         row = of(drawn(n, device, levels, rows))
         laid, strong = made_up_noise(under(row), row, args.offsets, args.tails, darks), strength(row)
         if bank:
             real = torch.rand(n, 1, 1, device=device) < share
-            row = of(bank_drawn(n, clean.shape[-1], bank))
+            row = of(bank_drawn(n, clean.shape[-1], bank), bank[0])
             laid = torch.where(each(real), bank_noise(under(row), row, args.offsets), laid)
             strong = torch.where(each(real).view(-1), strength(row), strong)
         if cameras:
@@ -1456,6 +1511,11 @@ def main(args):
             smooth = torch.rand(n, 1, 1, device=device) < args.smoothed
             laid = torch.where(each(smooth), made_up_noise(under(row), row, args.offsets, args.tails, darks), laid)
             strong = torch.where(each(smooth).view(-1), strength(row), strong)
+        if body:
+            mine = torch.rand(n, 1, 1, device=device) < body_share
+            row = of(dark_drawn(n, clean.shape[-1], body), body[0])
+            laid = torch.where(each(mine), dark_noise(under(row), row), laid)
+            strong = torch.where(each(mine).view(-1), strength(row), strong)
         return laid, strong
 
     def noisy_of(scene, steps=None):
@@ -1663,7 +1723,13 @@ if __name__ == "__main__":
     parser.add_argument("--levels", help="noise levels drawn as whole (camera, ISO) rows of this table")
     parser.add_argument("--offsets", action="store_true", help="noisy frames keep their black offset per colour plane")
     parser.add_argument("--tails", action="store_true", help="long-tailed read noise, rounded to the raw's steps")
-    parser.add_argument("--darks", help="a bank of real dark frames for part of the read noise")
+    parser.add_argument(
+        "--darks",
+        nargs="+",
+        metavar=("FILE", "SHARE"),
+        help="a bank of real dark frames: any cameras', for part of the read noise,"
+        " or one camera's own, and the share of laid-over noise that is then that camera's",
+    )
     parser.add_argument(
         "--mixing", action="store_true", help="neighbouring pixels' noise moves together as in --levels' rows"
     )
