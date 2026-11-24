@@ -63,12 +63,15 @@ largest thing wrong.
 
 PSNR folds noise and detail into one number that hardly moves, so every model scored also gets
 quality.py's numbers, which a person can picture, in data/out/quality.json: its rows are
-[noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented] by ISO, under
-the board's test names. Noise left is what is left where the truth is flat, as the eye weighs it at
-2x, in 8-bit levels, and stops cleaner is the same against the noisy frame's. Detail kept is the
-share of the truth's detail the result holds where the truth is busy, and invented what else it
-holds there; the finest is the band 2 to 3 px across, where small print lives. All of it is of the
-picture a model makes itself, a mosaic through the bilinear demosaic. "gr3", "gr3x", "unseen" and
+[noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented, texture kept,
+texture wrong] by ISO, under the board's test names. Noise left is what is left where the truth is
+flat, as the eye weighs it at 2x, in 8-bit levels, and stops cleaner is the same against the noisy
+frame's. Detail kept is the share of the truth's detail the result holds where the truth is busy, and
+invented what else it holds there; the finest is the band 2 to 3 px across, where small print lives.
+Texture kept and texture wrong are that band's kept and invented where the truth has fine detail and
+no hard edge (quality.texture): cloth and grain, which a model can paint flat while detail kept stays
+high. They are read on the real noisy frames and on shift, between models on one test. All of it is
+of the picture a model makes itself, a mosaic through the bilinear demosaic. "gr3", "gr3x", "unseen" and
 "seen" are the real noisy frames against their clean twins: read noise there, on real noise, and not
 detail, since a twin is no sharper than the result. "<test>-colour" and "shift" are the full-colour
 tests: read detail there, under made-up noise.
@@ -690,16 +693,17 @@ def looked_at():
 
 @torch.no_grad()
 def dials(clean_up, camera, demosaic=None):
-    """{ISO: [noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented]}
-    of the picture clean_up makes of a test's windows, as quality.py measures it and the eye weighs
-    it at 2x. The truth is each noisy frame's clean twin, or a full-colour test's truth. demosaic is
-    what a cleaned mosaic goes through in place of the bilinear one (see develop)."""
+    """{ISO: [noise left, stops cleaner, detail kept, finest detail kept, invented, finest invented,
+    texture kept, texture wrong]} of the picture clean_up makes of a test's windows, as quality.py
+    measures it and the eye weighs it at 2x. The truth is each noisy frame's clean twin, or a
+    full-colour test's truth. demosaic is what a cleaned mosaic goes through in place of the bilinear
+    one (see develop)."""
     return over_cameras([dials_one(clean_up, windows(name), demosaic) for name in cuts(camera)])
 
 
 @torch.no_grad()
 def dials_one(clean_up, cut, demosaic=None):
-    """dials() for one file's windows. Flat and busy are picked over all of a truth's windows together."""
+    """dials() for one file's windows. Flat, busy and textured are picked over all of a truth's windows together."""
     frames, isos, means, wb, matrix, twins, *_ = cut
     exposure = 0.108 / develop(frames[0], wb, matrix).median()
     picture = lambda result, way=None: ((develop(result, wb, matrix, way) * exposure).clamp(0, 1) ** (1 / 2.2))[
@@ -710,10 +714,12 @@ def dials_one(clean_up, cut, demosaic=None):
         truth = picture(frames[0] if twins is None else twins[k])
         flat, busy = quality.regions(truth)
         untouched, *_ = quality.dials(quality.measure(picture(noisy), truth, flat, busy))
-        bands = quality.measure(picture(clean_up(noisy, mean), demosaic), truth, flat, busy)
+        textured = quality.texture(truth, flat)
+        bands = quality.measure(picture(clean_up(noisy, mean), demosaic), truth, flat, busy, textured)
         left, held, made_up = quality.dials(bands)
         stops = 2 * math.log2(untouched / left)
         found[iso] = [left, stops, held, bands["kept"][0], made_up, bands["invented"][0]]
+        found[iso] += [bands["texture_kept"], bands["texture_wrong"]]
     return found
 
 

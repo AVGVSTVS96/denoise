@@ -17,6 +17,13 @@ is 1 when all the truth's detail is there and over 1 in a band that was sharpene
 of a frame nobody denoised keeps 0.8, so read it with invented, which sharpening and left-over noise
 both raise. Detail is only worth reading against a truth sharper than the result, the full-colour
 tests'; against a real noisy frame's clean twin it says little.
+
+Detail kept is carried by edges and print, and a model can smooth cloth, grain or foliage flat while
+it stays high. Texture kept and texture wrong are the finest band's kept and invented where the truth
+is textured instead: where that band is FINE times its strength in the flat region or more, which is
+the truth's own noise, and nothing near steps by more than STEP 8-bit levels. They are read against a
+real noisy frame's clean twin too, between models on one test: a truth's noise and how well it sits on
+the noisy frame lower them for every model alike.
 """
 
 import itertools
@@ -28,6 +35,7 @@ SIGMAS = (0.7, 1.4, 2.8, 5.6, 11.2)
 MIDDLES = (0.4, 0.219, 0.109, 0.055, 0.027)
 VIEWS = {"100%": 45.0, "2x": 22.0}
 FLATTEST, BUSIEST = 0.3, 0.2
+FINE, STEP = 2.0, 20.0
 
 
 def planes(picture):
@@ -67,6 +75,22 @@ def regions(truth):
     return busy <= ranked[int(FLATTEST * (len(ranked) - 1))], busy >= ranked[int((1 - BUSIEST) * (len(ranked) - 1))]
 
 
+def texture(truth, flat):
+    """Where the truth (N, 3, H, W) has fine detail and no hard edge, as a mask (N, 1, H, W).
+
+    Fine detail: over the 17 px round a pixel its finest band is FINE times as strong as in the flat
+    region, or stronger. No hard edge: with detail under 6 px or so blurred away, its brightness moves
+    STEP 8-bit levels or less across any 5 px of those 17.
+    """
+    luma = planes(truth)[:, :1]
+    fine = luma - blurred(luma, SIGMAS[0])
+    around = lambda plane, side, pool: pool(torch.nn.functional.pad(plane, (side // 2,) * 4, mode="reflect"), side, 1)
+    strength = around(fine * fine, 17, torch.nn.functional.avg_pool2d).sqrt()
+    soft, highest = blurred(luma, SIGMAS[1]), torch.nn.functional.max_pool2d
+    step = around(around(soft, 5, highest) + around(-soft, 5, highest), 17, highest)
+    return (strength >= FINE * fine[flat].pow(2).mean().sqrt()) & (step <= STEP)
+
+
 def eye(cycles_per_degree, colour=False):
     """How well the eye sees a stripe pattern, 1 at its best: Mannos and Sakrison's curve for brightness,
     and for colour a curve that only falls, to half by 3 cycles a degree, as colour vision does."""
@@ -87,30 +111,45 @@ def sums(made, real, where):
     return torch.stack([x.new_tensor(x.numel()), x.sum(), y.sum(), (x * x).sum(), (x * y).sum(), (y * y).sum()])
 
 
-def measure(result, truth, flat, busy):
+def held(fitted):
+    """From sums() of a region: the share of the truth's band the result holds there, and the spread of
+    what else the result's band holds, over the truth's."""
+    _, _, _, xx, xy, yy = fitted.unbind(-1)
+    return xy / yy, ((xx - xy**2 / yy) / yy).clamp(min=0).sqrt()
+
+
+def measure(result, truth, flat, busy, textured=None):
     """What a result (N, 3, H, W) is against its truth, band by band:
 
     left (5, 3): in the flat region, the spread of what a band holds that does not follow the truth's
     band, in 8-bit levels, for brightness and the two colours;
     kept (5,): in the busy region, the share of the truth's brightness band the result holds;
-    invented (5,): the spread of what else the result's band holds there, over the truth's.
+    invented (5,): the spread of what else the result's band holds there, over the truth's;
+    texture_kept, texture_wrong: the finest band's kept and invented in the textured region, texture()'s,
+    when one is given.
 
     The windows go through eight at a time and only sums() of them are kept, so a test of any size
     costs a training run's card no more than eight windows do.
     """
-    smooth, rough = 0, 0
-    for shown, wanted, calm, lively in zip(*(part.split(8) for part in (result, truth, flat, busy))):
-        pairs = list(zip(bands(planes(shown)), bands(planes(wanted))))
+    smooth, rough, woven = 0, 0, 0
+    for at in range(0, len(result), 8):
+        part = slice(at, at + 8)
+        pairs = list(zip(bands(planes(result[part])), bands(planes(truth[part]))))
         smooth = smooth + torch.stack(
-            [torch.stack([sums(a[:, at : at + 1], b[:, at : at + 1], calm) for at in range(3)]) for a, b in pairs]
+            [torch.stack([sums(a[:, k : k + 1], b[:, k : k + 1], flat[part]) for k in range(3)]) for a, b in pairs]
         )
-        rough = rough + torch.stack([sums(a[:, :1], b[:, :1], lively) for a, b in pairs])
+        rough = rough + torch.stack([sums(a[:, :1], b[:, :1], busy[part]) for a, b in pairs])
+        if textured is not None:
+            woven = woven + sums(pairs[0][0][:, :1], pairs[0][1][:, :1], textured[part])
     size, x, y, xx, xy, yy = smooth.unbind(-1)
     together = xy / size - x * y / size**2
     left = (xx / size - (x / size) ** 2 - together**2 / (yy / size - (y / size) ** 2)).clamp(min=0).sqrt()
-    _, _, _, xx, xy, yy = rough.unbind(-1)
-    invented = ((xx - xy**2 / yy) / yy).clamp(min=0).sqrt()
-    return {"left": left.tolist(), "kept": (xy / yy).tolist(), "invented": invented.tolist()}
+    kept, invented = held(rough)
+    found = {"left": left.tolist(), "kept": kept.tolist(), "invented": invented.tolist()}
+    if textured is None:
+        return found
+    texture_kept, texture_wrong = held(woven)
+    return found | {"texture_kept": texture_kept.item(), "texture_wrong": texture_wrong.item()}
 
 
 def dials(found, view="2x"):
