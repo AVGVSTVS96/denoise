@@ -36,6 +36,14 @@ from one generator, the single frames first in small_print.py's order: a model's
 its "-made" rows there, and the burst's picked frame is the single frame at PICKED. Rows go to
 data/out/burst.json under "equal".
 
+Burst v2 lines the frames up to a fraction of a pixel and merges them outside any network
+(merge.py, aligned()), and every test reads it beside the rest. A one-frame model cleans the merge
+as a mosaic, "aligned", next to its "merged" row, the plain average: in ladders, in equal, where a
+one-frame model's bursts are FRAMES frames, and in moving. A model trained on merged bursts
+(train_raw.py --merged) takes the merge's planes with what was measured where, its "burst" rows,
+and has no guard: the merge's own trust takes out what moved. The merge is told each frame's noise
+levels, the ones the guard goes by.
+
 The offsets a model is told are measured ones in every test, because measured ones are all an app
 has: the rows a model is held to are those. Beside them, for a model that is told, the same burst
 with the offsets the test knows: in equal the ones it drew, "true offsets", and in ladders, where
@@ -88,6 +96,7 @@ import torch
 
 import bench_raw
 import demosaic
+import merge
 import raw_pairs
 import small_print
 import train_raw
@@ -168,6 +177,12 @@ def lined_up(frames, places):
     return torch.stack([frames[0], *moved]), apart
 
 
+def aligned(frames, levels):
+    """Bursts (N, frames, H, W), the picked frame first, lined up and merged by merge.py, as the mosaics
+    (N, H, W) a one-frame model cleans. levels (frames, 2) is each frame's shot and read noise."""
+    return merge.mosaic(*merge.merged(frames, levels))
+
+
 def fired(bursts, levels):
     """Where the guard fires in bursts (N, frames, H, W): the colour cells (N, 1, H / 2, W / 2) where a
     later frame differs from the picked one by more than their noise allows.
@@ -246,13 +261,17 @@ def camera(file, models):
             where = fired(burst[None], levels[k : k + 1 + more])
             swaps[used] = swaps.get(used, 0) + tiles(where)
             furthest = max(furthest, float((sat_at.cpu() - read_off)[:, :2].abs().max()))
-            bursts[used] = (more, given, places, burst[None], apart[None], rolled[None], shift[None], where)
-        for name, (clean_up, slots, told) in models.items():
+            noise = levels[k : k + 1 + more]
+            bursts[used] = (more, given, places, burst[None], apart[None], rolled[None], shift[None], where, noise)
+        for name, (clean_up, slots, told, merges) in models.items():
             one, found = clean_up(frames[k + 1 : k + 2], means[k]), {}
             alone = read(look(one), thing, lines[k + 1], small)
-            for used, (more, given, places, burst, apart, rolled, shift, where) in bursts.items():
+            for used, (more, given, places, burst, apart, rolled, shift, where, noise) in bursts.items():
                 found[f"{used} one frame"] = alone
-                if slots > more:
+                if merges:
+                    many = clean_up(given[None], means[k], levels=noise)
+                    found[f"{used} burst"] = read(look(many), thing, places[0], small)
+                elif slots > more:
                     many = clean_up(burst, means[k], apart)
                     found[f"{used} burst"] = read(look(many), thing, places[0], small)
                     found[f"{used} swapped"] = read(look(swapped(many, one, where)), thing, places[0], small)
@@ -264,6 +283,8 @@ def camera(file, models):
                     merged = sum(float(weight) * frame for weight, frame in zip(weights, given))[None]
                     place = sum(float(weight) * place for weight, place in zip(weights, places))
                     found[f"{used} merged"] = read(look(clean_up(merged, means[k])), thing, place, small)
+                    lined = clean_up(aligned(given[None], noise), means[k])
+                    found[f"{used} aligned"] = read(look(lined), thing, places[0], small)
             kept = rows.setdefault(name, {})
             for way, counts in found.items():
                 kept[way] = kept.get(way, 0) + counts
@@ -285,13 +306,19 @@ def shown(title, rows):
 
 
 def entrants(specs):
-    """{name: (cleaner, slots, whether it is told how far its frames sit apart)} for each NAME=WEIGHTS."""
+    """{name: (cleaner, slots, whether it is told how far its frames sit apart, whether it takes a
+    merged burst)} for each NAME=WEIGHTS."""
     if small_print.DEVICE == "cpu":
         torch.set_num_threads(small_print.THREADS)
     models = {}
     for name, _, weights in (spec.partition("=") for spec in specs):
         model = small_print.trained(weights)
-        models[name] = (train_raw.cleaner(model), train_raw.slots(model), hasattr(model, "apart"))
+        models[name] = (
+            train_raw.cleaner(model),
+            train_raw.slots(model),
+            hasattr(model, "apart"),
+            hasattr(model, "more"),
+        )
     return models
 
 
@@ -378,11 +405,20 @@ def equal(*specs):
             where = fired(lined[None], [[shot, read_noise]] * FRAMES)
             taken[way] = taken.get(way, 0) + float(where.float().mean()) / len(things)
             bursts[way] = (burst[None], true[None] / 2, lined[None], told_off[None])
-        for name, (clean_up, slots, told) in models.items():
-            pooled, given, mean = rows.setdefault(name, {}), min(slots, FRAMES), means[len(under) - 1]
+        for name, (clean_up, slots, told, merges) in models.items():
+            pooled, mean = rows.setdefault(name, {}), means[len(under) - 1]
+            given = FRAMES if slots == 1 else min(slots, FRAMES)
             found = {f"{iso} one frame": clean_up(alone[iso][thing], means[at]) for at, iso in enumerate(under)}
-            for way, (burst, true, lined, told_off) in bursts.items() if slots > 1 else ():
-                where = fired(lined[:, :given], [[shot, read_noise]] * given)
+            for way, (burst, true, lined, told_off) in bursts.items():
+                noise = [[shot, read_noise]] * given
+                if merges:
+                    found[f"{PICKED} {given} frames {way}"] = clean_up(burst[:, :given], mean, levels=noise)
+                    continue
+                if slots == 1:
+                    found[f"{PICKED} {given} frames {way}, merged"] = clean_up(burst.mean(1), mean)
+                    found[f"{PICKED} {given} frames {way}, aligned"] = clean_up(aligned(burst, noise), mean)
+                    continue
+                where = fired(lined[:, :given], noise)
                 many = clean_up(lined[:, :given], mean, told_off[:, : given - 1])
                 found[f"{PICKED} {given} frames {way}"] = many
                 found[f"{PICKED} {given} frames {way}, swapped"] = swapped(many, found[f"{PICKED} one frame"], where)
@@ -400,11 +436,14 @@ def equal(*specs):
         )
 
 
-def moved(name, clean_up, slots, rng):
+def moved(name, clean_up, slots, merges, rng):
     """One Ricoh's full-colour windows as bursts with a moved patch in each: how far the picture is from
     the truth, in 8-bit levels of the developed picture, inside the patches and then outside them,
     from the burst, from the burst behind the guard and from the picked frame alone; the share of
-    the picture the guard swapped; and how far off the line-up was over a window, px."""
+    the picture the guard swapped; and how far off the line-up was over a window, px. A one-frame
+    model's burst is FRAMES frames lined up and merged (aligned()), and a model that takes a merged
+    burst gets the same frames: neither has a guard, so the second figure is the first again, the
+    share is the weight the merge's trust took from the later frames, and the line-up is merge.py's."""
     data, levels = (
         np.load(bench_raw.BENCH / "colour" / f"{name}.npz"),
         np.load(small_print.READER.parent / f"{name}.npz"),
@@ -412,36 +451,48 @@ def moved(name, clean_up, slots, rng):
     on = lambda key: torch.from_numpy(data[key].astype(np.float32)).to(small_print.DEVICE)
     truth, wb, matrix = on("truth"), on("wb"), on("matrix")
     shot, read_noise = levels["levels"][levels["isos"].tolist().index(PICKED)]
-    seen, _, _, patch, true = train_raw.burst(truth, max(slots, 2), fewer=0, uneven=0, moving=1)
+    count = FRAMES if merges or slots == 1 else slots
+    seen, _, _, patch, true = train_raw.burst(truth, count, fewer=0, uneven=0, moving=1)
     frames = small_print.made_up(bench_raw.mosaiced(seen), shot, read_noise, rng)
     frames = frames.view(len(truth), -1, *truth.shape[-2:])
-    found_at = [measured(burst) for burst in frames]
-    lined, apart = (torch.stack(part) for part in zip(*(lined_up(burst, at) for burst, at in zip(frames, found_at))))
-    wrong = torch.stack([train_raw.sat(at[:, :2], at[:, 2], *truth.shape[-2:]) for at in found_at]) - true
-    mean = float(frames[:, 0].mean())
+    mean, noise = float(frames[:, 0].mean()), [[shot, read_noise]] * count
     exposure = 0.108 / bench_raw.develop(truth, wb, matrix).median()
     picture = lambda result: (bench_raw.develop(result, wb, matrix) * exposure).clamp(0, 1) ** (1 / 2.2)
     far = lambda result: 255 * (picture(result) - picture(truth)).abs().mean(1, keepdim=True)
-    where = fired(lined, [[shot, read_noise]] * frames.shape[1])
-    many, one = clean_up(lined, mean, apart), clean_up(frames[:, 0], mean)
-    ways = [far(result) for result in (many, swapped(many, one, where), one)]
+    one = clean_up(frames[:, 0], mean)
+    if merges or slots == 1:
+        offsets, weights = merge.flows(frames, noise)
+        sat = merge.spread(offsets.flatten(0, 1), *true.shape[-2:]).view_as(true)
+        wrong, taken = sat - true, 1 - float(weights.mean())
+        many = clean_up(frames, mean, levels=noise) if merges else clean_up(aligned(frames, noise), mean)
+        safe = many
+    else:
+        found_at = [measured(burst) for burst in frames]
+        lined, apart = (
+            torch.stack(part) for part in zip(*(lined_up(burst, at) for burst, at in zip(frames, found_at)))
+        )
+        wrong = torch.stack([train_raw.sat(at[:, :2], at[:, 2], *truth.shape[-2:]) for at in found_at]) - true
+        where = fired(lined, noise)
+        many, taken = clean_up(lined, mean, apart), float(where.float().mean())
+        safe = swapped(many, one, where)
+    ways = [far(result) for result in (many, safe, one)]
     found = [[float(way[place].mean()) for way in ways] for place in (patch, ~patch)]
-    return found, float(where.float().mean()), float(wrong.pow(2).mean().sqrt())
+    return found, taken, float(wrong.pow(2).mean().sqrt()), count
 
 
 @torch.no_grad()
 def moving(weights):
-    ((clean_up, slots, _),) = entrants([f"={weights}"]).values()
+    ((clean_up, slots, _, merges),) = entrants([f"={weights}"]).values()
     rng = torch.Generator().manual_seed(0)
     torch.manual_seed(0)
     for name in bench_raw.CAMERAS:
-        found, share, off = moved(name, clean_up, slots, rng)
+        found, share, off, count = moved(name, clean_up, slots, merges, rng)
         told = [
             f"{place} burst {burst:.3f}, swapped {safe:.3f} ({safe / one:.3f} of one frame), one frame {one:.3f}"
             for place, (burst, safe, one) in zip(("inside the patches", "outside them"), found)
         ]
         print(
-            f"{name}, ISO {PICKED}'s noise, {slots} frames, a moved patch in every window, 8-bit levels from the truth:"
+            f"{name}, ISO {PICKED}'s noise, {count} frames, a moved patch in every window, 8-bit levels from the truth:"
             f" {'; '.join(told)}; the guard swapped {share:.1%} of the picture; the line-up {off:.3f} px off",
             flush=True,
         )

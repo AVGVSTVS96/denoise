@@ -78,6 +78,15 @@ tests: read detail there, under made-up noise.
 
     uv run bench_raw.py quality joint-v2=data/models/raw/joint-v2/joint.pth      those numbers alone
 
+On the real noisy frames the truth of all of that is the clean twin through the bilinear demosaic. A
+cleaned mosaic through the same demosaic shares its errors and a model's own picture does not, so
+detail, texture and PSNR there favour a model that hands back a mosaic. Each of those tests is
+therefore also scored on the mosaic itself, with no demosaic on either side, as "<test>-mosaic" in
+the same file (quality.on_mosaic): a picture is sampled back to a mosaic by each pixel's own colour.
+Its rows are PSNR, then kept at the green, the red and the blue sites, then wrong, texture kept and
+texture wrong at the same three: thirteen numbers. A model that hands back a mosaic scores the same
+there whatever demosaic its picture is made by.
+
 "night" is the test of what the model is for: data/night-raw's dark scenes, ELD's, SID's Sony ones
 and RawNIND's, each a real noisy frame against a long exposure, 8 windows a pair. Its windows are in
 the noisy frame's own units, the ones denoise() meets, with the clean frame brought to them by the
@@ -723,6 +732,35 @@ def dials_one(clean_up, cut, demosaic=None):
     return found
 
 
+@torch.no_grad()
+def on_mosaic(clean_up, camera):
+    """{ISO: [PSNR, kept at the green, the red and the blue sites, then wrong, texture kept and texture
+    wrong at the same three]} of what clean_up makes of a real test's windows against their clean twins,
+    mosaic against mosaic (quality.on_mosaic)."""
+    return over_cameras([on_mosaic_one(clean_up, windows(name)) for name in cuts(camera)])
+
+
+@torch.no_grad()
+def on_mosaic_one(clean_up, cut):
+    """on_mosaic() for one file's windows. A picture is sampled back to a mosaic, and both mosaics are
+    white-balanced and developed as dials_one() develops a picture, but for the colour matrix, which
+    needs every colour at a pixel. Busy and textured are where dials_one() has them."""
+    frames, isos, means, wb, matrix, twins, *_ = cut
+    exposure = 0.108 / develop(frames[0], wb, matrix).median()
+    shown = lambda linear: ((linear * exposure).clamp(0, 1) ** (1 / 2.2))[..., EDGE:-EDGE, EDGE:-EDGE]
+    balance = mosaiced(wb.view(1, 3, 1, 1).expand(1, 3, *frames.shape[-2:]))
+    found = {}
+    for iso, noisy, mean, twin in zip(isos, frames[1:], means, twins):
+        truth = shown(develop(twin, wb, matrix))
+        flat, busy = quality.regions(truth)
+        result = shown(mosaiced(clean_up(noisy, mean)) * balance)
+        sites = quality.on_mosaic(result, shown(twin * balance), busy, quality.texture(truth, flat))
+        found[iso] = [sites["psnr_mosaic"]] + [
+            value for key in ("kept", "wrong", "texture_kept", "texture_wrong") for value in sites[f"mosaic_{key}"]
+        ]
+    return found
+
+
 def at_gain(clean_up, times):
     """clean_up as it runs at times its gain: the same windows, shown to it that much brighter."""
     return lambda mosaics, mean: clean_up(mosaics * times, mean) / times
@@ -879,6 +917,14 @@ def main(specs, only=""):
             f"{test}  stops cleaner / detail kept / finest detail kept",
             lambda row: f"{row[1]:.2f} {row[2]:.3f} {row[3]:.3f}",
         )
+        if test in real:
+            sites = look_table.setdefault(f"{test}-mosaic", {})
+            sites |= {name: on_mosaic(clean_up, cut) for name, clean_up in cleaners.items()}
+            show(
+                sites,
+                f"{test}-mosaic  PSNR / kept / wrong at the green sites",
+                lambda row: f"{row[0]:.2f} {row[1]:.3f} {row[4]:.3f}",
+            )
         looks.write_text(json.dumps(look_table, indent=1))
 
 

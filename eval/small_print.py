@@ -447,7 +447,7 @@ def trained(weights):
     state = torch.load(weights, map_location="cpu")
     model = train_raw.shaped(state)
     model.load_state_dict(state)
-    return model.to(DEVICE).eval()
+    return train_raw.as_trained(model, weights).to(DEVICE).eval()
 
 
 def entrants(specs):

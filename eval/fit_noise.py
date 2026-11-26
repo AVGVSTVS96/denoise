@@ -147,13 +147,21 @@ def together(clean, noisy, gains):
     left = [blocks(plane - gain * twin) for plane, twin, gain in zip(planes, twins, gains)]
     busy = sum(blocks(twins[plane]).std((1, 2)) for plane in (0, 1, 3))
     flattest = usable & (busy <= np.quantile(busy[usable], FLATTEST))
-    red, green, other, blue = noise = [part[flattest] - part[flattest].mean((1, 2), keepdims=True) for part in left]
+    noise = [part[flattest] - part[flattest].mean((1, 2), keepdims=True) for part in left]
+    far = ties(noise, FAR)
+    return {} if max(far["across"] + far["down"]) > SCENE else ties(noise)
+
+
+def ties(noise, apart=1):
+    """The correlations together() stores, of four colour planes' centred blocks of noise (red, green, green,
+    blue): red's and blue's with the green beside it, and each plane's with its own pixel that far across and down."""
+    red, green, other, blue = noise
     alike = lambda a, b: float((a * b).sum() / np.sqrt((a * a).sum() * (b * b).sum()))
-    across = lambda apart: [alike(plane[:, :, :-apart], plane[:, :, apart:]) for plane in noise]
-    down = lambda apart: [alike(plane[:, :-apart], plane[:, apart:]) for plane in noise]
-    if max(across(FAR) + down(FAR)) > SCENE:
-        return {}
-    return {"beside": [alike(red, green), alike(blue, other)], "across": across(1), "down": down(1)}
+    return {
+        "beside": [alike(red, green), alike(blue, other)],
+        "across": [alike(plane[:, :, :-apart], plane[:, :, apart:]) for plane in noise],
+        "down": [alike(plane[:, :-apart], plane[:, apart:]) for plane in noise],
+    }
 
 
 def measure(clean, noisy, share=1.0):
