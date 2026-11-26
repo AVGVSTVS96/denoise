@@ -7,8 +7,11 @@
 
 The app packs a mosaic tile into four planes (R, G, G, B) and gets camera RGB at the mosaic's size
 back, so the file holds train_raw's fed() and made() around the network: the fixed mix to twelve
-planes, NAFNet, the pixel shuffle. Half precision, with the layer norms and pools left in fp32 as
-ship.py leaves them (Hush's export), because WebGPU computes fp16 for real and those overflow it.
+planes, NAFNet, the pixel shuffle. The network is train_raw.as_trained()'s: each block's attention takes
+its mean with the tile's edge ring at the share the run's crops gave it, so the app's tiles of 1,024 px
+give it what training did; without that r22-big's picture breaks on them. Half precision, with the
+layer norms and those means left in fp32 as ship.py leaves its norms and pools (Hush's export),
+because WebGPU computes fp16 for real and those overflow it.
 
 The app scales and tiles a photo as train_raw.denoise() does, tile_gain() and the fade between tiles
 with it, and reads tile_gain()'s two numbers from the manifest this writes. A model trained with
@@ -21,6 +24,11 @@ it is. NAFNet adds its input to its output, so below the ceiling nothing changes
 network's values grow with the input: a lamp at the top gain drives them past 100,000, where fp16
 ends at 65,504 and WebGPU would hand back a tile of NaN. After tile_gain() only lights smaller than
 its block still pass the ceiling; without it every light a dark photo's gain lifts past it does.
+
+BOUNDS: each block's attention is held to the range it spans on real tiles, PHOTOS' and the full-colour
+tests' windows, widened by Hush's margin, as ship.py holds the photo model's. On tiles no photo
+gives, r22-big's attention fed on itself to 110,000, past fp16; held, its largest value is 31,000.
+The unseen cameras' small print windows come out within 55 dB of the unheld model's and read the same.
 
 Three checks before anything is written into the app:
   the largest value any fp16 step holds, on real photos' tiles at the gain the app gives them and
@@ -41,16 +49,19 @@ import json
 import pathlib
 import shutil
 import sys
+import warnings
 
 import numpy as np
 import onnx
 import onnxruntime as ort
 import torch
+from onnxconverter_common import float16
 
 import evaluate  # isort: split
 
 # Hush's tools, which evaluate puts on the path.
 import export
+from nafnet import blocks, bound_attention
 
 import bench_raw
 import blacks
@@ -93,7 +104,7 @@ def loaded(path):
     width, planes = state["intro.weight"].shape[:2]
     if planes != 12:
         sys.exit(f"{path} is a faithful model (mosaic out); the app has no demosaic for it")
-    model = train_raw.network(width, True)
+    model = train_raw.as_trained(train_raw.network(width, True), path)
     model.load_state_dict(state)
     return Picture(model).eval(), f"NAFNet width {width}, joint denoise and demosaic on raw Bayer, {path.parent.name}{step}"
 
@@ -113,6 +124,22 @@ def exported(model, path):
     onnx.checker.check_model(onnx.load(str(path)), full_check=True)
 
 
+def islands(model):
+    """The steps that stay in fp32: Hush's, the layer norms and pools, and train_raw.Mean's means, which sum as a pool does."""
+    means = [node.name for node in model.graph.node if node.op_type == "ReduceMean" and "/sca/" in node.name]
+    return export.fp32_islands(model) + means
+
+
+def halved(fp32, fp16):
+    """export.convert_fp16 with islands() left in fp32."""
+    model = onnx.load(str(fp32))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        half = float16.convert_float_to_float16(model, keep_io_types=True, node_block_list=islands(model))
+    onnx.checker.check_model(half, full_check=True)
+    onnx.save(half, str(fp16))
+
+
 def packed(mosaic):
     return train_raw.pack(torch.from_numpy(np.ascontiguousarray(mosaic))[None]).numpy()
 
@@ -127,6 +154,39 @@ def photo_tiles(path, held, count=3):
     cut = lambda y, x: mosaic[y : y + TILE, x : x + TILE]
     scaled = lambda tile: tile * (train_raw.tile_gain(tile, gain) if held else gain)
     return {f"{path.parent.name}/{path.name} {y},{x}": packed(scaled(cut(y, x))) for y, x in picks}
+
+
+def test_tiles(count=2):
+    """Windows of the full-colour tests of the GR III and the seen cameras, a few at every ISO, at their photo's gain."""
+    tiles = {}
+    for camera in (*bench_raw.cuts("colour/gr3"), *bench_raw.cuts("colour/seen")):
+        data = np.load(bench_raw.BENCH / f"{camera}.npz")
+        for iso, frames, mean in zip(data["isos"].tolist(), data["frames"], data["means"].tolist()):
+            gain = min(max(train_raw.LEVEL / mean, 1), train_raw.MAX_GAIN)
+            tiles |= {f"{camera} {iso} {at}": packed(frames[at].astype(np.float32) * gain) for at in range(count)}
+    return tiles
+
+
+def bounded(model, tiles):
+    """The model with every block's attention held to the range it spans on tiles, widened by Hush's margin."""
+    low, high = {}, {}
+
+    def record(name):
+        def hook(_module, _inputs, output):
+            weights = output.flatten()
+            low[name] = torch.minimum(low.get(name, weights), weights)
+            high[name] = torch.maximum(high.get(name, weights), weights)
+
+        return hook
+
+    hooks = [block.sca.register_forward_hook(record(name)) for name, block in blocks(model)]
+    with torch.no_grad():
+        for planes in tiles.values():
+            model(torch.from_numpy(planes))
+    for hook in hooks:
+        hook.remove()
+    bound_attention(model, {name: (low[name].tolist(), high[name].tolist()) for name in low}, export.ATTENTION_MARGIN)
+    return model
 
 
 def made_up_tiles():
@@ -160,10 +220,11 @@ def peaks(fp32, fp16):
 
     Run in priority order, which takes a step's largest value as soon as the step is made and lets its
     values go. The default order leaves all of that to the end and holds every step's values until then,
-    13 GB for one tile where this holds 1.
+    13 GB for one tile where this holds 1. Without the arena, which keeps what a tile took for the
+    next and at width 64 passes 6 GB by the second tile.
     """
     model = onnx.load(str(fp32))
-    half = {node.name for node in onnx.load(str(fp16)).graph.node} - set(export.fp32_islands(model))
+    half = {node.name for node in onnx.load(str(fp16)).graph.node} - set(islands(model))
     names = []
     for node in [node for node in model.graph.node if node.name in half and node.op_type != "Constant"]:
         model.graph.node.append(onnx.helper.make_node("Abs", [node.output[0]], [f"{node.name}/size"]))
@@ -172,15 +233,14 @@ def peaks(fp32, fp16):
         names.append(node.name)
     options = ort.SessionOptions()
     options.execution_order = ort.ExecutionOrder.PRIORITY_BASED
+    options.enable_cpu_mem_arena = False
     return ort.InferenceSession(model.SerializeToString(), options, providers=["CPUExecutionProvider"]), names
 
 
-def audit(fp32, fp16, held):
+def audit(fp32, fp16, photos):
     """Stops the export if an fp16 step comes within half of fp16's largest number."""
     session, names = peaks(fp32, fp16)
-    tiles = made_up_tiles()
-    for path in PHOTOS:
-        tiles |= photo_tiles(path, held)
+    tiles = made_up_tiles() | photos
     worst = (0.0, "", "")
     for tile, planes in tiles.items():
         top, step = max(zip(map(float, session.run(names, {"input": planes})), names))
@@ -245,10 +305,12 @@ def shipped(fp16, name, held, manifest):
 def main(checkpoint, bright="", manifest="raw"):
     held = bright != "bright"
     model, name = loaded(pathlib.Path(checkpoint))
+    photos = {tile: planes for path in PHOTOS for tile, planes in photo_tiles(path, held).items()}
+    bounded(model, photos | test_tiles())
     fp32, fp16 = (evaluate.MODELS / f"{manifest}-joint-{precision}.onnx" for precision in ("fp32", "fp16"))
     exported(model, fp32)
-    export.convert_fp16(fp32, fp16)
-    report = {"model": name, "fp16 range": audit(fp32, fp16, held), "parity": parity(model, fp32, fp16)}
+    halved(fp32, fp16)
+    report = {"model": name, "fp16 range": audit(fp32, fp16, photos), "parity": parity(model, fp32, fp16)}
     print(json.dumps(report, indent=1))
     print(shipped(fp16, f"{name}, fp16", held, manifest), fp16.stat().st_size, export.sha256_file(fp16))
 
