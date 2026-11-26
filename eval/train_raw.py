@@ -432,12 +432,51 @@ def shaped(state):
     return network(first.shape[0], first.shape[1] == 12, slots, "apart.weight" in state, "more.weight" in state)
 
 
+class Mean(torch.nn.Module):
+    """The mean over a tile that a block's attention is made from, with the tile's outermost ring of
+    cells weighing edge of it: the share that ring is of the crops the model was trained on.
+
+    A convolution pads with nothing, so the ring holds other values than the inside: -63 against 26
+    in one channel of r22-big's ninth middle block. The plain mean mixes the two by the tile's
+    size, and a run's attention comes to count on the mix its crops gave it. r22-big holds where the
+    ring is 0.19 to 0.27 of a middle block's cells, a tile of 448 to 640 px, and runs away on either
+    side, each block's attention moving the next block's mean further: values of 400 and up on tiles
+    from 768 px, and on a 448 px tile given the 0.12 of a 1,024 px tile, and of 46 on a flat tile of
+    256 px, whose ring is 0.44. Its own 768 px crops, at 0.16, hold in training and not on every
+    photo. On a tile of the crops' size this is the plain mean.
+    """
+
+    def __init__(self, edge):
+        super().__init__()
+        self.edge = edge
+
+    def forward(self, x):
+        sides = x[..., 1:-1, :1], x[..., 1:-1, -1:]
+        ring = torch.cat([x[..., :1, :], x[..., -1:, :], *(side.transpose(-2, -1) for side in sides)], -1)
+        return self.edge * ring.mean((-2, -1), True) + (1 - self.edge) * x[..., 1:-1, 1:-1].mean((-2, -1), True)
+
+
+def as_trained(model, weights):
+    """A model with every block's attention fed the mean its run's crops gave it (Mean), whatever the
+    tile: a crop is the first of --size in the run.json beside the weights. A model without one
+    keeps the plain mean."""
+    run = pathlib.Path(weights).with_name("run.json")
+    if not run.exists():
+        return model
+    side = int(np.ravel(json.loads(run.read_text())["size"])[0])
+    for level, stage in zip((0, 1, 2, 3, 4, 3, 2, 1, 0), (*model.encoders, model.middle_blks, *model.decoders)):
+        cells = side >> level + 1
+        for block in stage:
+            block.sca[0] = Mean(4 * (cells - 1) / cells**2)
+    return model
+
+
 def trained(weights):
-    """A saved model, faithful or joint, at whatever width it was trained."""
+    """A saved model, faithful or joint, at whatever width it was trained, to run on tiles of any size (as_trained)."""
     state = torch.load(weights, map_location="cpu")
     model = shaped(state)
     model.load_state_dict(state)
-    return model.cuda().eval()
+    return as_trained(model, weights).cuda().eval()
 
 
 def widened(state):
