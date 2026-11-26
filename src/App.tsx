@@ -46,9 +46,9 @@ type Finished = (result: Blob, info: { model: string; width: number; height: num
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
-const LOOKS: Look[] = ["raw", "crisp", "burst"];
+const LOOKS: Look[] = ["raw", "crisp", "big", "burst"];
 const FRAMES = 4;
-const LOOK = { raw: "Standard", crisp: "Crisper", burst: "Burst" };
+const LOOK = { raw: "Standard", crisp: "Crisper", big: "Best", burst: "Burst" };
 
 const fresh = (): Run => ({
   stage: "decode",
