@@ -1717,8 +1717,8 @@ def main(args):
                 seen, steps, _, _, _ = burst(truth, count, fewer=0, shake=HELD, bad=BAD)
                 noisy, _, known = noisy_of(seen, steps)
                 noisy, told = at_white(noisy.view(len(truth), count, *truth.shape[-2:]), g[:, None]), None
-                out = torch.empty(len(truth), 1, 1, device=truth.device).uniform_(-MISTOLD, MISTOLD)
-                known = known.view(len(truth), count, 2) * 2**out
+                miss = torch.empty(len(truth), 1, 1, device=truth.device).uniform_(-MISTOLD, MISTOLD)
+                known = known.view(len(truth), count, 2) * 2**miss
             else:
                 noisy, told = at_white(noisy_of(truth)[0], g), None
             picture = cleaned(noisy, told, known)
