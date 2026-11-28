@@ -86,9 +86,13 @@ out whatever its contrast: all of that stays under L1 alone. The truth's own gra
 finest band too, so where a flat part passes for texture the network is asked for that much grain
 and no more. The weights are a run's to set by how hard a term pulls beside L1, not by what is
 published: at --perceptual 1 --adversarial 0.1 the two pull a hundred times as hard as L1, through
-weights every part of the picture shares, and in 5,000 steps hard edges lost a seventh of their
-finest band and the picture 1.1 dB, with nothing gained where it is textured (r27-look). A run
-without it is what it was.
+weights every part of the picture shares, and cost 1 dB in 5,000 steps (r27-look). At 0.3 and
+0.003, from r8-p00 in its own recipe (r29-look), the picture at 4,000 steps keeps 12 to 23% more of
+the truth's texture on every test, its hard edges and its print as they were, for 0.2 to 0.3 dB
+and a quarter to three quarters more noise left where the truth is flat. Holding the terms off the
+flat parts does not spare them: a network cannot tell faint texture from noise in what it is
+given, so this is the trade LPIPS makes over a whole picture, with the edges kept out of it. The
+gain is there by 4,000 steps and only the cost grows after. A run without it is what it was.
 
 --truth data/rawshift 0.25 takes that share of the joint crops from truth a sensor measured in full
 colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
