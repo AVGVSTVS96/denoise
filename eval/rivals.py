@@ -15,6 +15,10 @@ darktable    darktable 5.6's rawdenoise-nind, a U-Net trained on RawNIND. Packed
              picture too bright wherever green is not the mean of red and blue (3 dB here). Each
              colour is set back to its own planes' mean instead, and the input is not clipped at
              black as darktable clips it, which costs it up to 1 dB at ISO 102,400.
+okeinla-*    Okeinla, a NAFNet trained by RawNIND's code on RawNIND and its author's own pairs, made
+             for darktable too and set back as darktable's is. Its network takes any size, so a
+             window goes in whole: 0.03 to 0.07 dB over darktable's mirrored tiles. 1.0 was trained
+             with a VGG term; 1.1 is 1.0 trained on without one.
 rawforge-*   RawForge's TreeNet denoisers, NAFNet-like and told the ISO. They take a picture, not a
              mosaic: the mosaic's colours turned to linear Rec.2020 without a white balance, then
              Malvar's demosaic, clipped to 0..1. Rec.2020 comes out and is turned back to camera RGB.
@@ -27,6 +31,10 @@ led-*        LED's pretrained networks, the starting points it fine-tunes per ca
              colour plane is fitted to the noisy window, worth 1 to 4 dB to it.
 eld-*        ELD's U-Nets as LED's model zoo ships them, each trained on ELD's noise model of one
              camera, the Sony A7S II or the Nikon D850, for gains of 1 to 200. Fed and fitted as LED's.
+rawdenoise-lab
+             sndstone's denoiser_1.1, a NAFNet trained as ours are, on clean frames under made-up
+             noise measured on five cameras: packed R, G, B, G in and out, a window whole. The network
+             alone, without its app's hot-pixel pass or the noisy pixels it puts back near white.
 
 One that puts out a picture gets two rows. "<name>" develops that picture with the test's white
 balance and matrix, so its own demosaic is scored against the clean frame's bilinear one.
@@ -72,11 +80,14 @@ RIVALS = raw_pairs.DATA / "rivals"
 BOARD = raw_pairs.DATA / "out" / "bench.json"
 QUALITY = raw_pairs.DATA / "out" / "quality.json"
 RELEASES = {
-    "darktable/rawdenoise-nind.dtmodel": "darktable-org/darktable-ai/releases/download/release-5.6.0",
-    "rawforge/ShadowWeightedL1.pt": "rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
-    "rawforge/ShadowWeightedL1_24_deep_500.pt": "rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
-    "rawforge/ShadowWeightedL1_light.pt": "rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
-    "rawforge/DemoRestormerDiT_to_demo_cont_cont_768_RawNIND.pt": "rymuelle/RawForge/releases/download/JDD_v1.0.0",
+    "darktable/rawdenoise-nind.dtmodel": "github.com/darktable-org/darktable-ai/releases/download/release-5.6.0",
+    "rawforge/ShadowWeightedL1.pt": "github.com/rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
+    "rawforge/ShadowWeightedL1_24_deep_500.pt": "github.com/rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
+    "rawforge/ShadowWeightedL1_light.pt": "github.com/rymuelle/RawRefinery/releases/download/v1.2.1-alpha",
+    "rawforge/DemoRestormerDiT_to_demo_cont_cont_768_RawNIND.pt": "github.com/rymuelle/RawForge/releases/download/JDD_v1.0.0",
+    "okeinla/iter_2940000.pt": "huggingface.co/AyedaOk/okeinla/resolve/7d4480d305ac9a425832afb9c110ee0b1af0200a/pytorch",
+    "okeinla/iter_100000.pt": "huggingface.co/AyedaOk/okeinla/resolve/699e832c7af22515b7d746b23ad2fce9c678608d/pytorch",
+    "rawdenoise-lab/denoiser_1.1_weights.pt": "github.com/sndstone/rawdenoise-lab/releases/download/model-denoiser_1.1-2026-11-22",
 }
 DRIVE = {
     "led/nafnet.pth": "1FmqGv_YICLX4Gc-aWzvcTl8aWgeJ5cEB",
@@ -85,6 +96,8 @@ DRIVE = {
     "led/eld-nikon.pth": "1seTloGkpM2XbeeSwKSJHvq9khICnbfLv",
 }
 UTNET = "https://raw.githubusercontent.com/trougnouf/rawnind_jddc/master/src/rawnind/models/raw_denoiser.py"
+NAFNET = "https://raw.githubusercontent.com/AyedaOk/okeinla/8ce1e395ea1fc60d0682466ba453a349eb7cdcab/src/rawnind/models/nafnet.py"
+LAB = "https://raw.githubusercontent.com/sndstone/rawdenoise-lab/719ef123c605988dc20f024fc5cc6a1cb3ebd3ad/src/denoise_lab/model.py"
 REC2020_FROM_XYZ = (
     (1.71666343, -0.35567332, -0.25336809),
     (-0.66667384, 1.61645574, 0.0157683),
@@ -172,13 +185,15 @@ def fetch():
         (RIVALS / file).parent.mkdir(parents=True, exist_ok=True)
     for file, release in RELEASES.items():
         if not (RIVALS / file).exists():
-            torch.hub.download_url_to_file(f"https://github.com/{release}/{file.split('/')[1]}", RIVALS / file)
+            torch.hub.download_url_to_file(f"https://{release}/{file.split('/')[1]}", RIVALS / file)
     for file, drive_id in DRIVE.items():
         if not (RIVALS / file).exists():
             gdown.download(id=drive_id, output=str(RIVALS / file))
     if not (RIVALS / "led" / "LED").exists():
         subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Srameo/LED.git"], cwd=RIVALS / "led")
     urllib.request.urlretrieve(UTNET, RIVALS / "darktable" / "raw_denoiser.py")
+    urllib.request.urlretrieve(NAFNET, RIVALS / "okeinla" / "nafnet.py")
+    urllib.request.urlretrieve(LAB, RIVALS / "rawdenoise-lab" / "model.py")
     with zipfile.ZipFile(RIVALS / "darktable" / "rawdenoise-nind.dtmodel") as package:
         graph = onnx.load_model_from_string(package.read("rawdenoise-nind/model_bayer.onnx")).graph
     unet = source(RIVALS / "darktable" / "raw_denoiser.py", **{"rawnind.libs.rawproc": types.ModuleType("rawproc")})
@@ -187,18 +202,34 @@ def fetch():
     torch.jit.trace(model, torch.zeros(1, 4, 512, 512)).save(str(RIVALS / "darktable" / "model_bayer.pt"))
 
 
+def set_back(rgb, planes):
+    """A RawNIND network's picture, which comes out at a gain of its own, with each colour at its planes' mean."""
+    level = lambda planes: planes.mean((2, 3), keepdim=True)
+    red, green, also_green, blue = level(planes).unbind(1)
+    return rgb * torch.stack([red, (green + also_green) / 2, blue], 1) / level(rgb)
+
+
 def darktable():
     model = torch.jit.load(str(RIVALS / "darktable" / "model_bayer.pt"), map_location="cuda").eval()
-    level = lambda planes: planes.mean((2, 3), keepdim=True)
 
     def clean_up(mosaics, mean):
         planes = train_raw.pack(mosaics)
         tiles = torch.nn.functional.pad(
             torch.nn.functional.pad(planes, (64,) * 4, mode="reflect"), (64,) * 4, mode="reflect"
         )
-        rgb = torch.cat([model(part) for part in tiles.split(4)])[..., 256:-256, 256:-256]
-        red, green, also_green, blue = level(planes).unbind(1)
-        return rgb * torch.stack([red, (green + also_green) / 2, blue], 1) / level(rgb)
+        return set_back(torch.cat([model(part) for part in tiles.split(4)])[..., 256:-256, 256:-256], planes)
+
+    return clean_up
+
+
+def okeinla(weights):
+    model = source(RIVALS / "okeinla" / "nafnet.py").NAFNet(funit=32)
+    model.load_state_dict(torch.load(RIVALS / "okeinla" / weights, map_location="cpu"))
+    model.cuda().eval()
+
+    def clean_up(mosaics, mean):
+        planes = train_raw.pack(mosaics)
+        return set_back(torch.cat([model(part) for part in planes.split(4)]), planes)
 
     return clean_up
 
@@ -272,6 +303,22 @@ def rawforge_jdd():
     return clean_up
 
 
+def rawdenoise_lab():
+    saved = torch.load(RIVALS / "rawdenoise-lab" / "denoiser_1.1_weights.pt", map_location="cpu")
+    config = {key: value for key, value in saved["model_config"].items() if key != "arch"}
+    model = source(RIVALS / "rawdenoise-lab" / "model.py").DenoiseNet(**config)
+    model.load_state_dict(saved["model"])
+    model.cuda().eval()
+
+    def clean_up(mosaics, mean):
+        red, green, also_green, blue = train_raw.pack(mosaics).unbind(1)
+        fed = torch.stack([red, green, blue, also_green], 1)
+        red, green, blue, also_green = torch.cat([model(part) for part in fed.split(4)]).unbind(1)
+        return train_raw.unpack(torch.stack([red, green, also_green, blue], 1))
+
+    return clean_up
+
+
 def led_arch(name):
     """One of LED's network files, without the rest of its package: only its registry is in the way."""
     registry = types.SimpleNamespace(ARCH_REGISTRY=types.SimpleNamespace(register=lambda: lambda arch: arch))
@@ -327,6 +374,8 @@ def fitted(clean_up):
 
 PICTURES = {
     "darktable": darktable,
+    "okeinla-1.0": lambda: okeinla("iter_2940000.pt"),
+    "okeinla-1.1": lambda: okeinla("iter_100000.pt"),
     "rawforge": lambda: rawforge("ShadowWeightedL1.pt"),
     "rawforge-heavy": lambda: rawforge("ShadowWeightedL1_24_deep_500.pt"),
     "rawforge-light": lambda: rawforge("ShadowWeightedL1_light.pt"),
@@ -337,6 +386,7 @@ MOSAICS = {
     "led-unet": lambda: led("unet-1-200.pth"),
     "eld-sony": lambda: eld("eld-sony.pth"),
     "eld-nikon": lambda: eld("eld-nikon.pth"),
+    "rawdenoise-lab": rawdenoise_lab,
 }
 
 
