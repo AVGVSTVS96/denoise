@@ -69,7 +69,7 @@ def bands(picture):
     return torch.stack([sharper - softer for sharper, softer in itertools.pairwise(steps)])
 
 
-def regions(truth):
+def regions(truth, flattest=FLATTEST):
     """Where the truth (N, 3, H, W) is flattest and where it is busiest, as masks (N, 1, H, W).
 
     By how much its brightness moves within 12 px or so, pooled over 17 px: the flattest and the
@@ -80,7 +80,7 @@ def regions(truth):
     padded = torch.nn.functional.pad(moves * moves, (8,) * 4, mode="reflect")
     busy = torch.nn.functional.avg_pool2d(padded, 17, 1).sqrt()
     ranked = busy.flatten().sort().values
-    return busy <= ranked[int(FLATTEST * (len(ranked) - 1))], busy >= ranked[int((1 - BUSIEST) * (len(ranked) - 1))]
+    return busy <= ranked[int(flattest * (len(ranked) - 1))], busy >= ranked[int((1 - BUSIEST) * (len(ranked) - 1))]
 
 
 def texture(truth, flat):

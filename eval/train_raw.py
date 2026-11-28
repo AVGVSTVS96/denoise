@@ -73,6 +73,19 @@ differences it lives on are a few thousandths of white. It is in last.pth for a 
 with, and nowhere else: joint.pth is the network alone, as without it. "critic" in the log is its
 loss, 2 when it cannot tell the two apart and 0 when it always can.
 
+--textured holds those two terms to texture, for a second phase from a model trained for fidelity:
+--perceptual 1 --adversarial 0.1 --textured, the weights such terms have beside L1 where they are
+published, a hundred times what the two flags were tried at alone. Under a plain loss the answer to
+cloth, grain and leaves is their average, which is flat; these terms ask for something that looks
+like the truth there, and what they get is made up. So they are shown the truth itself with one
+thing changed (textured()): the picture's finest band, detail 2 to 3 px across, in place of the
+truth's, and only where the truth has fine detail and no hard edge, quality.py's texture. A letter,
+a rim and every coarser band are the truth to them, so nothing there earns anything, and laid print
+(--text) is left out whatever its contrast: all of that stays under L1 alone. The truth's own grain
+is in its finest band too, so where a flat part passes for texture the network is asked for that
+much grain and no more. The perceptual term is then LPIPS over VGG, the kind made to train by,
+where --perceptual alone is the AlexNet one the tests read. A run without it is what it was.
+
 --truth data/rawshift 0.25 takes that share of the joint crops from truth a sensor measured in full
 colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
 mosaic. It is used as it is, at the joint truth's size: nothing is binned, so it is as sharp as the
@@ -230,7 +243,8 @@ frames, what is left where the truth is flat as the eye weighs it at 2x, in 8-bi
 "gr3_stops_cleaner", the same in stops against the noisy frame's. A joint run adds, on the
 full-colour tests of the GR III and the seen cameras, "detail_kept" and "detail_invented", the share
 of the truth's detail the picture holds where the truth is busy and what else it holds there, and
-"finest_kept" and "finest_invented", the same of the band 2 to 3 px across. They are not "kept" and
+"finest_kept" and "finest_invented", the same of the band 2 to 3 px across, and "texture_kept" and
+"texture_wrong", that band where the truth is textured (quality.texture). They are not "kept" and
 "invented", which stay as they were: one size, over the whole picture.
 
 --held data/bench/night/held.json leaves the scenes that file names out of training: the ones
@@ -253,6 +267,7 @@ import torch
 import bench_raw
 import evaluate
 import merge
+import quality
 import raw_pairs
 import text_bank
 import text_reader
@@ -316,6 +331,9 @@ MOST, HELD, BAD, ASTRAY, SMEAR, MISTOLD, HOLD = 8, 6.0, 0.15, 16.0, (0.7, 2.0), 
 MEASURED = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 #: reader_loss's window and how near the page's ink it counts, in px of a page, and --reader's weight.
 WINDOW, NEAR, READER = 256, 17, 0.055
+#: textured(): the share of a crop taken as its flat part, how far round laid print nothing counts as
+#: texture, px, the least ink that is print, and the width the texture's border is feathered by, px.
+CALM, CLEAR, INK, FEATHER = 0.05, 17, 0.02, 1.4
 #: The joint network's twelve planes from the mosaic's four: red, green and blue, each at a 2x2 cell's
 #: four places in reading order. A colour goes where it was measured and the cell's mean elsewhere.
 SPREAD = (
@@ -773,6 +791,35 @@ def perceptual_loss(result, truth):
     """LPIPS between camera RGB (N, 3, H, W) and its truth, each developed()."""
     shown, wanted = developed(result, truth)
     return bench_raw.perceptual()(shown, wanted).mean()
+
+
+@functools.cache
+def vgg():
+    import lpips
+
+    return lpips.LPIPS(net="vgg", verbose=False).cuda().requires_grad_(False)
+
+
+def textured(shown, wanted, inked=None):
+    """developed()'s picture and truth as --textured's terms see them: the truth with the picture's
+    finest band in place of its own where the truth is textured, and the truth.
+
+    Textured is quality.texture(), fine detail and no hard edge, each crop against its own calmest
+    CALM: a test has a whole photo's windows to find a flat part in, and a crop that is all cloth
+    has none, so the flattest third of it would be cloth, and cloth would then pass for the truth's
+    grain. Nowhere within CLEAR px of laid print is textured, inked (N', 1, H, W) for the first
+    crops, where it covers INK of a pixel or more. The border is feathered by FEATHER px so that no
+    seam marks it. Everywhere else, and in every coarser band, the two are the same picture, so a
+    term over them pulls on the network's texture and on nothing else.
+    """
+    with torch.no_grad():
+        truth = (wanted + 1) / 2
+        where = torch.cat([quality.texture(one, quality.regions(one, CALM)[0]) for one in truth.split(1)])
+        if inked is not None:
+            where[: len(inked)] &= torch.nn.functional.max_pool2d(inked, CLEAR, 1, CLEAR // 2) < INK
+        share = quality.blurred(where.float(), FEATHER)
+    fine = lambda look: look - quality.blurred(look, quality.SIGMAS[0])
+    return wanted + share * (fine(shown) - fine(wanted)), wanted
 
 
 def discriminator():
@@ -1577,6 +1624,8 @@ def main(args):
     )
     if args.adversarial and not args.joint:
         raise SystemExit("--adversarial judges the joint crops' picture, for a --joint run")
+    if args.textured and not (args.perceptual or args.adversarial):
+        raise SystemExit("--textured holds --perceptual and --adversarial to texture, for a run with one of them")
     critic = discriminator().cuda() if args.adversarial else None
     critic_optimizer = (
         torch.optim.AdamW(critic.parameters(), lr=args.lr, betas=(0.5, 0.9), weight_decay=0, fused=True)
@@ -1764,12 +1813,17 @@ def main(args):
             loss = loss + picture_loss(picture, truth)
             if teacher and args.burst == 1 and not args.merged:
                 loss = loss + args.distil * picture_loss(picture, taught(teacher, noisy))
-            if args.perceptual:
+            if args.textured:
+                shown, wanted = textured(*developed(picture, truth), cover if printed else None)
+                if args.perceptual:
+                    loss = loss + args.perceptual * vgg()(shown, wanted).mean()
+            elif args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
             if reader and printed:
                 loss = loss + args.reader * reader_loss(reader, picture[:printed], truth[:printed], cover, spin)
             if critic:
-                shown, wanted = developed(picture, truth)
+                if not args.textured:
+                    shown, wanted = developed(picture, truth)
                 critic.requires_grad_(False)
                 loss = loss + args.adversarial * adversarial_loss(critic, shown)
         optimizer.zero_grad(set_to_none=True)
@@ -1837,7 +1891,14 @@ def main(args):
                     "gr3_colour": bench_raw.dials_one(clean_up, bench_raw.kept("colour/gr3")),
                     "seen_colour": bench_raw.dials(clean_up, "colour/seen"),
                 }
-                parts = ("detail_kept", "finest_kept", "detail_invented", "finest_invented")
+                parts = (
+                    "detail_kept",
+                    "finest_kept",
+                    "detail_invented",
+                    "finest_invented",
+                    "texture_kept",
+                    "texture_wrong",
+                )
                 line |= {
                     f"{test}_{part}": mean_of(look, 2 + at, 4)
                     for test, look in looks.items()
@@ -1915,6 +1976,11 @@ if __name__ == "__main__":
     parser.add_argument("--perceptual", type=float, default=0, help="weight of LPIPS on the joint crops' picture")
     parser.add_argument(
         "--adversarial", type=float, default=0, help="weight of a patch discriminator's verdict on that picture"
+    )
+    parser.add_argument(
+        "--textured",
+        action="store_true",
+        help="those two terms judge the finest band alone, where the truth has texture and no hard edge",
     )
     parser.add_argument("--bright", type=float, default=0, help="share of crops shown as a lit part of a dark photo")
     parser.add_argument(
