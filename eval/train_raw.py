@@ -73,20 +73,22 @@ differences it lives on are a few thousandths of white. It is in last.pth for a 
 with, and nowhere else: joint.pth is the network alone, as without it. "critic" in the log is its
 loss, 2 when it cannot tell the two apart and 0 when it always can.
 
---textured holds those two terms to texture, for a second phase from a model trained for fidelity:
---perceptual 1 --adversarial 0.1 --textured, the weights such terms have beside L1 where they are
-published, a hundred times what the two flags were tried at alone. Under a plain loss the answer to
-cloth, grain and leaves is their average, which is flat; these terms ask for something that looks
-like the truth there, and what they get is made up. So each sees only where the truth has fine
-detail and no hard edge, quality.py's texture (textured()). The perceptual term is shown the truth
-with the picture in place there, and is LPIPS over VGG, the kind made to train by, where
---perceptual alone is the AlexNet one the tests read. The discriminator is shown the finest band
-alone, detail 2 to 3 px across, the picture's against the truth's, and nothing where there is no
-texture: in a whole picture that band is two levels in 255, which a network held to a spectral
-norm of 1 cannot tell from none. A letter and a rim are not texture, so nothing there earns
-anything, and laid print (--text) is left out whatever its contrast: all of that stays under L1
-alone. The truth's own grain is in its finest band too, so where a flat part passes for texture
-the network is asked for that much grain and no more. A run without it is what it was.
+--textured holds those two terms to texture, for a second phase from a model trained for fidelity.
+Under a plain loss the answer to cloth, grain and leaves is their average, which is flat; these
+terms ask for something that looks like the truth there, and over a whole picture they pay for it
+with noise left where the truth is flat. So each sees only where the truth has fine detail and no
+hard edge, quality.py's texture (textured()). The perceptual term is shown the truth with the
+picture in place there. The discriminator is shown the finest band alone, detail 2 to 3 px across,
+the picture's against the truth's, and nothing where there is no texture: in a whole picture that
+band is two levels in 255, which a network held to a spectral norm of 1 cannot tell from none. A
+letter and a rim are not texture, so nothing there earns anything, and laid print (--text) is left
+out whatever its contrast: all of that stays under L1 alone. The truth's own grain is in its
+finest band too, so where a flat part passes for texture the network is asked for that much grain
+and no more. The weights are a run's to set by how hard a term pulls beside L1, not by what is
+published: at --perceptual 1 --adversarial 0.1 the two pull a hundred times as hard as L1, through
+weights every part of the picture shares, and in 5,000 steps hard edges lost a seventh of their
+finest band and the picture 1.1 dB, with nothing gained where it is textured (r27-look). A run
+without it is what it was.
 
 --truth data/rawshift 0.25 takes that share of the joint crops from truth a sensor measured in full
 colour, PixelShift200's four shots a pixel apart (pixel_shift.py), in place of truth binned from one
@@ -794,13 +796,6 @@ def perceptual_loss(result, truth):
     """LPIPS between camera RGB (N, 3, H, W) and its truth, each developed()."""
     shown, wanted = developed(result, truth)
     return bench_raw.perceptual()(shown, wanted).mean()
-
-
-@functools.cache
-def vgg():
-    import lpips
-
-    return lpips.LPIPS(net="vgg", verbose=False).cuda().requires_grad_(False)
 
 
 def textured(shown, wanted, inked=None):
@@ -1820,7 +1815,7 @@ def main(args):
             if args.textured:
                 look, (shown, wanted) = textured(*developed(picture, truth), cover if printed else None)
                 if args.perceptual:
-                    loss = loss + args.perceptual * vgg()(*look).mean()
+                    loss = loss + args.perceptual * bench_raw.perceptual()(*look).mean()
             elif args.perceptual:
                 loss = loss + args.perceptual * perceptual_loss(picture, truth)
             if reader and printed:
