@@ -1,35 +1,63 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { borrowing, setBorrowing } from "./blacks";
 import { MODELS, type Model } from "./cloud";
 import { rawPreview } from "./dng";
 import { listPhotos, savePhoto, type Photo } from "./library";
-import { modelBytes } from "./model";
+import type { Look } from "./model";
+import { detailed, MARGIN } from "./raw";
 import { setSharing, share, sharing } from "./training";
 import { cloudKey, finishSignIn, signIn, signOut } from "./openrouter";
-import type { FromWorker } from "./worker";
+import type { FromWorker, ToWorker } from "./worker";
 import Worker from "./worker?worker";
 
-type Job = {
-  name: string;
-  original: string;
-  cloud?: string;
-  width: number;
-  height: number;
+type Run = {
   stage: "decode" | "model" | "clean" | "done";
+  band?: number;
   loaded: number;
+  modelBytes: number;
   done: number;
   total: number;
   startedAt: number;
   firstTileAt?: number;
   finishedAt?: number;
   result?: Blob;
+};
+
+type Job = {
+  name: string;
+  file?: File;
+  more: File[];
+  original: string;
+  cloud?: string;
+  width: number;
+  height: number;
+  raw?: boolean;
+  shown: Look;
+  runs: Partial<Record<Look, Run>>;
   cleaned?: ImageBitmap;
   savedAt?: number;
   saving?: "saving" | "saved" | "failed";
 };
 
+type Canvases = React.RefObject<Partial<Record<Look, HTMLCanvasElement | null>>>;
+
+type Finished = (result: Blob, info: { model: string; width: number; height: number }) => void;
+
 const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
 
 const CHOICES: Model[] = ["flash", "pro"];
+const LOOKS: Look[] = ["raw", "crisp", "big", "burst"];
+const FRAMES = 4;
+const LOOK = { raw: "Standard", crisp: "Crisper", big: "Best", burst: "Burst" };
+
+const fresh = (): Run => ({
+  stage: "decode",
+  loaded: 0,
+  modelBytes: 0,
+  done: 0,
+  total: 0,
+  startedAt: performance.now(),
+});
 
 const isPhoto = (f: File) => f.type.startsWith("image/") || /\.dng$/i.test(f.name);
 
@@ -39,7 +67,8 @@ export function App() {
   const [key, setKey] = useState(cloudKey);
   const [model, setModel] = useState<Model>(() => (localStorage.getItem("cloud-model") === "pro" ? "pro" : "flash"));
   const [photos, setPhotos] = useState<Photo[]>();
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const canvases: Canvases = useRef({});
+  const input = useRef<HTMLCanvasElement>(null);
   const worker = useRef<Worker>(undefined);
 
   useEffect(() => {
@@ -62,8 +91,92 @@ export function App() {
     return () => document.removeEventListener("visibilitychange", refresh);
   }, [key]);
 
+  const clean = useCallback(
+    (file: File, more: File[], kind: Look, finished?: Finished) => {
+      worker.current?.terminate();
+      const w = new Worker();
+      worker.current = w;
+      let lock: WakeLockSentinel | undefined;
+      navigator.wakeLock
+        ?.request("screen")
+        .then((l) => (lock = l))
+        .catch(() => {});
+      let size = { width: 0, height: 0 };
+      let onDevice = "on-device";
+
+      const change = (to: (run: Run) => Partial<Run>) =>
+        setJob((j) => {
+          const run = j?.runs[kind];
+
+          return j && run ? { ...j, runs: { ...j.runs, [kind]: { ...run, ...to(run) } } } : j;
+        });
+
+      w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
+        switch (data.type) {
+          case "start":
+            size = { width: data.width, height: data.height };
+            onDevice = data.raw ? "on-device-raw" : "on-device";
+            setJob((j) => j && { ...j, width: data.width, height: data.height, raw: data.raw });
+            change(() => ({ stage: "model" }));
+
+            return;
+          case "original":
+            setJob((j) => {
+              if (!j) return j;
+              URL.revokeObjectURL(j.original);
+
+              return { ...j, original: URL.createObjectURL(data.blob) };
+            });
+
+            return;
+          case "model":
+            change(() => ({ loaded: data.loaded, modelBytes: data.total }));
+
+            return;
+          case "progress":
+            change((run) => ({
+              stage: "clean",
+              done: data.done,
+              total: data.total,
+              firstTileAt: data.done === 1 ? performance.now() : run.firstTileAt,
+            }));
+
+            return;
+          case "tile":
+          case "input":
+            (data.type === "tile" ? canvases.current[kind] : input.current)
+              ?.getContext("2d")
+              ?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
+
+            return;
+          case "done":
+            lock?.release();
+            change(() => ({ stage: "done", result: data.blob, band: data.band, finishedAt: performance.now() }));
+            finished?.(data.blob, { model: onDevice, ...size });
+
+            return;
+          case "error":
+            lock?.release();
+            setError(data.message);
+
+            if (kind !== "raw")
+              setJob(
+                (j) => j && { ...j, shown: j.shown === kind ? "raw" : j.shown, runs: { ...j.runs, [kind]: undefined } },
+              );
+
+            return;
+        }
+      });
+
+      const order: ToWorker = { file, more, key, model, borrowed: borrowing(), kind };
+      w.postMessage(order);
+    },
+    [key, model],
+  );
+
   const open = useCallback(
-    async (file: File) => {
+    async (files: File[]) => {
+      const [file, ...more] = files.toSorted((a, b) => a.name.localeCompare(b.name)).slice(0, FRAMES);
       worker.current?.terminate();
       setError(undefined);
       const shown = (await rawPreview(file)) ?? file;
@@ -73,86 +186,40 @@ export function App() {
 
         return {
           name,
+          file,
+          more,
           original: URL.createObjectURL(shown),
           cloud: key && MODELS[model].name,
           width: 0,
           height: 0,
-          stage: "decode",
-          loaded: 0,
-          done: 0,
-          total: 0,
-          startedAt: performance.now(),
+          shown: "raw",
+          runs: { raw: fresh() },
         };
       });
-      const w = new Worker();
-      worker.current = w;
-      let lock: WakeLockSentinel | undefined;
-      navigator.wakeLock
-        ?.request("screen")
-        .then((l) => (lock = l))
-        .catch(() => {});
-      let size = { width: 0, height: 0 };
-      w.addEventListener("message", ({ data }: MessageEvent<FromWorker>) => {
-        switch (data.type) {
-          case "start":
-            size = { width: data.width, height: data.height };
-            setJob((j) => j && { ...j, width: data.width, height: data.height, stage: "model" });
+      clean(file, [], "raw", (result, info) => {
+        if (sharing()) share(file, result, { ...info, model: key ? MODELS[model].id : info.model }).catch(() => {});
 
-            return;
-          case "model":
-            setJob((j) => j && { ...j, loaded: data.loaded });
-
-            return;
-          case "progress":
-            setJob((j) => {
-              if (!j) return j;
-              const now = performance.now();
-
-              return {
-                ...j,
-                stage: "clean",
-                done: data.done,
-                total: data.total,
-                firstTileAt: data.done === 1 ? now : j.firstTileAt,
-              };
-            });
-
-            return;
-          case "tile":
-            canvas.current?.getContext("2d")?.putImageData(new ImageData(data.pixels, data.w, data.h), data.x, data.y);
-
-            return;
-          case "done":
-            lock?.release();
-            setJob((j) => j && { ...j, stage: "done", result: data.blob, finishedAt: performance.now() });
-
-            if (sharing())
-              share(file, data.blob, { model: key ? MODELS[model].id : "on-device", ...size }).catch(() => {});
-
-            if (key) {
-              setJob((j) => j && { ...j, saving: "saving" });
-              savePhoto(key, name, shown, data.blob).then(
-                (photo) => {
-                  setPhotos((p) => [photo, ...(p ?? [])]);
-                  setJob((j) => j && { ...j, saving: "saved" });
-                },
-                () => setJob((j) => j && { ...j, saving: "failed" }),
-              );
-            }
-
-            return;
-          case "error":
-            lock?.release();
-            setError(data.message);
-
-            return;
+        if (key) {
+          setJob((j) => j && { ...j, saving: "saving" });
+          savePhoto(key, name, shown, result).then(
+            (photo) => {
+              setPhotos((p) => [photo, ...(p ?? [])]);
+              setJob((j) => j && { ...j, saving: "saved" });
+            },
+            () => setJob((j) => j && { ...j, saving: "failed" }),
+          );
         }
       });
-
-      w.postMessage({ file, key, model });
     },
-    [key, model],
+    [key, model, clean],
   );
+
+  const look = (kind: Look) => {
+    setError(undefined);
+    setJob((j) => j && { ...j, shown: kind, runs: { ...j.runs, [kind]: j.runs[kind] ?? fresh() } });
+
+    if (job?.file && !job.runs[kind]) clean(job.file, kind === "burst" ? job.more : [], kind);
+  };
 
   const view = async (photo: Photo) => {
     worker.current?.terminate();
@@ -166,15 +233,12 @@ export function App() {
 
         return {
           name: photo.name,
+          more: [],
           original: photo.original ?? photo.result!,
           width: cleaned.width,
           height: cleaned.height,
-          stage: "done",
-          loaded: 0,
-          done: 1,
-          total: 1,
-          startedAt: 0,
-          result,
+          shown: "raw",
+          runs: { raw: { ...fresh(), stage: "done", done: 1, total: 1, result } },
           cleaned,
           savedAt: photo.at,
         };
@@ -194,16 +258,16 @@ export function App() {
 
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      const file = [...(e.clipboardData?.files ?? [])].find(isPhoto);
+      const files = [...(e.clipboardData?.files ?? [])].filter(isPhoto);
 
-      if (file) open(file);
+      if (files.length) open(files);
     };
 
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
-      const file = [...(e.dataTransfer?.files ?? [])].find(isPhoto);
+      const files = [...(e.dataTransfer?.files ?? [])].filter(isPhoto);
 
-      if (file) open(file);
+      if (files.length) open(files);
     };
 
     const onDragOver = (e: DragEvent) => e.preventDefault();
@@ -234,10 +298,10 @@ export function App() {
       </header>
       <main className="flex min-h-0 flex-1 flex-col">
         {job ? (
-          <Editor job={job} error={error} canvas={canvas} onNew={reset} />
+          <Editor job={job} error={error} canvases={canvases} input={input} onLook={look} onNew={reset} />
         ) : (
           <Pick
-            onFile={open}
+            onFiles={open}
             cloud={Boolean(key)}
             model={model}
             onModel={(m) => {
@@ -261,7 +325,7 @@ export function App() {
 }
 
 function Pick({
-  onFile,
+  onFiles,
   cloud,
   model,
   onModel,
@@ -270,7 +334,7 @@ function Pick({
   onPhoto,
   onCloud,
 }: {
-  onFile: (f: File) => void;
+  onFiles: (files: File[]) => void;
   cloud: boolean;
   model: Model;
   onModel: (m: Model) => void;
@@ -281,6 +345,7 @@ function Pick({
 }) {
   const input = useRef<HTMLInputElement>(null);
   const [train, setTrain] = useState(sharing);
+  const [borrowed, setBorrowed] = useState(borrowing);
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -322,11 +387,12 @@ function Pick({
             ref={input}
             type="file"
             accept="image/*,.dng"
+            multiple
             hidden
             onChange={(e) => {
-              const f = e.target.files?.[0];
+              const files = [...(e.target.files ?? [])];
 
-              if (f) onFile(f);
+              if (files.length) onFiles(files);
               e.target.value = "";
             }}
           />
@@ -378,6 +444,19 @@ function Pick({
             ? "Photos you clean help train denoise · Turn off"
             : "Photos you clean stay private · Share for training"}
         </button>
+        {!cloud && (
+          <button
+            onClick={() => {
+              setBorrowing(!borrowed);
+              setBorrowed(!borrowed);
+            }}
+            className="block w-full underline-offset-2 hover:text-fg hover:underline"
+          >
+            {borrowed
+              ? "Black offsets from another body of your camera: on · Turn off"
+              : "Black offsets from another body of your camera: off · Turn on"}
+          </button>
+        )}
         {!cloud && !hasWebGPU && <p>This browser has no WebGPU. Use Safari 26+ or Chrome.</p>}
       </div>
     </div>
@@ -387,24 +466,42 @@ function Pick({
 function Editor({
   job,
   error,
-  canvas,
+  canvases,
+  input,
+  onLook,
   onNew,
 }: {
   job: Job;
   error?: string;
-  canvas: React.RefObject<HTMLCanvasElement | null>;
+  canvases: Canvases;
+  input: React.RefObject<HTMLCanvasElement | null>;
+  onLook: (kind: Look) => void;
   onNew: () => void;
 }) {
   const [split, setSplit] = useState(50);
+  const [strength, setStrength] = useState(() => Number(localStorage.getItem("strength") ?? 100));
+  const [fine, setFine] = useState(() => Number(localStorage.getItem("detail") ?? 50));
   const [actual, setActual] = useState(false);
   const [view, setView] = useState({ scroll: 0, width: 1, offset: 0, image: 1 });
   const frame = useRef<HTMLDivElement>(null);
   const image = useRef<HTMLDivElement>(null);
-  const done = job.stage === "done";
+  const details: Canvases = useRef({});
+  const { shown } = job;
+  const run = job.runs[shown]!;
+  const done = run.stage === "done";
+  const band = run.band ?? 0;
+  const finer = band > 0 ? fine : 0;
+  const busy = LOOKS.some((kind) => job.runs[kind] && job.runs[kind].stage !== "done");
+  const looks = LOOKS.filter((kind) => kind !== "burst" || job.more.length > 0);
 
   useEffect(() => {
-    if (job.cleaned) canvas.current?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
-  }, [job.cleaned, canvas]);
+    if (job.cleaned) canvases.current.raw?.getContext("2d")?.drawImage(job.cleaned, 0, 0);
+  }, [job.cleaned, canvases]);
+
+  useEffect(() => {
+    if (done && finer > 0)
+      withDetail(input.current!, canvases.current[shown]!, details.current[shown]!, band).catch(() => {});
+  }, [done, finer, band, shown, input, canvases]);
 
   const measure = useCallback(() => {
     if (!frame.current || !image.current) return;
@@ -431,17 +528,17 @@ function Editor({
   useEffect(() => {
     const prefix = {
       decode: "",
-      model: job.loaded ? `${Math.round((job.loaded / modelBytes) * 100)}% model · ` : "",
-      clean: `${Math.round((job.done / job.total) * 100)}% · `,
+      model: run.loaded ? `${Math.round((run.loaded / run.modelBytes) * 100)}% model · ` : "",
+      clean: `${Math.round((run.done / run.total) * 100)}% · `,
       done: "Done · ",
-    }[job.stage];
+    }[run.stage];
 
     document.title = `${prefix}denoise`;
 
     return () => {
       document.title = "denoise";
     };
-  }, [job.stage, job.done, job.total, job.loaded]);
+  }, [run.stage, run.done, run.total, run.loaded, run.modelBytes]);
 
   const dragOver = (e: React.PointerEvent, box: Element) => {
     if (!done || (e.type === "pointermove" && e.buttons === 0)) return;
@@ -475,13 +572,45 @@ function Editor({
             className={`relative m-auto shrink-0 overflow-hidden bg-line select-none ${actual ? "" : "rounded-lg"} ${done && !actual ? "cursor-ew-resize touch-none" : ""}`}
           >
             <img src={job.original} alt="" draggable={false} className="absolute inset-0 size-full" />
-            <canvas
-              ref={canvas}
-              width={job.width}
-              height={job.height}
-              className="absolute inset-0 size-full"
+            <div
+              className="absolute inset-0"
               style={done ? { clipPath: `inset(0 0 0 ${Math.min(100, Math.max(0, clip))}%)` } : undefined}
-            />
+            >
+              {job.raw && (
+                <canvas ref={input} width={job.width} height={job.height} className="absolute inset-0 size-full" />
+              )}
+              {LOOKS.map(
+                (kind) =>
+                  job.runs[kind] && (
+                    <div
+                      key={kind}
+                      hidden={kind !== shown}
+                      className="absolute inset-0"
+                      style={job.raw ? { opacity: strength / 100 } : undefined}
+                    >
+                      <canvas
+                        ref={(made) => {
+                          canvases.current[kind] = made;
+                        }}
+                        width={job.width}
+                        height={job.height}
+                        className="absolute inset-0 size-full"
+                      />
+                      {(job.runs[kind].band ?? 0) > 0 && (
+                        <canvas
+                          ref={(made) => {
+                            details.current[kind] = made;
+                          }}
+                          width={job.width}
+                          height={job.height}
+                          className="absolute inset-0 size-full"
+                          style={{ opacity: fine / 100 }}
+                        />
+                      )}
+                    </div>
+                  ),
+              )}
+            </div>
             {done && !actual && <Divider split={split} />}
           </div>
         </div>
@@ -496,23 +625,81 @@ function Editor({
         )}
       </div>
       <footer className="relative shrink-0 px-5 py-3">
-        <Progress job={job} error={error} />
-        <div className="flex items-center gap-2">
+        <Progress run={run} error={error} />
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-3">
           <p className="min-w-0 flex-1 truncate text-[13px] text-muted tabular-nums">
-            {error ? <span className="text-red-500">{error}</span> : status(job)}
+            {error ? <span className="text-red-500">{error}</span> : status(job, run)}
           </p>
+          {job.raw && job.runs.raw?.stage === "done" && (
+            <div className="order-first flex basis-full sm:order-none sm:mr-2 sm:basis-auto">
+              <div className="flex rounded-full border border-line bg-card p-0.5 text-[13px] font-medium pointer-coarse:text-sm">
+                {looks.map((kind) => (
+                  <button
+                    key={kind}
+                    onClick={() => onLook(kind)}
+                    disabled={busy && !job.runs[kind]}
+                    aria-pressed={kind === shown}
+                    className={`h-6.5 rounded-full px-3 transition disabled:opacity-40 pointer-coarse:h-8.5 pointer-coarse:px-4 ${kind === shown ? "bg-line" : "text-muted enabled:hover:text-fg"}`}
+                  >
+                    {kind === "burst" ? `${LOOK[kind]} of ${job.more.length + 1}` : LOOK[kind]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {done && job.raw && (
+            <>
+              <Dial name="Strength" value={strength} onChange={setStrength} />
+              {band > 0 && <Dial name="Detail" value={fine} onChange={setFine} />}
+            </>
+          )}
           <Button onClick={() => setActual((a) => !a)} disabled={!job.width}>
             {actual ? "Fit" : "1:1"}
           </Button>
           <Button onClick={onNew}>New</Button>
-          {done && job.result && (
-            <Button primary onClick={() => save(job.result!, `${job.name}-denoised.jpg`)}>
+          {done && run.result && (
+            <Button
+              primary
+              onClick={async () =>
+                save(
+                  job.raw && (strength < 100 || finer > 0)
+                    ? await blended(
+                        input.current!,
+                        canvases.current[shown]!,
+                        details.current[shown],
+                        strength,
+                        finer,
+                        band,
+                      )
+                    : run.result!,
+                  `${job.name}-denoised.jpg`,
+                )
+              }
+            >
               Save
             </Button>
           )}
         </div>
       </footer>
     </>
+  );
+}
+
+function Dial({ name, value, onChange }: { name: string; value: number; onChange: (value: number) => void }) {
+  return (
+    <label className="order-first flex basis-full items-center gap-3 text-[13px] text-muted tabular-nums sm:order-none sm:mr-2 sm:basis-auto">
+      <span className="w-[8ch] sm:w-auto">{name}</span>
+      <input
+        type="range"
+        value={value}
+        onChange={(e) => {
+          localStorage.setItem(name.toLowerCase(), e.target.value);
+          onChange(e.target.valueAsNumber);
+        }}
+        className="strength min-w-0 flex-1 sm:w-28 sm:flex-none"
+      />
+      <span className="w-[4ch] text-right">{value}%</span>
+    </label>
   );
 }
 
@@ -569,55 +756,55 @@ function Button({ primary, ...props }: React.ButtonHTMLAttributes<HTMLButtonElem
   );
 }
 
-function Progress({ job, error }: { job: Job; error?: string }) {
+function Progress({ run, error }: { run: Run; error?: string }) {
   const value =
-    job.stage === "done"
+    run.stage === "done"
       ? 1
-      : job.stage === "clean"
-        ? job.done / job.total
-        : job.stage === "model"
-          ? (job.loaded / modelBytes) * 0.999
+      : run.stage === "clean"
+        ? run.done / run.total
+        : run.stage === "model"
+          ? (run.loaded / run.modelBytes) * 0.999
           : 0;
 
   return (
     <div
-      className={`absolute inset-x-5 top-0 h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${job.stage === "done" ? "opacity-0" : ""}`}
+      className={`absolute inset-x-5 top-0 h-1 overflow-hidden rounded-full bg-line transition-opacity delay-700 duration-700 ${run.stage === "done" ? "opacity-0" : ""}`}
     >
       <div
         className={`h-full rounded-full transition-[width] duration-500 ${error ? "bg-red-500" : "bg-gradient-to-r from-indigo-500 to-cyan-400"}`}
-        style={{ width: `${(job.stage === "model" && job.loaded === 0 ? 0 : value) * 100}%` }}
+        style={{ width: `${(run.stage === "model" && run.loaded === 0 ? 0 : value) * 100}%` }}
       />
     </div>
   );
 }
 
-function status(job: Job) {
+function status(job: Job, run: Run) {
   const megapixels = (job.width * job.height) / 1e6;
   const mp = `${megapixels < 10 ? megapixels.toFixed(1) : Math.round(megapixels)} MP`;
 
-  switch (job.stage) {
+  switch (run.stage) {
     case "decode":
       return "Opening photo…";
     case "model":
       if (job.cloud) return `Sending to ${job.cloud}…`;
 
-      return job.loaded > 0 && job.loaded < modelBytes
-        ? `Model · ${mb(job.loaded)} / ${mb(modelBytes)} MB`
+      return run.loaded > 0 && run.loaded < run.modelBytes
+        ? `Model · ${mb(run.loaded)} / ${mb(run.modelBytes)} MB`
         : "Starting the GPU…";
     case "clean": {
       const left =
-        job.firstTileAt && job.done > 1
-          ? ((performance.now() - job.firstTileAt) / (job.done - 1)) * (job.total - job.done)
+        run.firstTileAt && run.done > 1
+          ? ((performance.now() - run.firstTileAt) / (run.done - 1)) * (run.total - run.done)
           : undefined;
 
-      return `Cleaning · ${Math.round((job.done / job.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
+      return `Cleaning · ${Math.round((run.done / run.total) * 100)}%${left ? ` · ${eta(left)} left` : ""}`;
     }
 
     case "done": {
       if (job.savedAt) return `Saved ${new Date(job.savedAt).toLocaleDateString()} · ${mp}`;
       const saving = { saving: " · Saving to your photos…", saved: " · In your photos", failed: " · Not saved" };
 
-      return `Done · ${eta(job.finishedAt! - job.startedAt)} · ${mp}${job.saving ? saving[job.saving] : ""}`;
+      return `Done · ${eta(run.finishedAt! - run.startedAt)} · ${mp}${job.saving ? saving[job.saving] : ""}`;
     }
   }
 }
@@ -628,6 +815,54 @@ function eta(ms: number) {
   const s = Math.max(1, Math.round(ms / 1000));
 
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+}
+
+const STRIP = 256;
+const filling = new WeakMap<HTMLCanvasElement, Promise<void>>();
+
+async function fill(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement, band: number) {
+  const { width, height } = over;
+  const [shot, made, drawn] = [under, over, onto].map((canvas) => canvas.getContext("2d")!);
+
+  for (let y = 0; y < height && onto.isConnected; y += STRIP) {
+    const top = Math.max(0, y - MARGIN);
+    const rows = Math.min(height, y + STRIP + MARGIN) - top;
+    const result = made.getImageData(0, top, width, rows).data;
+    const pixels = detailed(result, shot.getImageData(0, top, width, rows).data, width, band);
+    drawn.putImageData(new ImageData(pixels, width, rows), 0, top, 0, y - top, width, STRIP);
+    await new Promise((next) => setTimeout(next));
+  }
+}
+
+function withDetail(under: HTMLCanvasElement, over: HTMLCanvasElement, onto: HTMLCanvasElement, band: number) {
+  const filled = filling.get(onto) ?? fill(under, over, onto, band);
+  filling.set(onto, filled);
+
+  return filled;
+}
+
+async function blended(
+  under: HTMLCanvasElement,
+  over: HTMLCanvasElement,
+  onto: HTMLCanvasElement | null | undefined,
+  strength: number,
+  fine: number,
+  band: number,
+) {
+  const mixed = new OffscreenCanvas(over.width, over.height);
+  const ctx = mixed.getContext("2d")!;
+  ctx.drawImage(over, 0, 0);
+
+  if (onto && fine > 0) {
+    await withDetail(under, over, onto, band);
+    ctx.globalAlpha = fine / 100;
+    ctx.drawImage(onto, 0, 0);
+  }
+
+  ctx.globalAlpha = 1 - strength / 100;
+  ctx.drawImage(under, 0, 0);
+
+  return mixed.convertToBlob({ type: "image/jpeg", quality: 0.95 });
 }
 
 async function save(blob: Blob, filename: string) {

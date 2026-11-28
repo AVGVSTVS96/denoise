@@ -1,14 +1,38 @@
-import manifest from "../public/model/manifest.json";
+import big from "../public/model/big.json";
+import crisp from "../public/model/crisp.json";
+import photo from "../public/model/manifest.json";
+import raw from "../public/model/raw.json";
+import type { Brightest } from "./raw";
 
-export const modelBytes = manifest.bytes;
+type Manifest = { name: string; bytes: number; sha256: string; parts: string[] };
 
-const cacheName = `model-${manifest.sha256.slice(0, 12)}`;
+type RawManifest = Manifest & { brightest: Brightest | null };
+
+type Models = { photo: Manifest; raw: RawManifest; crisp: RawManifest; big: RawManifest };
+
+export const models: Models = { photo, raw, crisp, big };
+
+export type ModelKind = keyof typeof models;
+
+export type RawKind = Exclude<ModelKind, "photo">;
+
+export type Look = RawKind | "burst";
+
+const cacheName = (manifest: Manifest) => `model-${manifest.sha256.slice(0, 12)}`;
 const ATTEMPTS = 3;
 
-export async function loadModel(onProgress: (loaded: number) => void): Promise<Uint8Array> {
-  const cache = await caches.open(cacheName).catch(() => undefined);
+async function forgetOld() {
+  const current = Object.values(models).map(cacheName);
+  const names = await caches.keys();
+  await Promise.all(names.filter((n) => n.startsWith("model-") && !current.includes(n)).map((n) => caches.delete(n)));
+}
+
+export async function loadModel(kind: ModelKind, onProgress: (loaded: number) => void): Promise<Uint8Array> {
+  const manifest = models[kind];
+  const cache = await caches.open(cacheName(manifest)).catch(() => undefined);
   const out = new Uint8Array(manifest.bytes);
   let offset = 0;
+  forgetOld().catch(() => {});
 
   for (const part of manifest.parts) {
     const url = `/model/${part}`;

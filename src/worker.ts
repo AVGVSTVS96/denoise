@@ -1,21 +1,25 @@
 import * as ort from "onnxruntime-web/webgpu";
 import * as cloud from "./cloud";
-import { rawPreview } from "./dng";
-import { loadModel } from "./model";
+import { blackOffsets } from "./blacks";
+import { burst } from "./burst";
+import { rawPhoto, rawPreview, type Raw } from "./dng";
+import { loadModel, models, type Look, type ModelKind } from "./model";
+import { clean, CORE, detailBand, grain, PIECE, type Piece } from "./raw";
 
 export type FromWorker =
-  | { type: "model"; loaded: number }
-  | { type: "start"; width: number; height: number }
-  | { type: "tile"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
+  | { type: "model"; loaded: number; total: number }
+  | { type: "start"; width: number; height: number; raw: boolean }
+  | { type: "original"; blob: Blob }
+  | { type: "tile" | "input"; x: number; y: number; w: number; h: number; pixels: Uint8ClampedArray<ArrayBuffer> }
   | { type: "progress"; done: number; total: number }
-  | { type: "done"; blob: Blob }
+  | { type: "done"; blob: Blob; band: number }
   | { type: "error"; message: string };
 
 const TILE = 512;
 const OVERLAP = 64;
 const MAX_PIXELS = 16_000_000;
 
-let session: Promise<ort.InferenceSession> | undefined;
+const sessions = new Map<ModelKind, Promise<ort.InferenceSession>>();
 
 const post = (msg: FromWorker, transfer: Transferable[] = []) => postMessage(msg, { transfer });
 
@@ -48,19 +52,23 @@ async function requestDevice() {
   });
 }
 
-function getSession() {
-  session ??= (async () => {
-    const device = await requestDevice();
-    const model = await loadModel((loaded) => post({ type: "model", loaded }));
+function getSession(kind: ModelKind) {
+  const made =
+    sessions.get(kind) ??
+    (async () => {
+      const device = await requestDevice();
+      const model = await loadModel(kind, (loaded) => post({ type: "model", loaded, total: models[kind].bytes }));
 
-    return ort.InferenceSession.create(model, {
-      executionProviders: [{ name: "webgpu", preferredLayout: "NCHW", device }],
-      graphOptimizationLevel: "all",
-    });
-  })();
-  session.catch(() => (session = undefined));
+      return ort.InferenceSession.create(model, {
+        executionProviders: [{ name: "webgpu", preferredLayout: "NCHW", device }],
+        graphOptimizationLevel: "all",
+      });
+    })();
 
-  return session;
+  sessions.set(kind, made);
+  made.catch(() => sessions.delete(kind));
+
+  return made;
 }
 
 async function decode(file: Blob) {
@@ -133,7 +141,7 @@ function flush(
 async function runCloud(file: Blob, key: string, model: cloud.Model) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H });
+  post({ type: "start", width: W, height: H, raw: false });
   const tile = Math.min(cloud.TILE, W, H);
   const overlap = Math.min(cloud.OVERLAP, tile >> 2);
   const xs = positions(W, tile, overlap);
@@ -176,7 +184,7 @@ async function runCloud(file: Blob, key: string, model: cloud.Model) {
     flush(ctx, acc, W, wy, r === ys.length - 1 ? tile : ys[r + 1] - wy, 1);
   }
 
-  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band: 0 });
 }
 
 const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
@@ -184,9 +192,9 @@ const padTo16 = (n: number) => Math.ceil(n / 16) * 16;
 async function run(file: Blob) {
   const { canvas, ctx } = await decode(file);
   const { width: W, height: H } = canvas;
-  post({ type: "start", width: W, height: H });
+  post({ type: "start", width: W, height: H, raw: false });
   const src = ctx.getImageData(0, 0, W, H).data;
-  const sess = await getSession();
+  const sess = await getSession("photo");
   const xs = positions(W);
   const ys = positions(H);
   const total = xs.length * ys.length;
@@ -245,11 +253,161 @@ async function run(file: Blob) {
     flush(ctx, acc, W, wy, r === ys.length - 1 ? winH : ys[r + 1] - wy, 255);
   }
 
-  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }) });
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band: 0 });
 }
 
-onmessage = (e: MessageEvent<{ file: Blob; key?: string; model: cloud.Model }>) => {
-  (e.data.key ? runCloud(e.data.file, e.data.key, e.data.model) : run(e.data.file)).catch((err: Error) =>
+const TURNS = [
+  [1, 0, 0, 1, 0, 0],
+  [-1, 0, 0, 1, 1, 0],
+  [-1, 0, 0, -1, 1, 1],
+  [1, 0, 0, -1, 0, 1],
+  [0, 1, 1, 0, 0, 0],
+  [0, 1, -1, 0, 1, 0],
+  [0, -1, -1, 0, 1, 1],
+  [0, -1, 1, 0, 0, 1],
+];
+
+function upright(orientation: number, width: number, height: number) {
+  const [a, b, c, d, e, f] = TURNS[orientation - 1] ?? TURNS[0];
+  const turned = a === 0;
+  const canvas = new OffscreenCanvas(turned ? height : width, turned ? width : height);
+  const ctx = canvas.getContext("2d");
+
+  ctx?.fillRect(0, 0, 1, 1);
+
+  if (!ctx || ctx.getImageData(0, 0, 1, 1).data[3] !== 255) return;
+  ctx.setTransform(a, b, c, d, e * canvas.width, f * canvas.height);
+
+  return { canvas, ctx };
+}
+
+async function originalUpright(file: Blob, raw: Raw) {
+  const preview = raw.orientation > 1 && (await rawPreview(file));
+
+  if (!preview) return;
+  const bitmap = await createImageBitmap(preview);
+  const made = upright(raw.orientation, bitmap.width, bitmap.height);
+
+  if (!made) return;
+  made.ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  post({ type: "original", blob: await made.canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 }) });
+}
+
+async function later(more: Blob[], raw: Raw, borrowed: boolean) {
+  return Promise.all(
+    more.map(async (file) => {
+      const found = await rawPhoto(file).catch(() => undefined);
+
+      if (!found || found.width !== raw.width || found.height !== raw.height)
+        throw new Error("A burst is raw photos of one scene from one camera.");
+
+      return { raw: found, offsets: await blackOffsets(found, borrowed) };
+    }),
+  );
+}
+
+async function runRaw(file: Blob, raw: Raw, borrowed: boolean, kind: Look, more: Blob[]) {
+  const { crop } = raw;
+  const fitted = Math.floor(CORE * Math.sqrt(MAX_PIXELS / (crop.width * crop.height))) / CORE;
+  const full = upright(raw.orientation, crop.width, crop.height);
+  const scale = full ? 1 : fitted;
+  const fit = (side: number) => Math.floor(side * scale) - 1;
+  const made = full ?? upright(raw.orientation, fit(crop.width), fit(crop.height));
+
+  if (!made) throw new Error("This photo is too large for this browser.");
+  const { canvas, ctx } = made;
+  const { width: W, height: H } = canvas;
+  post({ type: "start", width: W, height: H, raw: true });
+  originalUpright(file, raw).catch(() => {});
+  const turn = ctx.getTransform();
+  const dx = Math.ceil(crop.x * scale);
+  const dy = Math.ceil(crop.y * scale);
+  ctx.imageSmoothingEnabled = scale < 1;
+  ctx.imageSmoothingQuality = "high";
+  const scratch = new OffscreenCanvas(PIECE, PIECE);
+  const held = scratch.getContext("2d")!;
+  const turned = new OffscreenCanvas(PIECE, PIECE).getContext("2d")!;
+  turned.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
+  turned.imageSmoothingQuality = ctx.imageSmoothingQuality;
+  const model = kind === "burst" ? "raw" : kind;
+  const [sess, offsets] = await Promise.all([getSession(model), blackOffsets(raw, borrowed)]);
+
+  const network = async (planes: Float32Array, height: number, width: number) => {
+    const result = await sess.run({ [sess.inputNames[0]]: new ort.Tensor("float32", planes, [1, 4, height, width]) });
+    const tensor = result[sess.outputNames[0]];
+    // SAFETY: the model's output is declared float32 in its ONNX graph.
+    const out = (await tensor.getData()) as Float32Array;
+    tensor.dispose();
+
+    return out;
+  };
+
+  const merged = kind === "burst" ? burst({ raw, offsets }, await later(more, raw, borrowed)) : undefined;
+  post({ type: "progress", done: 0, total: 1 });
+  let squares = 0;
+  let flat = 0;
+
+  const painted = (piece: Piece, done: number, total: number) => {
+    const x = (piece.x + crop.x) * scale - dx;
+    const y = (piece.y + crop.y) * scale - dy;
+    const w = piece.width * scale;
+    const h = piece.height * scale;
+    const from = turn.transformPoint({ x, y });
+    const to = turn.transformPoint({ x: x + w, y: y + h });
+    const left = Math.max(0, Math.ceil(Math.min(from.x, to.x)));
+    const top = Math.max(0, Math.ceil(Math.min(from.y, to.y)));
+    const right = Math.min(W, Math.floor(Math.max(from.x, to.x)));
+    const bottom = Math.min(H, Math.floor(Math.max(from.y, to.y)));
+
+    const drawn = (
+      pixels: Uint8ClampedArray<ArrayBuffer>,
+      onto: OffscreenCanvasRenderingContext2D,
+      atX: number,
+      atY: number,
+    ) => {
+      held.putImageData(new ImageData(pixels, piece.width, piece.height), 0, 0);
+      onto.drawImage(scratch, 0, 0, piece.width, piece.height, x, y, w, h);
+
+      return onto.getImageData(atX, atY, right - left, bottom - top).data;
+    };
+
+    turned.setTransform(turn.a, turn.b, turn.c, turn.d, turn.e - left, turn.f - top);
+    const at = { x: left, y: top, w: right - left, h: bottom - top };
+    const input = drawn(piece.input, turned, 0, 0);
+    const tile = drawn(piece.pixels, ctx, left, top);
+    const found = grain(tile, input, at.w);
+    squares += found.squares;
+    flat += found.flat;
+    post({ type: "input", ...at, pixels: input }, [input.buffer]);
+    post({ type: "tile", ...at, pixels: tile }, [tile.buffer]);
+    post({ type: "progress", done, total });
+  };
+
+  await clean(raw, offsets, models[model].brightest, network, painted, merged);
+
+  const band = detailBand(Math.sqrt(squares / Math.max(flat, 1)));
+  post({ type: "done", blob: await canvas.convertToBlob({ type: "image/jpeg", quality: 0.95 }), band });
+  canvas.width = 0;
+}
+
+async function runOnDevice({ file, more, borrowed, kind }: ToWorker) {
+  const raw = await rawPhoto(file).catch(() => undefined);
+
+  return raw ? runRaw(file, raw, borrowed, kind, more) : run(file);
+}
+
+export type ToWorker = {
+  file: Blob;
+  more: Blob[];
+  key?: string;
+  model: cloud.Model;
+  borrowed: boolean;
+  kind: Look;
+};
+
+onmessage = ({ data }: MessageEvent<ToWorker>) => {
+  (data.key ? runCloud(data.file, data.key, data.model) : runOnDevice(data)).catch((err: Error) =>
     post({ type: "error", message: err.message }),
   );
 };

@@ -9,7 +9,7 @@ import { MODELS } from "../src/cloud.js";
 
 const PER_VISITOR = 40;
 const PER_DAY = 200;
-const MODEL_IDS = new Set<string>(["on-device", ...Object.values(MODELS).map((m) => m.id)]);
+const MODEL_IDS = new Set<string>(["on-device", "on-device-raw", ...Object.values(MODELS).map((m) => m.id)]);
 
 const LIMITS = {
   input: { allowedContentTypes: ["image/*"], maximumSizeInBytes: 100_000_000 },

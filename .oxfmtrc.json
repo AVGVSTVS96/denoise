@@ -1,1 +1,4 @@
-{ "printWidth": 120, "ignorePatterns": ["public/model", "tools/oxlint/anti-slop/**"] }
+{
+  "printWidth": 120,
+  "ignorePatterns": ["public/model", "src/blacks.json", "eval/small_print.json", "tools/oxlint/anti-slop/**"]
+}

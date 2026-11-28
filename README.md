@@ -13,7 +13,22 @@ bun dev
 2. It runs through NAFNet in 512 px tiles, one at a time on the GPU, with 64 px feathered overlaps so tile edges don't show.
 3. The result is shown against the original and saved as a JPEG.
 
-Raw files (DNG) are read through the camera's full-size JPEG preview, not the tiny thumbnail browsers decode.
+## Raw files
+
+A DNG with a Bayer sensor is cleaned from its raw sensor data, not from its JPEG preview:
+
+1. The worker reads the mosaic itself (uncompressed or lossless JPEG, strips or tiles, 8 to 16 bits), the black and white levels, and the camera's colour from the DNG's tags.
+2. The mosaic is scaled and tiled the way `eval/train_raw.py`'s `denoise()` does it and runs through the joint model in 1024 px tiles (64 px of mirrored border, tiles fade into each other over the middle of what they share). A model that was not trained on lit parts of dark photos needs a tile with a light in it held to a lower gain of its own, by `train_raw.tile_gain`'s rule: no 128 px block brighter than a blown block in a photo that needs no gain. The model's manifest (`public/model/raw.json`) says whether it does; the one shipped, trained with `--bright`, does not, so every tile gets the photo's gain. The model denoises and demosaics in one pass and hands back the camera's RGB at full size.
+3. That is developed on the spot: white balance as shot, highlights clipped where the sensor clipped, the camera's matrix to sRGB, the DNG's baseline exposure, a filmic tone curve. The result is shown against the camera's own JPEG preview, cropped and turned upright as the DNG says.
+4. The noisy mosaic is developed the same way beside it, filled in by a plain bilinear demosaic. The Strength slider blends the result with that picture, from 0% (the photo as shot) to 100% (the model's result), and Save keeps the blend.
+5. The Detail slider gives the result back the camera's own finest detail where the picture is busy: the finest band of that developed input's brightness (what a 3 px blur takes away) is added to the result wherever the result's own brightness moves by more than 4 of 255 within 9 px, in full from 8 up, and nowhere in a flat area. Nothing is made up and no colour is touched, but that band's noise comes back with its detail, so the slider's top is half the band and it starts at a quarter. A noisier photo gets less of it, by the photo's own noise and not its ISO or camera: the app measures how strong that band is where the result is flat, gives the whole share up to 8.2 of 255, less above, and nothing from 9, where the band is all grain and the slider is not shown. The picture it fades to is worked out in the page once the photo is done.
+6. Once a raw photo is done it can be cleaned again by a second model, Crisper: the same cleaning with small print a little crisper (`public/model/crisp.json`, trained with `--soften … noise`, where the model is shown a softer picture than the one it is asked for, the softer the noisier the frame). A third model, Best, is the same network at twice the width (`public/model/big.json`, r22-big): it reads more small print than Standard, and it is four times the download (234 MB) and takes a little over twice as long. Each is fetched only when chosen, and every result is kept, so the choices switch at once, and Strength, Detail and Save apply to the one shown.
+7. Two to four raw files of one scene, chosen together, add another choice, Burst: the frames are lined up and merged into one mosaic with less noise, and the Standard model cleans that, in little more than the time one frame takes. The first file by name is the picked frame: the one Standard, Crisper and Best clean, and the one the merged picture is of. For now the merge is a first version, a line-up to whole colour cells and an average; the line-up to a fraction of a pixel and the merge of `eval/burst.py` on main take its place when they land.
+   - **Brightness.** Each other frame is brought to the picked one's brightness by one gain, the median over blocks of 32 colour cells of how much brighter the picked frame is.
+   - **Line-up.** Where each other frame sits from the picked one is measured from the two noisy frames, on their green detail between 1 and 4 colour cells, as `burst.py`'s `sits` does: a shift and a turn over the whole frame first, then again in each tile from there, leaving out what does not fit, so a thing that moved does not drag it. The frame is then moved by whole colour cells (2 px) in that tile, so nothing is resampled and a colour stays the colour its pixel measured.
+   - **Trust.** Where a lined-up frame still differs from the picked one by more than the two frames' noise allows (its mean over 5 colour cells a side, 6 times the noise of that mean, `burst.py`'s guard), something moved or blew out, and that frame is left out there, fading back in over 4 px. Each pixel is then the mean of the picked frame and the frames trusted there. The noise is measured from the two frames themselves, for each colour plane: how far apart their pixels are at each brightness, by medians, so what moved does not count.
+
+Black offsets that `eval/blacks.py` knows a camera body by come off first (`src/blacks.json`), for a raw that names its body by a serial number. A raw without one (Ricoh, Sony, Samsung) can only take the offsets of another body of its camera, which don't carry over, so it gets none unless that is turned on under the photo picker. Any other raw file, a DNG without a Bayer mosaic (ProRAW, monochrome, X-Trans), one packed in a way the reader doesn't know (lossy or JPEG XL), and every other photo goes the first way, through its preview and the sRGB model. Cloud cleaning always uses the preview.
 
 ## Cloud
 
@@ -29,7 +44,20 @@ NAFNet width 32 ([megvii-research/NAFNet](https://github.com/megvii-research/NAF
 | Camera, ISO ≤6,400 (PolyU, 100)       | 37.39        | 37.69      |
 | Phone (SIDD, 320 crops)               | 40.43        | 40.32      |
 
-`eval/ship.py` exports it with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
+The raw model is the same network with twelve planes in and out (packed RGGB in, each colour at each of a 2x2 cell's four places out), trained by `eval/train_raw.py --joint`. `eval/ship_raw.py` exports any joint checkpoint to `public/model/` and `public/model/raw.json`, after checking that no fp16 step comes near fp16's range and that the fp16 file matches PyTorch on test windows:
+
+```sh
+cd eval && uv run ship_raw.py data/models/raw/joint-v1/joint.pth
+cd eval && uv run ship_raw.py data/models/raw/r8-p00/joint.pth bright
+cd eval && uv run ship_raw.py data/models/raw/r16-crisp/joint.pth bright crisp
+cd eval && uv run ship_raw.py data/models/raw/r22-big/joint.pth bright big
+```
+
+The second form is for a model trained with `--bright`: it ships without the hold-down for tiles with a light in them. The third and fourth ship a model beside the first, as `public/model/crisp.json` and `public/model/big.json`, and leave `raw.json` alone.
+
+`eval/raw_check.ts` runs the app's raw path outside a browser, a burst's later frames after `burst`, and `eval/raw_develop.py` compares its picture with the Python pipeline's. `eval/detail.py` is the Detail slider's step in numpy and compares the app's picture with it.
+
+`eval/ship.py` exports the sRGB model with the model tools of [Hush](https://github.com/ms0242808/Hush) (Apache-2.0) by ms0242808, which bound each block's channel attention so dark high-ISO JPEG shadows don't turn into a striped grid, and keep LayerNorm and pooling in fp32 so WebGPU doesn't return NaN.
 
 ## License
 
